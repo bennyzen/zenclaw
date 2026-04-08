@@ -1,6 +1,12 @@
 # ZenClaw
 
-Lightweight AI agent framework for MicroPython. Runs on ESP32 hardware or the MicroPython unix port for desktop development.
+Lightweight AI agent framework for MicroPython. Runs on $3 ESP32-S3 hardware or the MicroPython unix port for desktop development.
+
+<p align="center">
+  <img src="esp32-s3.png" alt="ZenClaw running on a $3 ESP32-S3 board">
+</p>
+
+The entire agent framework — LLM calls, tool execution, vector memory, cron scheduling, Telegram bot — runs on this $3 microcontroller with 512KB SRAM.
 
 ## Features
 
