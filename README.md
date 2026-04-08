@@ -10,7 +10,7 @@ The entire agent framework — LLM calls, tool execution, vector memory, cron sc
 
 ## Features
 
-- **Multi-provider LLM support**: Google Gemini, OpenAI, Anthropic, DeepSeek
+- **Multi-provider LLM support**: Google Gemini (native API), any OpenAI-compatible provider (OpenAI, DeepSeek, Groq, local models via Ollama, etc.)
 - **Tool-use agent loop**: Call LLM, execute tools, persist context, repeat
 - **40+ built-in tools**: File I/O, code exec, vector memory, cron scheduling, web search, sub-agents, MCP client, image generation, Google Sheets, cloud storage (S3), Telegram messaging
 - **Circuit breaker**: Detects stuck loops, no-progress polling, ping-pong patterns
@@ -19,7 +19,7 @@ The entire agent framework — LLM calls, tool execution, vector memory, cron sc
 - **Sub-agents**: Spawn isolated background agent sessions with depth limits
 - **Heartbeat**: Autonomous loop with cron scheduling and reflection turns
 - **Multi-channel**: CLI and Telegram (voice, photos, typing indicator)
-- **Cloud storage**: S3-compatible sync (Cloudflare R2, Backblaze B2, AWS S3)
+- **Cloud persistence**: Write-through S3-compatible sync — the device is brittle (flash wear, filesystem corruption, firmware reflashes), so sessions, memory, cron jobs, and user files are automatically backed up to cloud storage (Cloudflare R2 free tier, Backblaze B2, AWS S3) and restored on boot
 - **Web UI**: Nuxt PWA — dashboard, config editor, file manager, ESP32 provisioning via Web Serial
 - **ESP32-S3 ready**: WiFi via NVS, headless boot, hardware detection, SD card support
 
@@ -80,7 +80,7 @@ firmware/main.py (ESP32) / firmware/run.py (desktop)
     prompt.py                   — System prompt from SOUL.md + tools + skills
     agent_loop.py               — LLM -> tool execution -> repeat
       runner.py                 — Provider dispatch, retry, streaming
-      providers/                — Gemini / OpenAI / Anthropic API
+      providers/                — Gemini native API + OpenAI-compatible format
       tools/                    — 40+ registered tools
       tool_loop.py              — Circuit breaker for stuck loops
     session_manager/            — JSONL branching conversation trees
@@ -153,7 +153,37 @@ zenclaw/
 }
 ```
 
-Multiple providers can be configured. The `default` key selects which one to use. Provider `base_url` determines the wire format: Gemini URLs use Gemini format, everything else uses OpenAI-compatible.
+Multiple providers can be configured. The `default` key selects which one to use. Provider `base_url` determines the wire format: Gemini URLs use Gemini native format, everything else uses OpenAI-compatible format (`POST /chat/completions` with Bearer auth). This means any OpenAI-compatible API (DeepSeek, Groq, Ollama, etc.) works out of the box.
+
+## Cloud Persistence
+
+The ESP32 is a $3 microcontroller with limited, wear-prone flash storage. Filesystem corruption from power loss, firmware reflashes, or flash wear is a real risk. ZenClaw mitigates this with automatic write-through replication to S3-compatible cloud storage.
+
+**How it works:**
+
+1. **Boot restore**: On startup, `pull_from_cloud()` downloads any local files missing from `data/` — sessions, memory, cron jobs, user files
+2. **Background sync**: A worker uploads dirty files every 30 seconds. Local writes happen at full speed; replication is asynchronous
+3. **Initial backup**: On first boot with sync configured, all existing local files are uploaded to the cloud bucket
+
+**Supported providers**: Any S3-compatible service — Cloudflare R2 (10 GB free tier), Backblaze B2, AWS S3, MinIO, etc.
+
+**What gets synced**: Sessions (`data/sessions/`), vector memory (`data/memory/`), cron jobs (`data/cron/`), and user files. Binary files (`.bin`, `.pyc`) and generated images are excluded. Files over 512 KB are skipped to conserve memory.
+
+**Config** (add to `config.json`):
+
+```json
+{
+  "storage": {
+    "endpoint": "https://<account>.r2.cloudflarestorage.com",
+    "access_key_id": "...",
+    "secret_access_key": "...",
+    "bucket": "zenclaw",
+    "region": "auto"
+  }
+}
+```
+
+Agent system data is stored under a `sys/` prefix in the bucket (stripped transparently). User files uploaded via the file manager or `storage_write` tool go to the bucket root. The web UI provides a cloud file browser with presigned URLs for direct browser-to-bucket uploads and downloads.
 
 ## Design Comparison: ZenClaw vs pi-agent-core
 
