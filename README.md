@@ -25,37 +25,22 @@ The entire agent framework — LLM calls, tool execution, vector memory, cron sc
 
 ## Quick Start
 
+### ESP32-S3 (browser provisioning)
+
+Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome or Edge (Web Serial required). Plug your ESP32-S3 via USB and go to the Provision page. The wizard handles everything:
+
+1. **Configure** — Enter WiFi credentials, pick an LLM provider, enter your API key, choose a device name
+2. **Flash** — The browser flashes MicroPython + LittleFS filesystem + NVS (WiFi creds) in one shot via Web Serial. No CLI tools, no manual file copying
+3. **Connect** — The device boots, joins your WiFi, and appears at `devicename.local`. The wizard pushes the API key config automatically
+
+Done. The device is running at `http://devicename.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
+
 ### Desktop (MicroPython unix port)
 
 ```bash
-# Copy config template and add your API key
 cp firmware/config.example.json firmware/config.json
 # Edit firmware/config.json with your provider API key, then:
 cd firmware && micropython -X heapsize=4m run.py
-```
-
-### ESP32-S3
-
-```bash
-# Flash MicroPython
-esptool --port /dev/ttyACM0 --chip esp32s3 erase_flash
-esptool --port /dev/ttyACM0 --chip esp32s3 write_flash -z 0x0 firmware.bin
-
-# Provision WiFi (once)
-mpremote connect /dev/ttyACM0 exec "
-from lib.wifi import set_credentials, connect
-set_credentials('YOUR_SSID', 'YOUR_PASSWORD')
-connect()
-"
-
-# Upload project files
-mpremote connect /dev/ttyACM0 cp firmware/boot.py firmware/main.py firmware/config.json firmware/zenclaw_paths.py firmware/firmware-version.json :
-mpremote connect /dev/ttyACM0 cp -r firmware/lib/ :lib/
-mpremote connect /dev/ttyACM0 cp -r firmware/agent/ :agent/
-mpremote connect /dev/ttyACM0 cp -r firmware/data/ :data/
-
-# Reset — boots headless, listens on Telegram
-mpremote connect /dev/ttyACM0 reset
 ```
 
 ### Testing
@@ -129,7 +114,9 @@ zenclaw/
 
 ## Configuration
 
-`firmware/config.json` (copy from `config.example.json`):
+For ESP32, configuration is handled through the hosted web UI — the Config page edits `config.json` on the device directly over your local network. The provisioning wizard sets up the initial provider and API key.
+
+For desktop, copy `firmware/config.example.json` to `firmware/config.json` and edit it. Example:
 
 ```json
 {
@@ -184,31 +171,6 @@ The ESP32 is a $3 microcontroller with limited, wear-prone flash storage. Filesy
 ```
 
 Agent system data is stored under a `sys/` prefix in the bucket (stripped transparently). User files uploaded via the file manager or `storage_write` tool go to the bucket root. The web UI provides a cloud file browser with presigned URLs for direct browser-to-bucket uploads and downloads.
-
-## Design Comparison: ZenClaw vs pi-agent-core
-
-ZenClaw's architecture compared to [pi-agent-core](https://github.com/badlogic/pi-mono/tree/main/packages/agent), a TypeScript agent framework by Mario Zechner. Different design goals lead to different trade-offs.
-
-| Capability | ZenClaw | pi-agent-core |
-|---|---|---|
-| **Runtime** | MicroPython (ESP32 + desktop) | TypeScript (Node + browser) |
-| **Philosophy** | Batteries-included, self-sufficient | Minimal kernel, hooks for everything |
-| **Agent loop** | LLM -> tool exec -> repeat, with steering interrupts | Two-tier (inner tool loop + outer follow-up loop) |
-| **Provider abstraction** | Single module, URL-based format detection | Registry with lazy-loaded provider modules |
-| **Tool execution** | Sequential, single-phase | Parallel, three-phase (prepare/execute/finalize) |
-| **Tool validation** | JSON Schema type + required + enum checks | AJV (full JSON Schema) with CSP-safe fallback |
-| **Streaming** | Delta callbacks (`on_delta`, `on_reply`) | `EventStream<T,R>` push/pull async iterable |
-| **Session persistence** | Built-in JSONL branching trees | None (consumer's responsibility) |
-| **Context management** | Auto-compaction (LLM summarization) + pruning | Hook-based (`transformContext`) |
-| **Retry logic** | Exponential backoff, 3 attempts, error classification | None (consumer's responsibility) |
-| **Loop detection** | Circuit breaker (repeat, ping-pong, global no-progress) | None |
-| **Memory** | Vector + keyword hybrid search, daily rotation | None |
-| **Sub-agents** | Spawn with depth limits, timeouts, lifecycle events | None |
-| **Cross-model switching** | Basic transcript repair | Full message transform (thinking blocks, tool ID normalization, orphan cleanup) |
-| **Prompt construction** | Built-in from SOUL.md + tools + hardware introspection | None (passed through as string) |
-| **Hardware awareness** | Chip, memory, buses, sensors in system prompt | N/A |
-
-**Key takeaway:** pi-agent-core is a composable building block for apps that own their own persistence, retry, and prompt logic. ZenClaw is a standalone agent that needs to run autonomously on a microcontroller. The useful pattern borrowed from pi-agent: tool argument validation at the execution boundary, catching LLM mistakes before they reach tool code.
 
 ## Agent Identity
 
