@@ -29,6 +29,13 @@ export default defineNuxtConfig({
 
   devtools: { enabled: true },
 
+  nitro: {
+    prerender: {
+      crawlLinks: false,
+      routes: ['/'],
+    },
+  },
+
   vite: {
     optimizeDeps: {
       include: ['@vue/devtools-core', '@vue/devtools-kit', 'esptool-js'],
