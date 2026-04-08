@@ -186,9 +186,10 @@ export function useSerial() {
       // Download firmware files
       onProgress({ stage: 'flashing', percent: 15, message: 'Downloading firmware...' })
 
+      const base = useRuntimeConfig().app.baseURL
       const [fwResponse, fsResponse] = await Promise.all([
-        fetch('/firmware/micropython.bin'),
-        fetch('/firmware/zenclaw.img'),
+        fetch(base + 'firmware/micropython.bin'),
+        fetch(base + 'firmware/zenclaw.img'),
       ])
       if (!fwResponse.ok) throw new Error(`Failed to download micropython.bin (HTTP ${fwResponse.status})`)
       if (!fsResponse.ok) throw new Error(`Failed to download zenclaw.img (HTTP ${fsResponse.status})`)

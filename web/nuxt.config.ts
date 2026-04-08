@@ -1,8 +1,22 @@
+// https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
   modules: ['@nuxt/ui', '@nuxtjs/mdc'],
 
-  // Static generation for GitHub Pages
   ssr: false,
+
+  app: {
+    baseURL: process.env.NUXT_APP_BASE_URL || '/',
+    head: {
+      title: 'ZenClaw',
+      meta: [
+        { name: 'description', content: 'ZenClaw ESP32 Agent Manager' },
+        { name: 'theme-color', content: '#18181b' },
+      ],
+      link: [
+        { rel: 'manifest', href: (process.env.NUXT_APP_BASE_URL || '/') + 'manifest.json' },
+      ],
+    },
+  },
 
   colorMode: {
     preference: 'dark',
@@ -11,20 +25,8 @@ export default defineNuxtConfig({
 
   css: ['~/assets/css/main.css'],
 
-  app: {
-    head: {
-      title: 'ZenClaw',
-      meta: [
-        { name: 'description', content: 'ZenClaw ESP32 Agent Manager' },
-        { name: 'theme-color', content: '#18181b' },
-      ],
-      link: [
-        { rel: 'manifest', href: '/manifest.json' },
-      ],
-    },
-  },
-
   compatibilityDate: '2025-07-15',
+
   devtools: { enabled: true },
 
   vite: {
