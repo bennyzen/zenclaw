@@ -24,7 +24,7 @@ const uptime = computed(() => {
   const h = Math.floor(s / 3600)
   const m = Math.floor((s % 3600) / 60)
   const sec = s % 60
-  return '{}h {}m {}s'.format(h, m, sec)
+  return `${h}h ${m}m ${sec}s`
 })
 
 const tooltipUi = {
