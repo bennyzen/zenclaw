@@ -49,11 +49,13 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="max-w-3xl space-y-6">
+  <div v-if="!state.networkConnected">
+    <WelcomeLanding />
+  </div>
+  <div v-else class="max-w-3xl space-y-6">
     <h1 class="text-2xl font-bold">Dashboard</h1>
 
-    <!-- Device info -->
-    <template v-if="state.networkConnected && state.lastStatus">
+    <template v-if="state.lastStatus">
       <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <!-- Name + version -->
         <UCard>

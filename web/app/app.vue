@@ -30,7 +30,8 @@ const navItems = [
           size="sm"
         />
       </nav>
-      <div class="ml-auto">
+      <div class="ml-auto flex items-center gap-1">
+        <HelpDrawer />
         <UColorModeButton size="sm" variant="ghost" color="neutral" />
       </div>
     </header>
