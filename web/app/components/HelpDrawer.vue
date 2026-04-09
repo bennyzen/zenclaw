@@ -2,34 +2,37 @@
 const open = ref(false)
 const route = useRoute()
 
-const helpComponents: Record<string, string> = {
-  '/': 'HelpDashboard',
-  '/provision': 'HelpProvision',
-  '/config': 'HelpConfig',
-  '/chat': 'HelpChat',
-  '/files': 'HelpFiles',
-  '/logs': 'HelpLogs',
+const routeHelp: Record<string, string> = {
+  '/': 'dashboard',
+  '/provision': 'provision',
+  '/config': 'config',
+  '/chat': 'chat',
+  '/files': 'files',
+  '/logs': 'logs',
 }
 
-const currentHelp = computed(() => helpComponents[route.path] ?? 'HelpDashboard')
+const currentHelp = computed(() => routeHelp[route.path] ?? 'dashboard')
 </script>
 
 <template>
-  <UButton
-    icon="i-lucide-circle-help"
-    size="sm"
-    variant="ghost"
-    color="neutral"
-    aria-label="Help"
-    @click="open = true"
-  />
-  <USlideover v-model:open="open" side="right" :ui="{ width: 'w-[480px]' }">
-    <div class="p-6 overflow-y-auto h-full">
-      <div class="flex items-center justify-between mb-6">
-        <h2 class="text-lg font-semibold">Help</h2>
-        <UButton icon="i-lucide-x" size="sm" variant="ghost" color="neutral" @click="open = false" />
-      </div>
-      <component :is="resolveComponent(currentHelp)" />
-    </div>
-  </USlideover>
+  <div>
+    <UButton
+      icon="i-lucide-circle-help"
+      size="sm"
+      variant="ghost"
+      color="neutral"
+      aria-label="Help"
+      @click="open = true"
+    />
+    <USlideover v-model:open="open" side="right">
+      <template #body>
+        <HelpDashboard v-if="currentHelp === 'dashboard'" />
+        <HelpProvision v-else-if="currentHelp === 'provision'" />
+        <HelpConfig v-else-if="currentHelp === 'config'" />
+        <HelpChat v-else-if="currentHelp === 'chat'" />
+        <HelpFiles v-else-if="currentHelp === 'files'" />
+        <HelpLogs v-else-if="currentHelp === 'logs'" />
+      </template>
+    </USlideover>
+  </div>
 </template>
