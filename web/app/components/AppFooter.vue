@@ -24,8 +24,12 @@ const uptime = computed(() => {
   const h = Math.floor(s / 3600)
   const m = Math.floor((s % 3600) / 60)
   const sec = s % 60
-  return `${h}h ${m}m ${sec}s`
+  return '{}h {}m {}s'.format(h, m, sec)
 })
+
+const tooltipUi = {
+  content: 'bg-elevated text-default shadow-lg rounded-md ring ring-default px-3 py-2 text-xs min-w-[200px] h-auto',
+}
 </script>
 
 <template>
@@ -34,11 +38,10 @@ const uptime = computed(() => {
       No device connected
     </div>
     <div v-else class="statusbar flex items-center text-xs text-toned h-6">
-      <!-- Device IP -->
-      <UTooltip>
+      <UTooltip :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <a
           v-if="state.deviceIp"
-          :href="`${state.useTls ? 'https' : 'http'}://${state.deviceIp}${state.useTls ? ':' + state.devicePort : ''}`"
+          :href="'http://' + state.deviceIp"
           target="_blank"
           class="cell text-muted hover:text-default transition-colors"
         >
@@ -46,119 +49,119 @@ const uptime = computed(() => {
           {{ state.deviceIp }}
         </a>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-cpu" class="size-4" /> Device Connection</div>
-            <div class="tip-row"><span class="tip-label">IP Address</span><span>{{ state.deviceIp }}</span></div>
-            <div class="tip-row"><span class="tip-label">Protocol</span><span>{{ state.useTls ? 'HTTPS :' + state.devicePort : 'HTTP :80' }}</span></div>
-            <div class="tip-row"><span class="tip-label">Mode</span><span>{{ state.mode === 'both' ? 'USB + Network' : state.mode === 'serial' ? 'USB' : 'Network' }}</span></div>
-            <div class="tip-hint">Click to open device landing page</div>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-cpu" class="size-4" /> Device
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">IP</span><span>{{ state.deviceIp }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Protocol</span><span>{{ state.useTls ? 'HTTPS' : 'HTTP' }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Mode</span><span>{{ state.mode === 'both' ? 'USB + Network' : state.mode === 'serial' ? 'USB' : 'Network' }}</span></div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- RAM -->
-      <UTooltip v-if="ramPercent != null">
+      <UTooltip v-if="ramPercent != null" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-memory-stick" class="size-3 text-dimmed" />
           {{ ramPercent }}%
         </span>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-memory-stick" class="size-4" /> RAM Usage</div>
-            <div class="tip-row"><span class="tip-label">Used</span><span>{{ state.lastStatus?.memory?.usedKb }} KB</span></div>
-            <div class="tip-row"><span class="tip-label">Free</span><span>{{ state.lastStatus?.memory?.freeKb }} KB</span></div>
-            <div class="tip-row"><span class="tip-label">Total</span><span>{{ state.lastStatus?.memory?.totalKb }} KB</span></div>
-            <div class="tip-hint">ESP32-S3 SRAM + PSRAM combined</div>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-memory-stick" class="size-4" /> RAM
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Used</span><span>{{ state.lastStatus?.memory?.usedKb }} KB</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Free</span><span>{{ state.lastStatus?.memory?.freeKb }} KB</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Total</span><span>{{ state.lastStatus?.memory?.totalKb }} KB</span></div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- Device Storage -->
-      <UTooltip v-if="state.lastStatus?.storage">
+      <UTooltip v-if="state.lastStatus?.storage" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-hard-drive" class="size-3 text-dimmed" />
           {{ prettyBytes(state.lastStatus.storage.freeKb * 1024) }}
         </span>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-hard-drive" class="size-4" /> Device Storage</div>
-            <div class="tip-row"><span class="tip-label">Free</span><span>{{ prettyBytes(state.lastStatus!.storage!.freeKb * 1024) }}</span></div>
-            <div class="tip-row"><span class="tip-label">Total</span><span>{{ prettyBytes(state.lastStatus!.storage!.totalKb * 1024) }}</span></div>
-            <div class="tip-hint">On-board flash filesystem (sessions, memory, skills)</div>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-hard-drive" class="size-4" /> Storage
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Free</span><span>{{ prettyBytes(state.lastStatus!.storage!.freeKb * 1024) }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Total</span><span>{{ prettyBytes(state.lastStatus!.storage!.totalKb * 1024) }}</span></div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- Cloud Storage -->
-      <UTooltip v-if="state.lastStatus?.cloudStorage?.configured">
+      <UTooltip v-if="state.lastStatus?.cloudStorage?.configured" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-cloud" class="size-3 text-green-400" />
-          {{ state.lastStatus.cloudStorage.objects }}&thinsp;obj&ensp;{{ prettyBytes(state.lastStatus.cloudStorage.totalBytes ?? 0) }}
+          {{ state.lastStatus.cloudStorage.objects }} obj {{ prettyBytes(state.lastStatus.cloudStorage.totalBytes ?? 0) }}
         </span>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-cloud" class="size-4 text-green-400" /> Cloud Storage</div>
-            <div class="tip-row"><span class="tip-label">Provider</span><span>{{ state.lastStatus!.cloudStorage!.provider === 'r2' ? 'Cloudflare R2' : 'S3-compatible' }}</span></div>
-            <div class="tip-row"><span class="tip-label">Bucket</span><span>{{ state.lastStatus!.cloudStorage!.bucket }}</span></div>
-            <div class="tip-row"><span class="tip-label">Objects</span><span>{{ state.lastStatus!.cloudStorage!.objects }}</span></div>
-            <div class="tip-row"><span class="tip-label">Size</span><span>{{ prettyBytes(state.lastStatus!.cloudStorage!.totalBytes ?? 0) }}</span></div>
-            <div class="tip-hint">Persistent off-device storage for documents and exports</div>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-cloud" class="size-4 text-green-400" /> Cloud
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Provider</span><span>{{ state.lastStatus!.cloudStorage!.provider === 'r2' ? 'Cloudflare R2' : 'S3' }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Bucket</span><span>{{ state.lastStatus!.cloudStorage!.bucket }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Objects</span><span>{{ state.lastStatus!.cloudStorage!.objects }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Size</span><span>{{ prettyBytes(state.lastStatus!.cloudStorage!.totalBytes ?? 0) }}</span></div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- Temperature -->
-      <UTooltip v-if="state.lastStatus?.temperatureC != null">
+      <UTooltip v-if="state.lastStatus?.temperatureC != null" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-thermometer" class="size-3 text-dimmed" />
           {{ state.lastStatus.temperatureC }}&deg;
         </span>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-thermometer" class="size-4" /> MCU Temperature</div>
-            <div class="tip-row"><span class="tip-label">Current</span><span>{{ state.lastStatus!.temperatureC }}&deg;C</span></div>
-            <div class="tip-hint">ESP32-S3 internal sensor. Normal range: 30-60&deg;C</div>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-thermometer" class="size-4" /> Temperature
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">MCU</span><span>{{ state.lastStatus!.temperatureC }}&deg;C</span></div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- Uptime -->
-      <UTooltip v-if="uptime">
+      <UTooltip v-if="uptime" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-clock" class="size-3 text-dimmed" />
           {{ uptime }}
         </span>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-clock" class="size-4" /> Uptime</div>
-            <div class="tip-row"><span class="tip-label">Since boot</span><span>{{ uptime }}</span></div>
-            <div class="tip-hint">Time since last device restart or power cycle</div>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-clock" class="size-4" /> Uptime
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Since boot</span><span>{{ uptime }}</span></div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- WiFi Signal -->
-      <UTooltip v-if="state.lastStatus?.wifi?.rssi != null">
+      <UTooltip v-if="state.lastStatus?.wifi?.rssi != null" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-wifi" class="size-3 text-dimmed" />
-          {{ state.lastStatus.wifi.rssi }}&thinsp;dBm
+          {{ state.lastStatus.wifi.rssi }} dBm
         </span>
         <template #content>
-          <div class="tip">
-            <div class="tip-title"><UIcon name="i-lucide-wifi" class="size-4" /> WiFi Signal</div>
-            <div class="tip-row"><span class="tip-label">RSSI</span><span>{{ state.lastStatus!.wifi!.rssi }} dBm</span></div>
-            <div class="tip-row">
-              <span class="tip-label">Quality</span>
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+              <UIcon name="i-lucide-wifi" class="size-4" /> WiFi
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">RSSI</span><span>{{ state.lastStatus!.wifi!.rssi }} dBm</span></div>
+            <div class="flex justify-between gap-4">
+              <span class="text-dimmed">Quality</span>
               <span>{{ state.lastStatus!.wifi!.rssi! > -50 ? 'Excellent' : state.lastStatus!.wifi!.rssi! > -60 ? 'Good' : state.lastStatus!.wifi!.rssi! > -70 ? 'Fair' : 'Weak' }}</span>
             </div>
-            <div class="tip-hint">-30 dBm = best, -80 dBm = barely usable</div>
           </div>
         </template>
       </UTooltip>
 
-      <!-- Disconnect -->
       <span class="ml-auto">
-        <UTooltip text="Disconnect from device">
+        <UTooltip text="Disconnect" :content="{ side: 'top', sideOffset: 8 }">
           <UButton
             icon="i-lucide-unplug"
             size="xs"
@@ -183,39 +186,5 @@ const uptime = computed(() => {
 }
 .statusbar .cell:first-child {
   padding-left: 0;
-}
-</style>
-
-<style>
-.tip {
-  min-width: 180px;
-  font-size: 0.75rem;
-  line-height: 1.4;
-}
-.tip-title {
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-  font-weight: 600;
-  font-size: 0.8125rem;
-  margin-bottom: 0.375rem;
-  padding-bottom: 0.375rem;
-  border-bottom: 1px solid rgb(255 255 255 / 0.1);
-}
-.tip-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 0.125rem 0;
-}
-.tip-label {
-  opacity: 0.5;
-}
-.tip-hint {
-  margin-top: 0.375rem;
-  padding-top: 0.375rem;
-  border-top: 1px solid rgb(255 255 255 / 0.1);
-  opacity: 0.4;
-  font-size: 0.6875rem;
 }
 </style>
