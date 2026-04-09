@@ -1,5 +1,6 @@
 <script setup lang="ts">
 const { state, connectNetwork } = useConnection()
+const router = useRouter()
 
 const STORAGE_KEY = 'zenclaw_provision'
 const hostname = ref('')
@@ -18,6 +19,7 @@ async function connect() {
   if (!hostname.value || state.connecting) return
   try {
     await connectNetwork(hostname.value + '.local')
+    router.push('/dashboard')
   } catch { /* error shown via state.error */ }
 }
 </script>
@@ -25,6 +27,7 @@ async function connect() {
 <template>
   <div class="max-w-2xl mx-auto space-y-8">
     <div class="text-center space-y-3">
+      <img :src="`${$config.app.baseURL}zenclaw.webp`" alt="ZenClaw on ESP32-S3" class="mx-auto rounded-lg w-full" />
       <h1 class="text-4xl font-bold">ZenClaw</h1>
       <p class="text-xl text-muted">AI agent on a $3 microcontroller</p>
       <p class="text-sm text-dimmed max-w-lg mx-auto">
@@ -88,7 +91,7 @@ async function connect() {
 
     <div class="space-y-3">
       <h3 class="font-semibold">What you need</h3>
-      <div class="grid gap-3 sm:grid-cols-3">
+      <div class="grid gap-3 grid-cols-2">
         <div class="flex items-start gap-2 p-3 rounded-lg bg-elevated/50">
           <UIcon name="i-lucide-cpu" class="text-primary mt-0.5 shrink-0" />
           <div>
@@ -110,6 +113,16 @@ async function connect() {
             <p class="text-xs text-dimmed">
               <a href="https://aistudio.google.com/apikey" target="_blank" class="text-primary underline">Get one free</a>
               from Google AI Studio
+            </p>
+          </div>
+        </div>
+        <div class="flex items-start gap-2 p-3 rounded-lg bg-elevated/50">
+          <UIcon name="i-lucide-cloud" class="text-dimmed mt-0.5 shrink-0" />
+          <div>
+            <p class="text-sm font-medium">Cloud storage <span class="text-xs font-normal text-dimmed">(optional)</span></p>
+            <p class="text-xs text-dimmed">
+              <a href="https://dash.cloudflare.com/sign-up" target="_blank" class="text-primary underline">Cloudflare R2</a>
+              10 GB free, protects your data
             </p>
           </div>
         </div>

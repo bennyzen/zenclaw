@@ -78,7 +78,16 @@ function mapStatus(raw: Record<string, any>): DeviceStatus {
           freeKb: raw.storage.free_kb,
         }
       : null,
-    cloudStorage: raw.cloud_storage ?? null,
+    cloudStorage: raw.cloud_storage
+      ? {
+          configured: raw.cloud_storage.configured,
+          provider: raw.cloud_storage.provider,
+          bucket: raw.cloud_storage.bucket,
+          objects: raw.cloud_storage.objects,
+          totalBytes: raw.cloud_storage.total_bytes,
+          error: raw.cloud_storage.error,
+        }
+      : null,
     uptimeS: raw.uptime_s ?? null,
   }
 }

@@ -1,12 +1,10 @@
-# ZenClaw
-
-Lightweight AI agent framework for MicroPython. Runs on $3 ESP32-S3 hardware or the MicroPython unix port for desktop development.
-
 <p align="center">
-  <img src="esp32-s3.png" alt="ZenClaw running on a $3 ESP32-S3 board">
+  <img src="zenclaw.webp" alt="ZenClaw running on an ESP32-S3 board">
 </p>
 
-The entire agent framework — LLM calls, tool execution, vector memory, cron scheduling, Telegram bot — runs on this $3 microcontroller with 512KB SRAM.
+# ZenClaw
+
+A fully autonomous AI agent that fits on a $3 ESP32-S3 microcontroller — 512KB of SRAM, cloud-backed persistence (S3-compatible), 40+ built-in tools, vector memory, cron scheduling, and a Telegram bot. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Built for MicroPython and deployable straight from the browser via Web Serial.
 
 ## Features
 

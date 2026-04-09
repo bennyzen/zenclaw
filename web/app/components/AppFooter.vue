@@ -28,7 +28,7 @@ const uptime = computed(() => {
 })
 
 const tooltipUi = {
-  content: 'bg-elevated text-default shadow-lg rounded-md ring ring-default px-3 py-2 text-xs min-w-[200px] h-auto',
+  content: 'bg-elevated text-default shadow-lg rounded-md ring ring-default px-3 py-2 text-xs w-56 h-auto',
 }
 </script>
 

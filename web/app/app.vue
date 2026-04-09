@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const navItems = [
-  { label: 'Dashboard', to: '/', icon: 'i-lucide-layout-dashboard' },
+  { label: 'Dashboard', to: '/dashboard', icon: 'i-lucide-layout-dashboard' },
   { label: 'Chat', to: '/chat', icon: 'i-lucide-message-circle' },
   { label: 'Provision', to: '/provision', icon: 'i-lucide-cpu' },
   { label: 'Files', to: '/files', icon: 'i-lucide-folder' },
@@ -14,10 +14,10 @@ const navItems = [
   <div class="flex min-h-screen flex-col bg-default text-default">
     <!-- Header -->
     <header class="flex items-center gap-4 border-b border-default bg-elevated px-4 py-3">
-      <div class="flex items-center gap-2">
+      <NuxtLink to="/" class="flex items-center gap-2">
         <UIcon name="i-lucide-cpu" class="text-xl text-primary" />
         <span class="text-lg font-semibold">ZenClaw</span>
-      </div>
+      </NuxtLink>
       <nav class="flex items-center gap-1">
         <UButton
           v-for="item in navItems"

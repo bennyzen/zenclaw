@@ -4,6 +4,7 @@ const route = useRoute()
 
 const routeHelp: Record<string, string> = {
   '/': 'dashboard',
+  '/dashboard': 'dashboard',
   '/provision': 'provision',
   '/config': 'config',
   '/chat': 'chat',

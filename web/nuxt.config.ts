@@ -38,7 +38,7 @@ export default defineNuxtConfig({
 
   vite: {
     optimizeDeps: {
-      include: ['@vue/devtools-core', '@vue/devtools-kit', 'esptool-js'],
+      include: ['@vue/devtools-core', '@vue/devtools-kit', 'esptool-js', 'pretty-bytes'],
     },
   },
 })
