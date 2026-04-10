@@ -21,7 +21,102 @@ const wifiPassword = ref('')
 const apiKey = ref('')
 const apiProvider = ref('google')
 const apiModel = ref('gemini-2.5-flash')
+const baseUrl = ref('https://generativelanguage.googleapis.com/v1beta')
 const deviceName = ref(randomName())
+
+const BASE_URLS: Record<string, string> = {
+  'google': 'https://generativelanguage.googleapis.com/v1beta',
+  'openai': 'https://api.openai.com/v1',
+  'anthropic': 'https://api.anthropic.com',
+  'x-ai': 'https://api.x.ai/v1',
+  'z-ai': 'https://api.z.ai/api/coding/paas/v4',
+  'mistralai': 'https://api.mistral.ai',
+  'deepseek': 'https://api.deepseek.com/v1',
+  'cohere': 'https://api.cohere.com/v2',
+  'perplexity': 'https://api.perplexity.ai',
+  'meta-llama': 'https://api.llama.com/v1',
+  'qwen': 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+  'nvidia': 'https://integrate.api.nvidia.com/v1',
+  'groq': 'https://api.groq.com/openai/v1',
+  'cerebras': 'https://api.cerebras.ai/v1',
+  'minimax': 'https://api.minimax.io/v1',
+  'amazon': 'https://bedrock-runtime.us-east-1.amazonaws.com',
+  'ai21': 'https://api.ai21.com/studio/v1',
+  'inflection': 'https://api.inflection.ai/v1',
+  'moonshotai': 'https://api.moonshot.cn/v1',
+  'stepfun': 'https://api.stepfun.com/v1',
+  'baidu': 'https://qianfan.baidubce.com/v2',
+  'writer': 'https://api.writer.com/v1',
+  'upstage': 'https://api.upstage.ai/v1',
+  'rekaai': 'https://api.reka.ai/v1',
+  'huggingface': 'https://router.huggingface.co/v1',
+  'openrouter': 'https://openrouter.ai/api/v1',
+  'liquid': 'https://api.liquid.ai/v1',
+  'arcee-ai': 'https://conductor.arcee.ai/v2',
+  'inception': 'https://api.inceptionlabs.ai/v1',
+  'tencent': 'https://api.lkeap.cloud.tencent.com/v1',
+  'bytedance-seed': 'https://ark.cn-beijing.volces.com/api/v3',
+}
+
+interface ORModel { id: string; name: string; provider: string }
+const allModels = ref<ORModel[]>([])
+
+async function fetchModels() {
+  try {
+    const resp = await fetch('https://openrouter.ai/api/v1/models')
+    const data = await resp.json()
+    allModels.value = (data.data || []).map((m: any) => {
+      const id = m.id || ''
+      const provider = id.includes('/') ? id.split('/')[0] : 'unknown'
+      return { id, name: m.name || id, provider }
+    })
+  } catch { /* user can type manually */ }
+}
+
+const providerItems = computed(() => {
+  const counts: Record<string, number> = {}
+  for (const m of allModels.value) {
+    counts[m.provider] = (counts[m.provider] || 0) + 1
+  }
+  const sorted = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([value, count]) => ({ label: `${value} (${count})`, value }))
+  sorted.unshift({ label: 'Custom', value: 'custom' })
+  return sorted
+})
+
+const filteredModels = computed(() => {
+  if (apiProvider.value === 'custom' || !allModels.value.length) return []
+  return allModels.value
+    .filter(m => m.provider === apiProvider.value)
+    .map(m => {
+      const short = m.id.includes('/') ? m.id.split('/').slice(1).join('/') : m.id
+      return { label: short, value: short }
+    })
+})
+
+const isCustomProvider = computed(() => apiProvider.value === 'custom')
+
+watch(apiProvider, (name) => {
+  if (BASE_URLS[name]) baseUrl.value = BASE_URLS[name]
+  apiModel.value = ''
+})
+
+onMounted(() => {
+  fetchModels()
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (!saved) return
+    const data = JSON.parse(saved)
+    if (data.wifiSsid) wifiSsid.value = data.wifiSsid
+    if (data.wifiPassword) wifiPassword.value = data.wifiPassword
+    if (data.apiKey) apiKey.value = data.apiKey
+    if (data.apiProvider) apiProvider.value = data.apiProvider
+    if (data.apiModel) apiModel.value = data.apiModel
+    if (data.deviceName) deviceName.value = data.deviceName
+    if (data.baseUrl) baseUrl.value = data.baseUrl
+  } catch { /* ignore */ }
+})
 const deviceIp = computed(() => `${deviceName.value}.local`)
 const flashing = ref(false)
 const polling = ref(false)
@@ -43,29 +138,15 @@ const items: StepperItem[] = [
   { title: 'Done', description: 'Ready to use', icon: 'i-lucide-check' },
 ]
 
-// Restore from localStorage
-onMounted(() => {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (!saved) return
-    const data = JSON.parse(saved)
-    if (data.wifiSsid) wifiSsid.value = data.wifiSsid
-    if (data.wifiPassword) wifiPassword.value = data.wifiPassword
-    if (data.apiKey) apiKey.value = data.apiKey
-    if (data.apiProvider) apiProvider.value = data.apiProvider
-    if (data.apiModel) apiModel.value = data.apiModel
-    if (data.deviceName) deviceName.value = data.deviceName
-  } catch { /* ignore */ }
-})
-
 // Save to localStorage on change
-watch([wifiSsid, wifiPassword, apiKey, apiProvider, apiModel, deviceName], () => {
+watch([wifiSsid, wifiPassword, apiKey, apiProvider, apiModel, baseUrl, deviceName], () => {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     wifiSsid: wifiSsid.value,
     wifiPassword: wifiPassword.value,
     apiKey: apiKey.value,
     apiProvider: apiProvider.value,
     apiModel: apiModel.value,
+    baseUrl: baseUrl.value,
     deviceName: deviceName.value,
   }))
 })
@@ -124,9 +205,7 @@ async function pollForDevice() {
         ...(providers[apiProvider.value] || {}),
         api_key: apiKey.value,
         model: apiModel.value,
-        base_url: apiProvider.value === 'google'
-          ? 'https://generativelanguage.googleapis.com/v1beta'
-          : 'https://api.openai.com/v1',
+        base_url: baseUrl.value,
       }
       await conn.saveConfig({ ...existing, providers })
       active.value = 3
@@ -170,21 +249,34 @@ async function pollForDevice() {
           <USeparator />
 
           <UFormField label="LLM Provider" class="w-full">
-            <USelect
+            <USelectMenu
               v-model="apiProvider"
               class="w-full"
               size="xl"
-              :items="[
-                { label: 'Google (Gemini)', value: 'google' },
-                { label: 'OpenAI', value: 'openai' },
-              ]"
+              :items="providerItems"
+              value-key="value"
+              :loading="!providerItems.length"
+              placeholder="Select provider..."
             />
+          </UFormField>
+          <UFormField v-if="isCustomProvider" label="Base URL" class="w-full">
+            <UInput v-model="baseUrl" placeholder="https://api.example.com/v1" class="w-full" size="xl" />
           </UFormField>
           <UFormField label="API Key" class="w-full">
             <UInput v-model="apiKey" placeholder="Your API key" class="w-full" size="xl" />
           </UFormField>
           <UFormField label="Model" class="w-full">
-            <UInput v-model="apiModel" class="w-full" size="xl" />
+            <USelectMenu
+              v-if="filteredModels.length"
+              v-model="apiModel"
+              class="w-full"
+              size="xl"
+              :items="filteredModels"
+              value-key="value"
+              placeholder="Select a model"
+              searchable
+            />
+            <UInput v-else v-model="apiModel" placeholder="e.g. gpt-4o-mini" class="w-full" size="xl" />
           </UFormField>
 
           <USeparator />
