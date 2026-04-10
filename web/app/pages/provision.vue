@@ -108,7 +108,7 @@ onMounted(async () => {
   await fetchModels()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    if (!saved) return
+    if (!saved) { _restoring = false; return }
     const data = JSON.parse(saved)
     if (data.wifiSsid) wifiSsid.value = data.wifiSsid
     if (data.wifiPassword) wifiPassword.value = data.wifiPassword
@@ -118,6 +118,10 @@ onMounted(async () => {
     if (data.deviceName) deviceName.value = data.deviceName
     if (data.baseUrl) baseUrl.value = data.baseUrl
   } catch { /* ignore */ }
+  // Wait for deferred watchers (apiProvider watcher) to flush before
+  // clearing the flag — otherwise the watcher sees _restoring=false
+  // and clears apiModel
+  await nextTick()
   _restoring = false
 })
 const deviceIp = computed(() => `${deviceName.value}.local`)
