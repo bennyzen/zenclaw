@@ -32,6 +32,7 @@ const currentPath = ref('.')
 const entries = ref<FileEntry[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
+const info = ref<string | null>(null)
 
 // Editor state
 const selectedFile = ref<string | null>(null)
@@ -230,8 +231,10 @@ async function handleUpload(event: Event) {
             ? file.name
             : `${currentPath.value}/${file.name}`
           await uploadCloudFile(key, data)
-          isCloud.value = true
+          storageMode.value = 'cloud'
           currentPath.value = ''
+          info.value = `File too large for device storage — uploaded to cloud instead.`
+          setTimeout(() => { info.value = null }, 5000)
         } else {
           throw e
         }
@@ -296,32 +299,37 @@ watch(() => state.networkConnected, (connected) => {
 
 <template>
   <div class="space-y-4">
-    <div class="flex items-center justify-between">
+        <div class="flex items-center justify-between">
       <h1 class="text-2xl font-bold">File Manager</h1>
 
       <div v-if="state.networkConnected" class="flex items-center gap-1">
-        <UButton
-          icon="i-lucide-hard-drive"
-          :label="'Device'"
-          size="xs"
-          :variant="storageMode === 'device' ? 'soft' : 'ghost'"
-          :color="storageMode === 'device' ? 'primary' : 'neutral'"
-          @click="switchMode('device')"
-        />
-        <UButton
-          icon="i-lucide-cloud"
-          :label="'Cloud'"
-          size="xs"
-          :variant="storageMode === 'cloud' ? 'soft' : 'ghost'"
-          :color="storageMode === 'cloud' ? 'primary' : 'neutral'"
-          :disabled="!cloudConfigured"
-          @click="switchMode('cloud')"
-        />
+        <UTooltip text="On-device storage. Best for small files and configs.">
+          <UButton
+            icon="i-lucide-hard-drive"
+            :label="'Device'"
+            size="xs"
+            :variant="storageMode === 'device' ? 'soft' : 'ghost'"
+            :color="storageMode === 'device' ? 'primary' : 'neutral'"
+            @click="switchMode('device')"
+          />
+        </UTooltip>
+        <UTooltip text="Cloud storage (R2). Large files go here automatically.">
+          <UButton
+            icon="i-lucide-cloud"
+            :label="'Cloud'"
+            size="xs"
+            :variant="storageMode === 'cloud' ? 'soft' : 'ghost'"
+            :color="storageMode === 'cloud' ? 'primary' : 'neutral'"
+            :disabled="!cloudConfigured"
+            @click="switchMode('cloud')"
+          />
+        </UTooltip>
       </div>
     </div>
 
     <template v-if="state.networkConnected">
       <p v-if="error" class="text-sm text-red-400">{{ error }}</p>
+      <p v-if="info" class="text-sm text-blue-400">{{ info }}</p>
 
       <div class="grid gap-4" style="grid-template-columns: 360px 1fr">
         <!-- Directory browser -->
