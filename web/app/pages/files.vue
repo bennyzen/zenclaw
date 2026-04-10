@@ -32,7 +32,8 @@ const currentPath = ref('.')
 const entries = ref<FileEntry[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
-const info = ref<string | null>(null)
+
+const toast = useToast()
 
 // Editor state
 const selectedFile = ref<string | null>(null)
@@ -233,8 +234,7 @@ async function handleUpload(event: Event) {
           await uploadCloudFile(key, data)
           storageMode.value = 'cloud'
           currentPath.value = ''
-          info.value = `File too large for device storage — uploaded to cloud instead.`
-          setTimeout(() => { info.value = null }, 5000)
+          toast.add({ title: 'Uploaded to cloud storage', description: 'File too large for device storage — saved to cloud instead.', color: 'info', icon: 'i-lucide-cloud-upload' })
         } else {
           throw e
         }
@@ -328,8 +328,7 @@ watch(() => state.networkConnected, (connected) => {
     </div>
 
     <template v-if="state.networkConnected">
-      <p v-if="error" class="text-sm text-red-400">{{ error }}</p>
-      <p v-if="info" class="text-sm text-blue-400">{{ info }}</p>
+      <UAlert v-if="error" icon="i-lucide-circle-x" color="error" variant="subtle" :description="error" />
 
       <div class="grid gap-4" style="grid-template-columns: 360px 1fr">
         <!-- Directory browser -->
