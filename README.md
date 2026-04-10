@@ -4,13 +4,13 @@
 
 # ZenClaw
 
-A fully autonomous AI agent that fits on a $3 ESP32-S3 microcontroller — 512KB of SRAM, cloud-backed persistence (S3-compatible), 40+ built-in tools, vector memory, cron scheduling, and a Telegram bot. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Built for MicroPython and deployable straight from the browser via Web Serial.
+A fully autonomous AI agent that fits on a $3 ESP32-S3 microcontroller — 512KB of SRAM, cloud-backed persistence (S3-compatible), consolidated action-param tools, vector memory, cron scheduling, and a Telegram bot. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Built for MicroPython and deployable straight from the browser via Web Serial. Runs on ESP32-S3 with or without PSRAM.
 
 ## Features
 
 - **Multi-provider LLM support**: Google Gemini (native API), any OpenAI-compatible provider (OpenAI, DeepSeek, Groq, local models via Ollama, etc.)
 - **Tool-use agent loop**: Call LLM, execute tools, persist context, repeat
-- **40+ built-in tools**: File I/O, code exec, vector memory, cron scheduling, web search, sub-agents, MCP client, image generation, Google Sheets, cloud storage (S3), Telegram messaging
+- **Consolidated tool system**: ~20 tools using action-param pattern (file I/O, code exec, vector memory, cron, web, sub-agents, MCP client, cloud storage, skills). Lazy-loaded to save RAM — modules import on first use, not at boot
 - **Circuit breaker**: Detects stuck loops, no-progress polling, ping-pong patterns
 - **Vector memory**: Keyword + embedding hybrid search with persistent markdown storage
 - **Session management**: JSONL-persisted branching conversation trees
@@ -64,7 +64,7 @@ firmware/main.py (ESP32) / firmware/run.py (desktop)
     agent_loop.py               — LLM -> tool execution -> repeat
       runner.py                 — Provider dispatch, retry, streaming
       providers/                — Gemini native API + OpenAI-compatible format
-      tools/                    — 40+ registered tools
+      tools/                    — Consolidated tools (lazy-loaded, action-param pattern)
       tool_loop.py              — Circuit breaker for stuck loops
     session_manager/            — JSONL branching conversation trees
     heartbeat_runner.py         — Autonomous background loop + cron
@@ -92,7 +92,7 @@ zenclaw/
       runner.py             Provider dispatch + retry
       prompt.py             System prompt builder
       providers/            LLM API implementations
-      tools/                40+ tool modules
+      tools/                Consolidated tool modules (action-param pattern)
       session_manager/      Conversation persistence
       telegram/             Bot polling, sending, media
       channels/             Channel abstraction (cli, telegram)
@@ -168,7 +168,7 @@ The ESP32 is a $3 microcontroller with limited, wear-prone flash storage. Filesy
 }
 ```
 
-Agent system data is stored under a `sys/` prefix in the bucket (stripped transparently). User files uploaded via the file manager or `storage_write` tool go to the bucket root. The web UI provides a cloud file browser with presigned URLs for direct browser-to-bucket uploads and downloads.
+Agent system data is stored under a `sys/` prefix in the bucket (stripped transparently). User files uploaded via the file manager or `storage(action="write")` tool go to the bucket root. The web UI provides a cloud file browser with presigned URLs for direct browser-to-bucket uploads and downloads.
 
 ## Agent Identity
 

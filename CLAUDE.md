@@ -18,24 +18,26 @@ cd firmware && micropython -X heapsize=4m test_tools.py
 
 ### ESP32-S3 Deployment
 
-**Preferred: Build + Flash (reliable, atomic)**
+**Preferred: Web UI provisioning (complete, handles everything)**
+
+Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome or Edge (Web Serial required). The provisioning wizard flashes MicroPython + LittleFS filesystem + NVS (WiFi creds) and pushes the API key config — all in one shot. No CLI tools needed.
+
+**Alternative: Build + Flash via CLI**
 
 ```bash
 # 1. Build the LittleFS image (includes all firmware/ files + data/SOUL.md, data/AGENTS.md)
 ./scripts/build-firmware-image.sh
 # Output: web/public/firmware/zenclaw.img (14MB)
 
-# 2a. Flash via browser: run the Nuxt dev server, open the provisioning wizard
-cd web && npm run dev
-# Navigate to http://localhost:3000 → Provisioning → Flash filesystem image
-
-# 2b. Flash via CLI: enter bootloader mode first (hold BOOT + press RESET on the board)
-#     PID changes from 303a:4001 (app) to 303a:0002 (bootloader)
+# 2. Flash via CLI: enter bootloader mode first (hold BOOT + press RESET on the board)
+#    PID changes from 303a:4001 (app) to 303a:0002 (bootloader)
 esptool --port /dev/ttyACM0 --chip esp32s3 write-flash 0x200000 web/public/firmware/zenclaw.img
-#     Press RESET after flashing to boot into application mode
+#    Press RESET after flashing to boot into application mode
 ```
 
 Requires: `littlefs-python` (`pipx install littlefs-python`), `esptool` (`pipx install esptool`)
+
+Note: CLI flashing only writes the filesystem image. You still need to flash MicroPython separately and provision WiFi credentials + config.json manually. The web UI handles all of this automatically.
 
 **Alternative: mpremote cp (individual files, device must be at REPL)**
 
@@ -112,7 +114,7 @@ firmware/main.py (ESP32) / firmware/run.py (desktop)
     -> firmware/agent/agent_loop.py       (LLM <-> tool execution loop)
       -> firmware/agent/runner.py         (provider dispatch, retry, streaming)
       -> firmware/agent/providers/        (Gemini/OpenAI/Anthropic API calls)
-      -> firmware/agent/tools/            (37 registered tools)
+      -> firmware/agent/tools/            (consolidated action-param tools, lazy-loaded)
     -> firmware/agent/session_manager/    (JSONL conversation tree persistence)
     -> firmware/agent/heartbeat_runner.py (autonomous background loop)
 ```
@@ -178,23 +180,23 @@ zenclaw/
       heartbeat_runner.py     Autonomous background loop
       ...                     (20+ more support modules)
 
-      tools/                  37 registered tools
-        __init__.py           ZenClawTools registry + executor
+      tools/                  Consolidated tools (action-param pattern, lazy-loaded)
+        __init__.py           ZenClawTools registry + lazy loader (imports on first execute)
         file_tools.py         read, write, edit, list_dir
         exec_tool.py          exec (code execution with print capture)
-        memory_tools.py       memory_save, memory_get, memory_search, memory_reindex, embed_text
-        cron_tools.py         cron_add, cron_list, cron_remove, cron_run, cron_update
-        web_tools.py          web_fetch, hub_search, hub_install
-        session_tools.py      session_list, session_history
-        session_status_tool.py  session_status (time, uptime, memory, model)
-        gateway_tool.py       gateway_status, gateway_reload
+        memory_tools.py       memory (action: save/search/get/reindex)
+        cron_tools.py         cron (action: add/list/remove/run/update)
+        web_tools.py          web_fetch, web_search, hub_search, hub_install
+        session_tools.py      session (action: status/list/history)
+        gateway_tool.py       gateway (action: status/reload)
         message_tool.py       message_send (cross-channel delivery)
         subagent_tools.py     subagents, sessions_spawn
-        mcp_tools.py          mcp_connect, mcp_call, mcp_list_tools, mcp_servers_list
-        gsheets_tools.py      Google Sheets read/write/chart
-        skill_tools.py        run_skill, list_skills, browse_skills, stop_skill
-        sensor_tools.py       Hardware sensors (not registered for headless)
-        storage_tools.py      Cloud storage (S3-compatible: read, write, delete, list)
+        mcp_tools.py          mcp (action: connect/list_tools/call/disconnect/servers)
+        gsheets_tools.py      Google Sheets (conditional: only if google.client_id configured)
+        skill_tools.py        skill (action: run/stop/browse)
+        sensor_tools.py       sense (hardware sensors, not registered for headless)
+        storage_tools.py      storage (action: read/write/delete/list/info/grep/analyze)
+        storage_heavy.py      Lazy-loaded heavy storage operations
 
       session_manager/        JSONL conversation persistence
       subagents/              Background agent spawning
@@ -250,29 +252,44 @@ All coroutines use `async def` + `await`. Do not use `yield from` for async call
 
 ### Tool Registration
 
-Each tool module exports a `create_X_tools(config)` function returning a dict:
+Tools use the **action-param pattern** — each module registers one tool with an `action` parameter that selects the operation. This reduces tool count for the LLM and saves RAM through fewer schema entries.
+
 ```python
 def create_my_tools(config):
+    async def _do_read(args):
+        return 'read result'
+
+    async def _do_write(args):
+        content = args.get('content', '')
+        return 'wrote {} bytes'.format(len(content))
+
     async def _my_tool(args):
-        value = args.get('param_name', 'default')
-        return 'result string'
+        action = args.get('action', 'read')
+        if action == 'read':
+            return await _do_read(args)
+        if action == 'write':
+            return await _do_write(args)
+        return "Unknown action '{}'".format(action)
 
     return {
         'my_tool': {
-            'description': 'What the tool does',
+            'description': 'My tool. Actions: read, write.',
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'param_name': {'type': 'string', 'description': '...'},
+                    'action': {'type': 'string', 'enum': ['read', 'write']},
+                    'content': {'type': 'string', 'description': 'Content (write)'},
                 },
-                'required': [],
+                'required': ['action'],
             },
             'execute': _my_tool,
         },
     }
 ```
 
-Register in `firmware/agent/tools/__init__.py` by adding the import and creator to `_collect_tools()`.
+Register in `firmware/agent/tools/__init__.py` by adding the module to `_TOOL_MODULES`.
+
+**Lazy loading**: `__init__.py` imports each module at boot only to extract schemas, then releases the module from `sys.modules`. The actual bytecode is garbage-collected and only re-imported on first `execute()`. This saves ~130KB of RAM on ESP32 boards without PSRAM.
 
 ### Logging
 
