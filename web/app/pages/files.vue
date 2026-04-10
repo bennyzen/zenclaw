@@ -222,7 +222,20 @@ async function handleUpload(event: Event) {
       const path = currentPath.value === '.'
         ? file.name
         : `${currentPath.value}/${file.name}`
-      await uploadFile(path, data)
+      try {
+        await uploadFile(path, data)
+      } catch (e: any) {
+        if (data.byteLength > 256 * 1024 || e.message?.includes('too large')) {
+          const key = currentPath.value === '.'
+            ? file.name
+            : `${currentPath.value}/${file.name}`
+          await uploadCloudFile(key, data)
+          isCloud.value = true
+          currentPath.value = ''
+        } else {
+          throw e
+        }
+      }
     }
     await loadDir(currentPath.value)
   } catch (e: any) {
