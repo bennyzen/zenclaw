@@ -327,6 +327,10 @@ watch(() => state.networkConnected, (connected) => {
       </div>
     </div>
 
+    <p class="text-sm text-dimmed">
+      Files up to 256 KB are stored on the device. Larger files are automatically uploaded to cloud storage and won't use device space. The agent can read and search cloud files of any size.
+    </p>
+
     <template v-if="state.networkConnected">
       <UAlert v-if="error" icon="i-lucide-circle-x" color="error" variant="subtle" :description="error" />
 
