@@ -97,13 +97,15 @@ const filteredModels = computed(() => {
 
 const isCustomProvider = computed(() => apiProvider.value === 'custom')
 
+let _restoring = true
+
 watch(apiProvider, (name) => {
   if (BASE_URLS[name]) baseUrl.value = BASE_URLS[name]
-  apiModel.value = ''
+  if (!_restoring) apiModel.value = ''
 })
 
-onMounted(() => {
-  fetchModels()
+onMounted(async () => {
+  await fetchModels()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
     if (!saved) return
@@ -116,6 +118,7 @@ onMounted(() => {
     if (data.deviceName) deviceName.value = data.deviceName
     if (data.baseUrl) baseUrl.value = data.baseUrl
   } catch { /* ignore */ }
+  _restoring = false
 })
 const deviceIp = computed(() => `${deviceName.value}.local`)
 const flashing = ref(false)
