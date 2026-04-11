@@ -405,7 +405,7 @@ mod tests {
 
     fn temp_dir() -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let dir = format!("/tmp/zenclaw_test_{}", id);
+        let dir = format!("/tmp/zenclaw_test_{}/sessions", id);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
