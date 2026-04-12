@@ -286,7 +286,7 @@ fn build_chat_request(
 // --- Convert genai response to our types ---
 
 fn parse_chat_response(response: genai::chat::ChatResponse) -> Result<LlmResponse, RunnerError> {
-    let text = response.content_text_as_str().map(|s| s.to_string());
+    let text = response.first_text().map(|s| s.to_string());
     let tool_calls_raw = response.into_tool_calls();
     let our_tcs = convert_tool_calls(&tool_calls_raw);
     let provider_data = if !tool_calls_raw.is_empty() {

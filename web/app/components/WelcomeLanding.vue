@@ -18,7 +18,10 @@ onMounted(() => {
 async function connect() {
   if (!hostname.value || state.connecting) return
   try {
-    await connectNetwork(hostname.value + '.local')
+    // If it looks like a raw address (IP, localhost:port), use as-is; otherwise append .local
+    const raw = hostname.value
+    const addr = raw.includes('.') || raw.includes(':') ? raw : raw + '.local'
+    await connectNetwork(addr)
     router.push('/dashboard')
   } catch { /* error shown via state.error */ }
 }
@@ -69,7 +72,7 @@ async function connect() {
               class="flex-1"
               @keydown.enter="connect"
             >
-              <template #trailing>
+              <template v-if="!hostname.includes('.') && !hostname.includes(':')" #trailing>
                 <span class="text-xs text-dimmed">.local</span>
               </template>
             </UInput>

@@ -28,8 +28,6 @@ pub async fn run_loop(
     let tool_defs = tools.definitions();
     let mut consecutive_errors: usize = 0;
     let mut loop_detector = LoopDetector::new();
-    let mut last_content = String::new();
-
     loop {
         // Check cancellation before LLM call
         if let Some(token) = cancel {
@@ -57,15 +55,14 @@ pub async fn run_loop(
 
         match response {
             LlmResponse::Text(text) => {
-                last_content = text.clone();
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: MessageContent::Text(text),
+                    content: MessageContent::Text(text.clone()),
                     tool_calls: None,
                     tool_call_id: None,
                     provider_data: None,
                 });
-                break;
+                return Ok(text);
             }
             LlmResponse::ToolCalls { tool_calls, provider_data } => {
                 execute_tool_calls(
@@ -81,7 +78,6 @@ pub async fn run_loop(
                 .await?;
             }
             LlmResponse::Mixed { text, tool_calls, provider_data } => {
-                last_content = text.clone();
                 execute_tool_calls(
                     &tool_calls,
                     Some(&text),
@@ -96,8 +92,6 @@ pub async fn run_loop(
             }
         }
     }
-
-    Ok(last_content)
 }
 
 async fn execute_tool_calls(

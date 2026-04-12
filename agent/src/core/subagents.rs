@@ -1,14 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::info;
 
 /// Maximum concurrent subagents per parent session.
 const MAX_CHILDREN_PER_AGENT: usize = 5;
 /// Maximum spawn depth (subagent of subagent of...).
 const MAX_SPAWN_DEPTH: usize = 3;
-/// Default run timeout in seconds.
-const DEFAULT_RUN_TIMEOUT_S: u64 = 300;
 
 /// Status of a subagent run.
 #[derive(Debug, Clone, PartialEq)]
