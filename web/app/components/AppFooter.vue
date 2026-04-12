@@ -111,6 +111,11 @@ const tooltipUi = {
         </template>
       </UTooltip>
 
+      <span v-if="state.lastStatus?.model" class="cell text-muted">
+        <UIcon name="i-lucide-bot" class="size-3 text-dimmed" />
+        {{ [state.lastStatus.provider, state.lastStatus.model].filter(Boolean).join('/') }}
+      </span>
+
       <UTooltip v-if="state.lastStatus?.temperatureC != null" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-thermometer" class="size-3 text-dimmed" />

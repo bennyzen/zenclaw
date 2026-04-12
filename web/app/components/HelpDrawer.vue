@@ -25,7 +25,7 @@ const currentHelp = computed(() => routeHelp[route.path] ?? 'dashboard')
       aria-label="Help"
       @click="open = true"
     />
-    <USlideover v-model:open="open" side="right">
+    <USlideover v-model:open="open" side="right" title="Help" description="Contextual help for the current page">
       <template #body>
         <HelpDashboard v-if="currentHelp === 'dashboard'" />
         <HelpProvision v-else-if="currentHelp === 'provision'" />

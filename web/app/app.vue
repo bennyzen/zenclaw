@@ -4,6 +4,7 @@ const navItems = [
   { label: 'Chat', to: '/chat', icon: 'i-lucide-message-circle' },
   { label: 'Provision', to: '/provision', icon: 'i-lucide-cpu' },
   { label: 'Files', to: '/files', icon: 'i-lucide-folder' },
+  { label: 'Memory', to: '/memory', icon: 'i-lucide-brain' },
   { label: 'Config', to: '/config', icon: 'i-lucide-settings' },
   { label: 'Logs', to: '/logs', icon: 'i-lucide-scroll-text' },
 ]

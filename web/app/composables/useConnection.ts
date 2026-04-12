@@ -17,6 +17,7 @@ const state = reactive<ConnectionState>({
 })
 
 let statsWs: WebSocket | null = null
+let statsPollTimer: ReturnType<typeof setInterval> | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectDelay = 2000
 let _savedHostname: string | null = null
@@ -47,7 +48,9 @@ async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> 
   const res = await fetch(url, { ...options, headers })
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(body.error || `HTTP ${res.status}`)
+    const err: any = new Error(body.error || `HTTP ${res.status}`)
+    err.status = res.status
+    throw err
   }
   return res.json()
 }
@@ -88,6 +91,8 @@ function mapStatus(raw: Record<string, any>): DeviceStatus {
           error: raw.cloud_storage.error,
         }
       : null,
+    provider: raw.provider || null,
+    model: raw.model || null,
     uptimeS: raw.uptime_s ?? null,
   }
 }
@@ -115,39 +120,76 @@ function scheduleReconnect() {
   }, reconnectDelay)
 }
 
+function mergeStats(raw: Record<string, any>) {
+  const partial = mapStatus(raw)
+  if (state.lastStatus) {
+    state.lastStatus = {
+      ...state.lastStatus,
+      memory: partial.memory,
+      temperatureC: partial.temperatureC,
+      wifi: partial.wifi,
+      storage: partial.storage,
+      uptimeS: partial.uptimeS,
+    }
+  }
+}
+
+let _pollFailCount = 0
+
+function startStatsPoll() {
+  if (statsPollTimer) return
+  _pollFailCount = 0
+  statsPollTimer = setInterval(async () => {
+    if (!state.networkConnected) return
+    try {
+      const res = await fetch(`${baseUrl()}/api/status`, { signal: AbortSignal.timeout(10000) })
+      if (res.ok) {
+        mergeStats(await res.json())
+        _pollFailCount = 0
+      } else {
+        _pollFailCount++
+      }
+    } catch {
+      _pollFailCount++
+    }
+    if (_pollFailCount >= 3) {
+      stopStatsPoll()
+      state.networkConnected = false
+      updateMode()
+      scheduleReconnect()
+    }
+  }, 15000)
+}
+
+function stopStatsPoll() {
+  if (statsPollTimer) {
+    clearInterval(statsPollTimer)
+    statsPollTimer = null
+  }
+}
+
 function startStatsStream() {
+  // Always start HTTP polling as baseline
+  startStatsPoll()
+
+  // Try WebSocket for faster updates — fall back to polling if it fails
   if (statsWs) return
   const url = `${wsUrl()}/ws/stats`
   statsWs = new WebSocket(url)
   statsWs.onmessage = (event) => {
     try {
-      const raw = JSON.parse(event.data)
-      // Stats stream doesn't include agent_name/version, merge with existing
-      const partial = mapStatus(raw)
-      if (state.lastStatus) {
-        state.lastStatus = {
-          ...state.lastStatus,
-          memory: partial.memory,
-          temperatureC: partial.temperatureC,
-          wifi: partial.wifi,
-          storage: partial.storage,
-          uptimeS: partial.uptimeS,
-        }
-      }
+      mergeStats(JSON.parse(event.data))
     } catch { /* ignore parse errors */ }
   }
   statsWs.onclose = () => {
     statsWs = null
-    if (state.networkConnected) {
-      state.networkConnected = false
-      updateMode()
-      scheduleReconnect()
-    }
+    // Don't disconnect — polling keeps stats alive
   }
   statsWs.onerror = () => { statsWs?.close() }
 }
 
 function stopStatsStream() {
+  stopStatsPoll()
   if (statsWs) {
     statsWs.close()
     statsWs = null
@@ -181,6 +223,24 @@ export function useConnection() {
       state.connecting = false
       updateMode()
       startStatsStream()
+
+      // Fill in model from config if status didn't include it
+      if (!state.lastStatus.model) {
+        try {
+          const cfgRes = await fetch(`${baseUrl()}/api/config`, { signal: AbortSignal.timeout(5000) })
+          if (cfgRes.ok) {
+            const cfg = await cfgRes.json()
+            const defaultProvider = cfg.providers?.default
+            if (defaultProvider && cfg.providers?.[defaultProvider]?.model) {
+              state.lastStatus = {
+                ...state.lastStatus!,
+                provider: state.lastStatus!.provider || defaultProvider,
+                model: cfg.providers[defaultProvider].model,
+              }
+            }
+          }
+        } catch { /* non-critical */ }
+      }
     } catch (e) {
       state.networkConnected = false
       state.connecting = false
