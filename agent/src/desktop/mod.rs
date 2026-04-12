@@ -1,6 +1,9 @@
 #[cfg(feature = "desktop")]
-pub mod platform_impl {
-    // TODO: implement ReqwestHttpClient (HttpClient trait)
-    // TODO: implement AxumHttpServer (HttpServer trait)
-    // TODO: implement TokioRuntime (Runtime trait)
-}
+mod http_client;
+#[cfg(feature = "desktop")]
+mod server;
+
+#[cfg(feature = "desktop")]
+pub use http_client::ReqwestHttpClient;
+#[cfg(feature = "desktop")]
+pub use server::start_api_server;

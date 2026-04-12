@@ -6,5 +6,7 @@ pub mod memory;
 pub mod prompt;
 pub mod runner;
 pub mod sessions;
+pub mod tool_loop;
 pub mod tools;
 pub mod types;
+pub mod workspace;
