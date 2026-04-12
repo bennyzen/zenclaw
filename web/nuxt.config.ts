@@ -38,7 +38,17 @@ export default defineNuxtConfig({
 
   vite: {
     optimizeDeps: {
-      include: ['@vue/devtools-core', '@vue/devtools-kit', 'esptool-js', 'pretty-bytes'],
+      include: [
+        '@vue/devtools-core',
+        '@vue/devtools-kit',
+        'esptool-js',
+        'pretty-bytes',
+        'vue-codemirror',
+        '@codemirror/lang-python',
+        '@codemirror/lang-json',
+        '@codemirror/lang-markdown',
+        '@codemirror/theme-one-dark',
+      ],
     },
   },
 })
