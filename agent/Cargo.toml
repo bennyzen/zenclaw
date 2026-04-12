@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = ["desktop"]
-desktop = ["tokio", "axum", "reqwest", "teloxide", "tower-http", "reqwest-eventsource", "tokio-util", "futures", "genai"]
+desktop = ["tokio", "axum", "reqwest", "tower-http", "reqwest-eventsource", "tokio-util", "futures", "genai"]
 esp32 = []
 hnsw = ["usearch"]
 
@@ -26,7 +26,8 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 reqwest-eventsource = { version = "0.6", optional = true }
-teloxide = { version = "0.17", features = ["macros"], optional = true }
+# teloxide removed — our Telegram poller uses raw reqwest HTTP calls instead
+# teloxide = { version = "0.17", features = ["macros"], optional = true }
 tokio-util = { version = "0.7", optional = true }
 futures = { version = "0.3", optional = true }
 
@@ -36,3 +37,8 @@ genai = { version = "0.6.0-beta", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
