@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bg_gateway = gateway.clone();
     let bg_token = bg_cancel.clone();
     tokio::spawn(async move {
-        let runner = zenclaw_agent::core::background::BackgroundRunner::new(bg_gateway.config.clone());
+        let runner = zenclaw_agent::core::background::BackgroundRunner::new(bg_gateway.config.clone(), bg_gateway.data_dir.clone());
         runner.run(bg_token).await;
     });
 

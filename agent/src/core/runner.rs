@@ -141,6 +141,271 @@ impl Runner {
         Err(last_error.unwrap_or(RunnerError::Api("Unknown error after retries".to_string())))
     }
 
+    /// Send messages to the LLM with streaming and retry, accumulating the full response.
+    ///
+    /// Each text delta is delivered to `on_delta` as it arrives. After the stream ends,
+    /// returns the accumulated `LlmResponse` (same type as non-streaming `call()`).
+    pub async fn call_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        model_override: Option<&str>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LlmResponse, RunnerError> {
+        let provider = self.resolve_provider(model_override);
+        let model = model_override
+            .map(|s| s.to_string())
+            .or_else(|| provider.model.clone())
+            .unwrap_or_else(|| "gpt-4o-mini".to_string());
+        let base_url = provider
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let api_key = provider.api_key.clone().unwrap_or_default();
+
+        let is_local = base_url.contains("127.0.0.1")
+            || base_url.contains("localhost")
+            || base_url.contains("192.168.");
+        if !is_local && api_key.is_empty() {
+            return Err(RunnerError::NoApiKey);
+        }
+
+        let is_gemini = is_gemini_url(&base_url);
+        let tools_for_llm = build_tools_payload(tools, is_gemini, &model);
+
+        info!(model = %model, provider = %self.config.providers.default, "LLM stream call");
+
+        let mut last_error = None;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+        for attempt in 1..=MAX_RETRIES {
+            match self
+                .stream_once(
+                    &base_url,
+                    &api_key,
+                    &model,
+                    messages,
+                    &tools_for_llm,
+                    is_gemini,
+                    on_delta,
+                )
+                .await
+            {
+                Ok(response) => {
+                    if attempt > 1 {
+                        info!(attempt, "LLM stream call succeeded after retry");
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    info!(attempt, error = %e, "LLM stream call failed");
+                    if !e.is_retryable() || attempt >= MAX_RETRIES {
+                        last_error = Some(e);
+                        break;
+                    }
+
+                    let sleep_ms = if matches!(e, RunnerError::RateLimit) {
+                        (30_000 * (1u64 << (attempt as u64 - 1))).min(MAX_BACKOFF_MS)
+                    } else {
+                        backoff_ms.min(MAX_BACKOFF_MS)
+                    };
+
+                    info!(sleep_ms, "Retrying stream after backoff");
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    backoff_ms *= 2;
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(RunnerError::Api("Unknown error after retries".to_string())))
+    }
+
+    async fn stream_once(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        messages: &[Message],
+        tools_payload: &Option<serde_json::Value>,
+        is_gemini: bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LlmResponse, RunnerError> {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        );
+
+        let (url, payload) = if is_gemini {
+            build_gemini_stream_request(base_url, api_key, model, messages, tools_payload)
+        } else {
+            if !api_key.is_empty() {
+                headers.insert(
+                    "Authorization".to_string(),
+                    format!("Bearer {}", api_key),
+                );
+            }
+            build_openai_stream_request(base_url, model, messages, tools_payload)
+        };
+
+        let body =
+            serde_json::to_vec(&payload).map_err(|e| RunnerError::Parse(e.to_string()))?;
+
+        // Collect all SSE chunks via the Send-compatible callback, then parse them
+        // sequentially so we can call on_delta (which is not Send).
+        let chunks: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chunks_clone = chunks.clone();
+
+        self.http
+            .stream_post(
+                &url,
+                &headers,
+                &body,
+                Box::new(move |data: String| {
+                    chunks_clone.lock().unwrap().push(data);
+                }),
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("429") || msg.contains("HTTP 429") {
+                    RunnerError::RateLimit
+                } else if msg.contains("401") || msg.contains("403") {
+                    RunnerError::Auth(msg)
+                } else {
+                    RunnerError::Network(msg)
+                }
+            })?;
+
+        // Parse collected chunks into accumulated response
+        let collected = chunks.lock().unwrap();
+        let mut accumulated_text = String::new();
+        let mut tool_calls_map: HashMap<u32, (String, String, String)> = HashMap::new();
+
+        for data in collected.iter() {
+            let chunk: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if is_gemini {
+                // Gemini streaming: each chunk has candidates[0].content.parts[]
+                if let Some(parts) = chunk
+                    .pointer("/candidates/0/content/parts")
+                    .and_then(|p| p.as_array())
+                {
+                    for part in parts {
+                        if part.get("thought").is_some() {
+                            continue;
+                        }
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            on_delta(t);
+                            accumulated_text.push_str(t);
+                        }
+                        if let Some(fc) = part.get("functionCall") {
+                            let name = fc
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let args = fc
+                                .get("args")
+                                .map(|a| {
+                                    serde_json::to_string(a)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                })
+                                .unwrap_or_else(|| "{}".to_string());
+                            let idx = tool_calls_map.len() as u32;
+                            tool_calls_map
+                                .insert(idx, (format!("call_{}", name), name, args));
+                        }
+                    }
+                }
+            } else {
+                // OpenAI streaming: choices[0].delta.content / choices[0].delta.tool_calls
+                if let Some(delta) = chunk.pointer("/choices/0/delta") {
+                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                        on_delta(content);
+                        accumulated_text.push_str(content);
+                    }
+
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tcs {
+                            let idx =
+                                tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                            let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                let id = tc
+                                    .get("id")
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = tc
+                                    .pointer("/function/name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                (id, name, String::new())
+                            });
+                            // Subsequent chunks may carry id/name too
+                            if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                                if !id.is_empty() {
+                                    entry.0 = id.to_string();
+                                }
+                            }
+                            if let Some(name) =
+                                tc.pointer("/function/name").and_then(|n| n.as_str())
+                            {
+                                if !name.is_empty() {
+                                    entry.1 = name.to_string();
+                                }
+                            }
+                            // Append argument fragments
+                            if let Some(args_chunk) =
+                                tc.pointer("/function/arguments").and_then(|a| a.as_str())
+                            {
+                                entry.2.push_str(args_chunk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build final tool calls sorted by index
+        let tool_calls: Vec<ToolCall> = if tool_calls_map.is_empty() {
+            Vec::new()
+        } else {
+            let mut entries: Vec<(u32, (String, String, String))> =
+                tool_calls_map.into_iter().collect();
+            entries.sort_by_key(|(idx, _)| *idx);
+            entries
+                .into_iter()
+                .map(|(_, (id, name, args))| ToolCall {
+                    id,
+                    function: FunctionCall {
+                        name,
+                        arguments: if args.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            args
+                        },
+                    },
+                })
+                .collect()
+        };
+
+        match (accumulated_text.is_empty(), tool_calls.is_empty()) {
+            (false, false) => Ok(LlmResponse::Mixed {
+                text: accumulated_text,
+                tool_calls,
+            }),
+            (true, false) => Ok(LlmResponse::ToolCalls(tool_calls)),
+            (_, true) => Ok(LlmResponse::Text(accumulated_text)),
+        }
+    }
+
     async fn call_once(
         &self,
         base_url: &str,
@@ -286,6 +551,17 @@ fn build_openai_request(
     (url, payload)
 }
 
+fn build_openai_stream_request(
+    base_url: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &Option<serde_json::Value>,
+) -> (String, serde_json::Value) {
+    let (url, mut payload) = build_openai_request(base_url, model, messages, tools);
+    payload["stream"] = serde_json::json!(true);
+    (url, payload)
+}
+
 fn build_gemini_request(
     base_url: &str,
     api_key: &str,
@@ -372,6 +648,22 @@ fn build_gemini_request(
         payload["tools"] = t.clone();
     }
 
+    (url, payload)
+}
+
+fn build_gemini_stream_request(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Message],
+    tools: &Option<serde_json::Value>,
+) -> (String, serde_json::Value) {
+    let (_, payload) = build_gemini_request(base_url, api_key, model, messages, tools);
+    let clean_url = base_url.replace("/openai", "");
+    let url = format!(
+        "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+        clean_url, model, api_key
+    );
     (url, payload)
 }
 
@@ -709,5 +1001,41 @@ mod tests {
             },
         ]);
         assert_eq!(parts.as_text(), "hello world");
+    }
+
+    #[test]
+    fn test_build_openai_stream_request() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let (url, payload) =
+            build_openai_stream_request("https://api.openai.com/v1", "gpt-4o", &messages, &None);
+        assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_build_gemini_stream_request() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Text("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let (url, payload) = build_gemini_stream_request(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "test-key",
+            "gemini-2.5-flash",
+            &messages,
+            &None,
+        );
+        assert!(url.contains("streamGenerateContent"));
+        assert!(url.contains("alt=sse"));
+        assert!(url.contains("key=test-key"));
+        assert!(payload.get("contents").is_some());
     }
 }

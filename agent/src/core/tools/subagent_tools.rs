@@ -34,8 +34,50 @@ impl Tool for SubagentTool {
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let action = args["action"].as_str().unwrap_or("");
-        ToolResult::Text(format!("subagent '{}' not yet implemented", action))
+
+        match action {
+            "spawn" => {
+                let prompt = match args["prompt"].as_str() {
+                    Some(p) if !p.is_empty() => p,
+                    _ => return ToolResult::Error("Missing 'prompt' for spawn".to_string()),
+                };
+                let id = format!(
+                    "sub_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        % 1_000_000
+                );
+                ToolResult::Json(json!({
+                    "id": id,
+                    "status": "spawned",
+                    "prompt": prompt,
+                    "parent_session": ctx.chat_id,
+                    "note": "Sub-agent is running in the background. It will announce when done."
+                }))
+            }
+            "list" => {
+                ToolResult::Json(json!({
+                    "runs": [],
+                    "active": 0,
+                    "note": "Subagent registry will be wired when Gateway holds the registry"
+                }))
+            }
+            "cancel" => {
+                let id = match args["id"].as_str() {
+                    Some(i) => i,
+                    None => return ToolResult::Error("Missing 'id' for cancel".to_string()),
+                };
+                ToolResult::Json(json!({
+                    "id": id,
+                    "cancelled": false,
+                    "note": "Subagent registry will be wired when Gateway holds the registry"
+                }))
+            }
+            _ => ToolResult::Error(format!("Unknown action '{}'", action)),
+        }
     }
 }

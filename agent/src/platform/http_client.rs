@@ -43,6 +43,6 @@ pub trait HttpClient: Send + Sync {
         url: &str,
         headers: &Headers,
         body: &[u8],
-        on_chunk: Box<dyn FnMut(&str) + Send>,
+        on_chunk: Box<dyn FnMut(String) + Send>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }

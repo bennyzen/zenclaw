@@ -1,11 +1,14 @@
 pub mod agent_loop;
 pub mod background;
 pub mod channels;
+pub mod cron;
 pub mod gateway;
 pub mod memory;
 pub mod prompt;
 pub mod runner;
 pub mod sessions;
+pub mod subagents;
+pub mod telegram;
 pub mod tool_loop;
 pub mod tools;
 pub mod types;

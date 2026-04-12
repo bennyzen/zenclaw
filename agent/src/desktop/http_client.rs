@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use futures::StreamExt;
+use reqwest_eventsource::{Event, EventSource};
 
 use crate::platform::http_client::{Headers, HttpClient, Response};
 
@@ -126,12 +128,58 @@ impl HttpClient for ReqwestHttpClient {
 
     async fn stream_post(
         &self,
-        _url: &str,
-        _headers: &Headers,
-        _body: &[u8],
-        _on_chunk: Box<dyn FnMut(&str) + Send>,
+        url: &str,
+        headers: &Headers,
+        body: &[u8],
+        mut on_chunk: Box<dyn FnMut(String) + Send>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // TODO: SSE streaming with reqwest-eventsource
+        let mut req = self.client.post(url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let req = req.body(body.to_vec());
+
+        let mut es = EventSource::new(req)?;
+
+        loop {
+            let event = match es.next().await {
+                Some(e) => e,
+                None => break,
+            };
+            match event {
+                Ok(Event::Open) => {}
+                Ok(Event::Message(msg)) => {
+                    let data = msg.data.trim().to_owned();
+                    if data == "[DONE]" {
+                        break;
+                    }
+                    if !data.is_empty() {
+                        on_chunk(data);
+                    }
+                }
+                Err(reqwest_eventsource::Error::StreamEnded) => break,
+                Err(reqwest_eventsource::Error::InvalidStatusCode(status, resp)) => {
+                    let status_code = status.as_u16();
+                    let body_text = resp
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    es.close();
+                    return Err(format!(
+                        "Stream HTTP {}: {}",
+                        status_code,
+                        &body_text[..body_text.len().min(200)]
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    es.close();
+                    return Err(format!("Stream error: {}", e).into());
+                }
+            }
+        }
+
+        es.close();
         Ok(())
     }
 }

@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = ["desktop"]
-desktop = ["tokio", "axum", "reqwest", "teloxide", "tower-http", "reqwest-eventsource", "tokio-util"]
+desktop = ["tokio", "axum", "reqwest", "teloxide", "tower-http", "reqwest-eventsource", "tokio-util", "futures"]
 esp32 = []
 hnsw = ["usearch"]
 
@@ -28,6 +28,10 @@ reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 reqwest-eventsource = { version = "0.6", optional = true }
 teloxide = { version = "0.17", features = ["macros"], optional = true }
 tokio-util = { version = "0.7", optional = true }
+futures = { version = "0.3", optional = true }
 
 # Optional
 usearch = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

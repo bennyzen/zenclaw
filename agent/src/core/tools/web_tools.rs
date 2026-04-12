@@ -71,7 +71,7 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Web search stub.
+/// Web search using Brave Search API.
 pub struct WebSearchTool;
 
 #[async_trait]
@@ -79,13 +79,17 @@ impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_search".to_string(),
-            description: "Search the web (requires search provider config).".to_string(),
+            description: "Search the web.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "Search query"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of results (default 5, max 20)"
                     }
                 },
                 "required": ["query"]
@@ -93,7 +97,101 @@ impl Tool for WebSearchTool {
         }
     }
 
-    async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
-        ToolResult::Error("Web search not configured. Set search provider in config.".to_string())
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let query = match args["query"].as_str() {
+            Some(q) if !q.is_empty() => q,
+            _ => return ToolResult::Error("Missing 'query'".to_string()),
+        };
+        let count = args["count"].as_u64().unwrap_or(5).min(20) as usize;
+
+        let api_key = ctx
+            .config
+            .providers
+            .entries
+            .get("brave")
+            .and_then(|e| e.api_key.clone());
+
+        #[cfg(feature = "desktop")]
+        {
+            let api_key = match api_key {
+                Some(k) if !k.is_empty() => k,
+                _ => {
+                    return ToolResult::Text(
+                        "Web search not configured. Add a 'brave' provider with your Brave Search API key in config. \
+                         You can still use web_fetch to read URLs, or rely on Gemini's built-in Google Search grounding."
+                            .to_string(),
+                    )
+                }
+            };
+
+            let encoded: String = query.chars().map(|c| match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+                ' ' => "+".to_string(),
+                _ => {
+                    let mut buf = [0u8; 4];
+                    c.encode_utf8(&mut buf);
+                    buf[..c.len_utf8()]
+                        .iter()
+                        .map(|b| format!("%{:02X}", b))
+                        .collect()
+                }
+            }).collect();
+
+            let url = format!(
+                "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+                encoded, count
+            );
+
+            let client = reqwest::Client::new();
+            let resp = match client
+                .get(&url)
+                .header("Accept", "application/json")
+                .header("X-Subscription-Token", &api_key)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return ToolResult::Error(format!("Search failed: {}", e)),
+            };
+
+            if !resp.status().is_success() {
+                return ToolResult::Error(format!("Search API HTTP {}", resp.status().as_u16()));
+            }
+
+            let body: serde_json::Value = match resp.json().await {
+                Ok(j) => j,
+                Err(e) => return ToolResult::Error(format!("Parse error: {}", e)),
+            };
+
+            let results = body
+                .pointer("/web/results")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let formatted: Vec<String> = results
+                .iter()
+                .take(count)
+                .enumerate()
+                .map(|(i, r)| {
+                    let title = r["title"].as_str().unwrap_or("(no title)");
+                    let url = r["url"].as_str().unwrap_or("");
+                    let desc = r["description"].as_str().unwrap_or("");
+                    format!("{}. [{}]({})\n   {}", i + 1, title, url, desc)
+                })
+                .collect();
+
+            if formatted.is_empty() {
+                ToolResult::Text(format!("No results found for '{}'", query))
+            } else {
+                ToolResult::Text(formatted.join("\n\n"))
+            }
+        }
+
+        #[cfg(not(feature = "desktop"))]
+        {
+            let _ = (query, count, api_key);
+            ToolResult::Error("web_search requires the desktop feature".to_string())
+        }
     }
 }

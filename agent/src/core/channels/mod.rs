@@ -54,12 +54,30 @@ impl Channel for CliChannel {
     }
 }
 
-/// Telegram channel — stub, filled in Task 8.
+/// Telegram channel — delivers messages via the Telegram Bot API.
+#[cfg(feature = "desktop")]
 pub struct TelegramChannel {
     pub bot_token: String,
     pub default_chat_id: String,
+    pub client: reqwest::Client,
 }
 
+#[cfg(feature = "desktop")]
+impl TelegramChannel {
+    pub fn new(bot_token: String, default_chat_id: String) -> Self {
+        Self {
+            bot_token,
+            default_chat_id,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
+    }
+}
+
+#[cfg(feature = "desktop")]
 #[async_trait]
 impl Channel for TelegramChannel {
     fn kind(&self) -> ChannelKind {
@@ -71,7 +89,21 @@ impl Channel for TelegramChannel {
         chat_id: &str,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!(chat_id, text_len = text.len(), "Telegram delivery (stub)");
+        let url = self.api_url("sendMessage");
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+        });
+
+        tracing::info!(chat_id, text_len = text.len(), "Telegram sendMessage");
+
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!("Telegram API error {}: {}", status, err_body).into());
+        }
+
         Ok(())
     }
 
@@ -80,7 +112,7 @@ impl Channel for TelegramChannel {
         chat_id: &str,
         chunk: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!(chat_id, chunk_len = chunk.len(), "Telegram stream (stub)");
-        Ok(())
+        // Streaming via edit_message comes later — for now just send as a full message.
+        self.deliver(chat_id, chunk).await
     }
 }
