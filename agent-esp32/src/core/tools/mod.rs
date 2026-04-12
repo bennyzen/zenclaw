@@ -76,8 +76,7 @@ impl ToolRegistry {
         self.register_lazy(|| Box::new(cron_tools::CronTool));
         self.register_lazy(|| Box::new(web_tools::WebFetchTool));
         self.register_lazy(|| Box::new(web_tools::WebSearchTool));
-        self.register_lazy(|| Box::new(message_tool::MessageTool));
-        self.register_lazy(|| Box::new(subagent_tools::SubagentTool));
+        // message_send and subagent omitted — not viable on ESP32 hardware
     }
 
     /// Register a tool factory. Creates a temporary instance to extract the
