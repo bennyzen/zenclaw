@@ -129,10 +129,6 @@ fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<Str
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use esp_idf_svc::http::Method;
 
-    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-    let largest = unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(4096) };
-    info!("HEAP[llm:pre]: free={}KB largest={}KB body={}B", free / 1024, largest / 1024, body.len());
-
     let config = HttpConfig {
         buffer_size: Some(1024),
         buffer_size_tx: Some(1024),
@@ -163,7 +159,7 @@ fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<Str
 
     let status = conn.status();
 
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 1024];
     let mut resp_body = Vec::new();
     loop {
         let n = conn.read(&mut buf).map_err(|e| format!("HTTP read: {}", e))?;

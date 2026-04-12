@@ -52,7 +52,7 @@ impl Tool for MemoryTool {
 }
 
 fn memory_path(ctx: &ToolContext) -> String {
-    format!("{}/memory/MEMORY.md", ctx.data_dir)
+    format!("{}/MEMORY.md", ctx.data_dir)
 }
 
 fn do_save(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {

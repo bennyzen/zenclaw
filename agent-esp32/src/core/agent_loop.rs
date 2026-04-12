@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, error};
+use log::{info, error};
 
 use crate::core::runner::{LlmRunner, RunnerError};
 use crate::core::tool_loop::{LoopDetector, LoopLevel};
@@ -28,6 +28,7 @@ pub async fn run_loop(
     let tool_defs = tools.definitions();
     let mut consecutive_errors: usize = 0;
     let mut loop_detector = LoopDetector::new();
+    let mut in_tool_loop = false;
     loop {
         // Check cancellation before LLM call
         if let Some(flag) = cancel {
@@ -37,15 +38,22 @@ pub async fn run_loop(
             }
         }
 
+        // After tool execution, skip tool schemas to reduce payload size.
+        // On memory-constrained devices (ESP32 without PSRAM), the full tool
+        // schemas add ~4-6KB to the JSON payload which can cause OOM on the
+        // second TLS+serialize pass. The LLM already saw tools on the first
+        // call and just needs to process tool results now.
+        let effective_tools: &[_] = if in_tool_loop { &[] } else { &tool_defs };
+
         // Call LLM
-        let response = match runner.call(messages, &tool_defs, model_override).await {
+        let response = match runner.call(messages, effective_tools, model_override).await {
             Ok(r) => {
                 consecutive_errors = 0;
                 r
             }
             Err(e) => {
                 consecutive_errors += 1;
-                error!(attempt = consecutive_errors, error = %e, "LLM call failed");
+                error!("LLM call failed (attempt {}): {}", consecutive_errors, e);
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     return Err(AgentLoopError::TooManyErrors(e.to_string()));
                 }
@@ -76,6 +84,7 @@ pub async fn run_loop(
                     &mut loop_detector,
                 )
                 .await?;
+                in_tool_loop = true;
             }
             LlmResponse::Mixed { text, tool_calls, provider_data } => {
                 execute_tool_calls(
@@ -89,6 +98,7 @@ pub async fn run_loop(
                     &mut loop_detector,
                 )
                 .await?;
+                in_tool_loop = true;
             }
         }
     }
@@ -123,7 +133,7 @@ async fn execute_tool_calls(
                     &check.message,
                     remaining_provider_data.take(),
                 );
-                info!(tool = %name, detector = check.detector, "Loop detector blocked tool call");
+                info!("Loop detector blocked tool call: {} ({})", name, check.detector);
                 continue;
             }
             // Warning — inject system message but still execute
@@ -140,7 +150,7 @@ async fn execute_tool_calls(
         if let Some(flag) = cancel {
             if flag.load(Ordering::Relaxed) {
                 push_tool_exchange(messages, tc, assistant_text, "Skipped: operation cancelled.", remaining_provider_data.take());
-                info!(tool = %name, "Tool skipped — cancelled");
+                info!("Tool skipped — cancelled: {}", name);
                 continue;
             }
         }
@@ -158,7 +168,7 @@ async fn execute_tool_calls(
 
         push_tool_exchange(messages, tc, assistant_text, &trimmed, remaining_provider_data.take());
 
-        info!(tool = %name, result_len = result_str.len(), "Tool executed");
+        info!("Tool executed: {} ({}B result)", name, result_str.len());
     }
 
     Ok(())

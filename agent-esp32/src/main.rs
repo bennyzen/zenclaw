@@ -85,6 +85,10 @@ fn main() {
     log_ring::init();
     log::info!("=== ZenClaw ESP32 boot ===");
 
+    // --- Status LED (WS2812 on T-Dongle-S3: GPIO 40) ---
+    zenclaw_agent::led_status::init(40);
+    zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Boot);
+
     // --- WiFi ---
     use esp_idf_svc::hal::prelude::Peripherals;
     use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -98,11 +102,11 @@ fn main() {
     let nvs_handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "wifi", true).unwrap();
     let ssid = nvs_get_string(&nvs_handle, "ssid").unwrap_or_default();
     let password = nvs_get_string(&nvs_handle, "password").unwrap_or_default();
-    log::info!("NVS: ssid='{}' (len={})", ssid, ssid.len());
     drop(nvs_handle);
 
     if ssid.is_empty() {
         log::error!("No WiFi SSID in NVS — halting");
+        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Error);
         loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
     }
 
@@ -120,6 +124,7 @@ fn main() {
     })).unwrap();
     wifi.start().unwrap();
     wifi.connect().unwrap();
+    zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiConnecting);
     log::info!("WiFi connecting...");
 
     let mut ip_str = String::new();
@@ -138,6 +143,7 @@ fn main() {
     }
     if ip_str.is_empty() {
         log::error!("WiFi: no IP after 15s — halting");
+        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiFailed);
         loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
     }
 
@@ -196,21 +202,27 @@ fn main() {
     let gateway = zenclaw_agent::core::gateway::Gateway::new(config, data_dir, runner);
     let gateway = std::sync::Arc::new(gateway);
 
-    // --- Start HTTP server ---
-    start_http_server(gateway.clone(), &ip_str, nvs);
+    // --- Chat request channel (httpd → agent thread) ---
+    let (chat_tx, chat_rx) = std::sync::mpsc::channel::<ChatRequest>();
+    let chat_tx = std::sync::Arc::new(std::sync::Mutex::new(chat_tx));
 
-    // --- Start Telegram poller if enabled ---
-    if let Some(ref tg) = config_for_tg.channels.telegram {
-        if tg.enabled && !tg.bot_token.is_empty() {
-            let gw = gateway.clone();
-            let bot_token = tg.bot_token.clone();
-            std::thread::Builder::new()
-                .name("telegram".into())
-                .stack_size(32768)
-                .spawn(move || telegram_poll_loop(&bot_token, gw))
-                .ok();
-            log::info!("Telegram poller started");
-        }
+    // --- Start HTTP server ---
+    start_http_server(gateway.clone(), &ip_str, nvs, chat_tx);
+    zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
+
+    // --- Start agent thread (handles both Telegram + HTTP chat) ---
+    // Single 32KB thread — no extra thread needed, saves heap.
+    {
+        let gw = gateway.clone();
+        let bot_token = config_for_tg.channels.telegram.as_ref()
+            .filter(|t| t.enabled && !t.bot_token.is_empty())
+            .map(|t| t.bot_token.clone());
+        std::thread::Builder::new()
+            .name("agent".into())
+            .stack_size(32768)
+            .spawn(move || agent_thread(bot_token.as_deref(), chat_rx, gw))
+            .expect("Failed to spawn agent thread");
+        log::info!("Agent thread started");
     }
 
     loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
@@ -341,9 +353,11 @@ fn start_http_server(
     gateway: std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
     ip_str: &str,
     nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
+    chat_tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<ChatRequest>>>,
 ) {
     use esp_idf_svc::http::server::{Configuration as HttpConfig, EspHttpServer};
     use esp_idf_svc::http::Method;
+    use zenclaw_agent::led_status::{self, State as Led};
 
     let mut server = EspHttpServer::new(&HttpConfig {
         http_port: 80,
@@ -470,6 +484,9 @@ a{{color:#60a5fa;text-decoration:none}}
                 },
             },
             "provider": gw.config.providers.default,
+            "model": gw.config.providers.entries.get(&gw.config.providers.default)
+                .and_then(|e| e.model.as_deref())
+                .unwrap_or(""),
             "usb": {
                 "mounted": cfg!(feature = "usb_storage") && {
                     #[cfg(feature = "usb_storage")]
@@ -488,25 +505,31 @@ a{{color:#60a5fa;text-decoration:none}}
     }).unwrap();
 
     // --- /api/chat (POST) ---
-    let gw = gateway.clone();
+    // Routes through the agent worker thread (32KB stack) to avoid stack overflow
+    // in the httpd's 16KB task. The httpd handler just parses, dispatches, and waits.
+    let chat_tx_clone = chat_tx.clone();
     server.fn_handler::<anyhow::Error, _>("/api/chat", Method::Post, move |mut req| {
-        // Read request body
-        let mut buf = [0u8; 4096];
-        let mut body = Vec::new();
-        loop {
-            let n = req.read(&mut buf)?;
-            if n == 0 { break; }
-            body.extend_from_slice(&buf[..n]);
-        }
-
-        let parsed: serde_json::Value = serde_json::from_slice(&body)
-            .unwrap_or_default();
-        let message = parsed.get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
-        let chat_id = parsed.get("chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or("web");
+        let (message, chat_id) = {
+            let mut buf = [0u8; 512];
+            let mut body = Vec::new();
+            loop {
+                let n = req.read(&mut buf)?;
+                if n == 0 { break; }
+                body.extend_from_slice(&buf[..n]);
+            }
+            let parsed: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_default();
+            drop(body);
+            let msg = parsed.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cid = parsed.get("chat_id")
+                .and_then(|c| c.as_str())
+                .unwrap_or("web")
+                .to_string();
+            (msg, cid)
+        };
 
         if message.is_empty() {
             let err = serde_json::json!({"error": "JSON body with message required"}).to_string();
@@ -519,14 +542,21 @@ a{{color:#60a5fa;text-decoration:none}}
 
         log::info!("Chat: chat_id={} msg_len={}", chat_id, message.len());
 
-        // Run gateway.chat() — blocking via ESP-IDF's FreeRTOS-backed executor
-        let result = esp_idf_svc::hal::task::block_on(gw.chat(chat_id, message, "api"));
+        // Send to agent worker thread and wait for result
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        {
+            let tx = chat_tx_clone.lock().unwrap();
+            tx.send(ChatRequest { chat_id, message, reply_tx })
+                .map_err(|e| anyhow::anyhow!("send to agent worker: {}", e))?;
+        }
+        let result = reply_rx.recv()
+            .map_err(|e| anyhow::anyhow!("agent worker recv: {}", e))?;
 
         let resp_body = match result {
             Ok(reply) => serde_json::json!({"reply": reply}),
             Err(e) => {
                 log::error!("Chat error: {}", e);
-                serde_json::json!({"error": e.to_string()})
+                serde_json::json!({"error": e})
             }
         };
         let resp_str = resp_body.to_string();
@@ -599,6 +629,7 @@ a{{color:#60a5fa;text-decoration:none}}
                 let mut resp = req.into_response(200, None, CORS_HEADERS)?;
                 resp.write_all(resp_body.as_bytes())?;
                 // Restart so gateway picks up new config
+                led_status::set(Led::Updating);
                 std::thread::spawn(|| {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     unsafe { esp_idf_svc::sys::esp_restart(); }
@@ -928,6 +959,7 @@ a{{color:#60a5fa;text-decoration:none}}
                         return;
                     }
                     log::info!("WS chat: chat_id={} msg_len={}", chat_id, message.len());
+                    led_status::set(Led::Thinking);
                     match esp_idf_svc::hal::task::block_on(gw.chat(chat_id, message, "api")) {
                         Ok(reply) => {
                             let msg = serde_json::json!({"type": "done", "text": reply});
@@ -939,6 +971,7 @@ a{{color:#60a5fa;text-decoration:none}}
                             let _ = sender.send(FrameType::Text(false), msg.to_string().as_bytes());
                         }
                     }
+                    led_status::set(Led::Idle);
                 }).ok();
             Ok(())
         }).unwrap();
@@ -992,17 +1025,13 @@ fn tg_api(token: &str, method: &str) -> String {
 }
 
 #[cfg(feature = "esp32")]
-fn log_heap(tag: &str) {
-    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-    let largest = unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(4096) }; // MALLOC_CAP_DEFAULT
-    log::info!("HEAP[{}]: free={}KB largest_block={}KB", tag, free / 1024, largest / 1024);
-}
-
 fn tg_http_get(url: &str) -> Result<String, String> {
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use esp_idf_svc::http::Method;
 
-    log_heap("tg_get:pre");
+    // Serialize TLS access — device can only sustain one TLS context at a time
+    let _tls_guard = zenclaw_agent::TLS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
     let config = HttpConfig {
         buffer_size: Some(1024),
         buffer_size_tx: Some(1024),
@@ -1021,7 +1050,6 @@ fn tg_http_get(url: &str) -> Result<String, String> {
         body.extend_from_slice(&buf[..n]);
     }
     drop(conn);
-    log_heap("tg_get:post");
     String::from_utf8(body).map_err(|e| format!("utf8: {}", e))
 }
 
@@ -1030,7 +1058,9 @@ fn tg_http_post(url: &str, json_body: &str) -> Result<String, String> {
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use esp_idf_svc::http::Method;
 
-    log_heap("tg_post:pre");
+    // Serialize TLS access — device can only sustain one TLS context at a time
+    let _tls_guard = zenclaw_agent::TLS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
     let config = HttpConfig {
         buffer_size: Some(1024),
         buffer_size_tx: Some(1024),
@@ -1054,91 +1084,125 @@ fn tg_http_post(url: &str, json_body: &str) -> Result<String, String> {
         body.extend_from_slice(&buf[..n]);
     }
     drop(conn);
-    log_heap("tg_post:post");
     String::from_utf8(body).map_err(|e| format!("utf8: {}", e))
 }
 
+/// A chat request sent from the httpd handler to the agent thread.
 #[cfg(feature = "esp32")]
-fn telegram_poll_loop(
-    token: &str,
+struct ChatRequest {
+    chat_id: String,
+    message: String,
+    reply_tx: std::sync::mpsc::Sender<Result<String, String>>,
+}
+
+/// Unified agent thread — handles both Telegram polling and HTTP chat requests.
+/// Single 32KB stack thread avoids the OOM from spawning a third thread.
+#[cfg(feature = "esp32")]
+fn agent_thread(
+    bot_token: Option<&str>,
+    chat_rx: std::sync::mpsc::Receiver<ChatRequest>,
     gateway: std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
 ) {
-    let mut offset: i64 = 0;
-    log::info!("Telegram poll loop running");
+    let mut tg_offset: i64 = 0;
+    let tg_enabled = bot_token.is_some();
+    if tg_enabled {
+        log::info!("Agent thread: Telegram + HTTP chat");
+    } else {
+        log::info!("Agent thread: HTTP chat only");
+    }
 
     loop {
-        // Step 1: Poll — one TLS connection, then fully drop it
-        let incoming = {
-            let url = format!("{}?offset={}&timeout=15", tg_api(token, "getUpdates"), offset);
-            let body = match tg_http_get(&url) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("Telegram poll: {}", e);
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    continue;
-                }
-            };
-            // Parse and extract only (chat_id, text) pairs — drop raw JSON immediately
-            let data: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("Telegram parse: {}", e);
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    continue;
-                }
-            };
-            drop(body); // Free raw string before extracting
+        // --- Process any pending HTTP chat requests (non-blocking) ---
+        while let Ok(req) = chat_rx.try_recv() {
+            log::info!("HTTP chat: chat_id={} msg_len={}", req.chat_id, req.message.len());
+            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
+            let result = esp_idf_svc::hal::task::block_on(
+                gateway.chat(&req.chat_id, &req.message, "api"),
+            );
+            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
+            let _ = req.reply_tx.send(result.map_err(|e| e.to_string()));
+        }
 
-            let mut msgs: Vec<(String, String)> = Vec::new();
-            if let Some(updates) = data.get("result").and_then(|r| r.as_array()) {
-                for update in updates {
-                    if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
-                        if uid >= offset { offset = uid + 1; }
+        // --- Telegram poll (if enabled) ---
+        if let Some(token) = bot_token {
+            let url = format!("{}?offset={}&timeout=5", tg_api(token, "getUpdates"), tg_offset);
+            let incoming = {
+                let body = match tg_http_get(&url) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::error!("Telegram poll: {}", e);
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
                     }
-                    if let Some(msg) = update.get("message") {
-                        let chat_id = msg.get("chat").and_then(|c| c.get("id"))
-                            .and_then(|id| id.as_i64()).map(|id| id.to_string());
-                        let text = msg.get("text").and_then(|t| t.as_str()).map(String::from);
-                        if let (Some(cid), Some(txt)) = (chat_id, text) {
-                            msgs.push((cid, txt));
+                };
+                let data: serde_json::Value = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("Telegram parse: {}", e);
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                };
+                drop(body);
+
+                let mut msgs: Vec<(String, String)> = Vec::new();
+                if let Some(updates) = data.get("result").and_then(|r| r.as_array()) {
+                    for update in updates {
+                        if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
+                            if uid >= tg_offset { tg_offset = uid + 1; }
+                        }
+                        if let Some(msg) = update.get("message") {
+                            let chat_id = msg.get("chat").and_then(|c| c.get("id"))
+                                .and_then(|id| id.as_i64()).map(|id| id.to_string());
+                            let text = msg.get("text").and_then(|t| t.as_str()).map(String::from);
+                            if let (Some(cid), Some(txt)) = (chat_id, text) {
+                                msgs.push((cid, txt));
+                            }
                         }
                     }
                 }
-            }
-            msgs
-            // `data` dropped here — all JSON freed before any outbound calls
-        };
-
-        // Step 2: Process each message — one TLS connection at a time
-        for (chat_id, text) in incoming {
-            log::info!("Telegram msg from {}: {}B", chat_id, text.len());
-
-            // Typing indicator — one connection, fully closed before next
-            let typing = format!(r#"{{"chat_id":"{}","action":"typing"}}"#, chat_id);
-            let _ = tg_http_post(&tg_api(token, "sendChatAction"), &typing);
-            drop(typing);
-
-            // LLM call — one connection inside gateway.chat()
-            let reply = esp_idf_svc::hal::task::block_on(
-                gateway.chat(&chat_id, &text, "telegram")
-            );
-            drop(text); // Free input before building reply payload
-
-            let reply_text = match reply {
-                Ok(r) => r,
-                Err(e) => format!("Error: {}", e),
+                msgs
             };
 
-            // Send reply — one connection
-            let send = format!(
-                r#"{{"chat_id":"{}","text":"{}","parse_mode":"Markdown"}}"#,
-                chat_id,
-                reply_text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
-            );
-            drop(reply_text);
-            match tg_http_post(&tg_api(token, "sendMessage"), &send) {
-                Ok(_) => log::info!("Telegram reply sent to {}", chat_id),
-                Err(e) => log::error!("Telegram send: {}", e),
+            for (chat_id, text) in incoming {
+                log::info!("Telegram msg from {}: {}B", chat_id, text.len());
+                let typing = format!(r#"{{"chat_id":"{}","action":"typing"}}"#, chat_id);
+                let _ = tg_http_post(&tg_api(token, "sendChatAction"), &typing);
+                drop(typing);
+
+                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
+                let reply = esp_idf_svc::hal::task::block_on(
+                    gateway.chat(&chat_id, &text, "telegram")
+                );
+                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
+                drop(text);
+
+                let reply_text = match reply {
+                    Ok(r) => r,
+                    Err(e) => format!("Error: {}", e),
+                };
+
+                let send = format!(
+                    r#"{{"chat_id":"{}","text":"{}","parse_mode":"Markdown"}}"#,
+                    chat_id,
+                    reply_text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+                );
+                drop(reply_text);
+                match tg_http_post(&tg_api(token, "sendMessage"), &send) {
+                    Ok(_) => log::info!("Telegram reply sent to {}", chat_id),
+                    Err(e) => log::error!("Telegram send: {}", e),
+                }
+            }
+        } else {
+            // No Telegram — just block-wait for HTTP chat requests
+            if let Ok(req) = chat_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                log::info!("HTTP chat: chat_id={} msg_len={}", req.chat_id, req.message.len());
+                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
+                let result = esp_idf_svc::hal::task::block_on(
+                    gateway.chat(&req.chat_id, &req.message, "api"),
+                );
+                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
+                let _ = req.reply_tx.send(result.map_err(|e| e.to_string()));
             }
         }
     }

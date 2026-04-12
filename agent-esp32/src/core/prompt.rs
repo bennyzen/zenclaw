@@ -154,6 +154,11 @@ fn build_tooling_section(tools: &[ToolDefinition]) -> String {
             .to_string(),
     );
     lines.push(
+        "When the user asks you to remember something, ALWAYS call memory(action=\"save\", content=\"...\"). \
+         Never just say \"I'll remember\" — persist it with the tool."
+            .to_string(),
+    );
+    lines.push(
         "Your device state changes between turns — settings get configured, \
          connections come online, files get written. If a tool call fails, retry it \
          before reporting the error; do not assume the fault persists."

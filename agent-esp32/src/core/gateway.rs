@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use log::info;
 
 use crate::config::Config;
 use crate::core::agent_loop;
@@ -60,35 +60,18 @@ impl Gateway {
             flag
         };
 
-        info!(chat_id, channel, "Chat started");
+        info!("GW chat: id={} ch={}", chat_id, channel);
 
-        // Build system prompt — on low-memory devices, skip tools and context files
-        let heap_total = heap_total_kb();
-        let low_memory = heap_total < 512; // No PSRAM: ~350KB total. PSRAM: >4MB.
-        if low_memory {
-            info!(heap_total, "Low memory mode — skipping tools and context files for LLM call");
-        }
-        let context_files = if low_memory {
-            Vec::new()
-        } else {
-            workspace::load_bootstrap_files(&self.data_dir)
-        };
-        let tool_defs = if low_memory {
-            Vec::new()
-        } else {
-            self.tools.definitions()
-        };
-        let system_prompt = if low_memory {
-            format!("You are {}. Be concise.", self.config.agent_name)
-        } else {
-            prompt::build_system_prompt(
-                &self.config,
-                &tool_defs,
-                &context_files,
-                Some(channel),
-                Some(chat_id),
-            )
-        };
+        // Build system prompt with all tools and context files
+        let context_files = workspace::load_bootstrap_files(&self.data_dir);
+        let tool_defs = self.tools.definitions();
+        let system_prompt = prompt::build_system_prompt(
+            &self.config,
+            &tool_defs,
+            &context_files,
+            Some(channel),
+            Some(chat_id),
+        );
         drop(context_files);
         drop(tool_defs);
 
@@ -103,7 +86,7 @@ impl Gateway {
             provider_data: None,
         });
 
-        if !low_memory {
+        {
             let branch = self
                 .sessions
                 .get_branch(chat_id)
@@ -147,7 +130,7 @@ impl Gateway {
             tool_call_id: None,
         };
         if let Err(e) = self.sessions.append(chat_id, &user_entry) {
-            tracing::warn!(chat_id, error = %e, "Session append failed (continuing)");
+            log::warn!("Session append failed (continuing): {}", e);
         }
 
         // Build tool context
@@ -162,6 +145,8 @@ impl Gateway {
         // Get model override from session state
         let model_override = self.sessions.get_state(chat_id).model_override;
 
+        info!("GW: agent_loop msgs={}", messages.len());
+
         // Run agent loop
         let result = agent_loop::run_loop(
             &mut messages,
@@ -174,6 +159,8 @@ impl Gateway {
         .await
         .map_err(|e| GatewayError::AgentLoop(e.to_string()))?;
 
+        info!("GW: reply {}B", result.len());
+
         // Persist assistant response to session
         let assistant_entry = crate::core::sessions::SessionEntry::Message {
             id: uuid::Uuid::new_v4().to_string(),
@@ -184,7 +171,7 @@ impl Gateway {
             tool_call_id: None,
         };
         if let Err(e) = self.sessions.append(chat_id, &assistant_entry) {
-            tracing::warn!(chat_id, error = %e, "Session append failed (continuing)");
+            log::warn!("Session append failed (continuing): {}", e);
         }
 
         // Remove from active chats
@@ -202,18 +189,6 @@ impl Gateway {
         } else {
             false
         }
-    }
-}
-
-/// Returns total heap in KB (ESP32) or a large value (desktop).
-fn heap_total_kb() -> usize {
-    #[cfg(feature = "esp32")]
-    {
-        (unsafe { esp_idf_svc::sys::heap_caps_get_total_size(4096) }) / 1024 // MALLOC_CAP_DEFAULT
-    }
-    #[cfg(not(feature = "esp32"))]
-    {
-        8192 // Desktop — always enough
     }
 }
 
