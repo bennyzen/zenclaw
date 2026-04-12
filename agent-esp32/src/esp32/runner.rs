@@ -72,11 +72,13 @@ impl EspRunner {
 
         let body = serde_json::to_string(&payload)
             .map_err(|e| RunnerError::Parse(e.to_string()))?;
+        drop(payload); // Free JSON Value before opening TLS connection
 
         info!("LLM call: model={} body={}B", model, body.len());
 
         let response_body = esp_http_post(&url, &body, auth_header.as_deref())
             .map_err(|e| RunnerError::Network(e))?;
+        drop(body); // Free request body before parsing response
 
         let response: serde_json::Value = serde_json::from_str(&response_body)
             .map_err(|e| RunnerError::Parse(format!("JSON parse: {}", e)))?;
@@ -127,9 +129,13 @@ fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<Str
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use esp_idf_svc::http::Method;
 
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let largest = unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(4096) };
+    info!("HEAP[llm:pre]: free={}KB largest={}KB body={}B", free / 1024, largest / 1024, body.len());
+
     let config = HttpConfig {
-        buffer_size: Some(4096),
-        buffer_size_tx: Some(4096),
+        buffer_size: Some(1024),
+        buffer_size_tx: Some(1024),
         timeout: Some(std::time::Duration::from_secs(60)),
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
@@ -166,6 +172,7 @@ fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<Str
         }
         resp_body.extend_from_slice(&buf[..n]);
     }
+    drop(conn); // Release TLS resources before processing response
 
     let body_str = String::from_utf8(resp_body)
         .map_err(|e| format!("Invalid UTF-8: {}", e))?;

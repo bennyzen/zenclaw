@@ -62,62 +62,79 @@ impl Gateway {
 
         info!(chat_id, channel, "Chat started");
 
-        // Build system prompt
-        let context_files = workspace::load_bootstrap_files(&self.data_dir);
-        let tool_defs = self.tools.definitions();
-        let system_prompt = prompt::build_system_prompt(
-            &self.config,
-            &tool_defs,
-            &context_files,
-            Some(channel),
-            Some(chat_id),
-        );
+        // Build system prompt — on low-memory devices, skip tools and context files
+        let heap_total = heap_total_kb();
+        let low_memory = heap_total < 512; // No PSRAM: ~350KB total. PSRAM: >4MB.
+        if low_memory {
+            info!(heap_total, "Low memory mode — skipping tools and context files for LLM call");
+        }
+        let context_files = if low_memory {
+            Vec::new()
+        } else {
+            workspace::load_bootstrap_files(&self.data_dir)
+        };
+        let tool_defs = if low_memory {
+            Vec::new()
+        } else {
+            self.tools.definitions()
+        };
+        let system_prompt = if low_memory {
+            format!("You are {}. Be concise.", self.config.agent_name)
+        } else {
+            prompt::build_system_prompt(
+                &self.config,
+                &tool_defs,
+                &context_files,
+                Some(channel),
+                Some(chat_id),
+            )
+        };
+        drop(context_files);
+        drop(tool_defs);
 
-        // Load session history
-        let branch = self
-            .sessions
-            .get_branch(chat_id)
-            .map_err(|e| GatewayError::Session(e.to_string()))?;
-
-        // Build messages
+        // Build messages — on low memory, skip session history entirely
         let mut messages = Vec::new();
 
-        // System prompt
         messages.push(Message {
             role: Role::System,
             content: MessageContent::Text(system_prompt),
             tool_calls: None,
             tool_call_id: None,
-                    provider_data: None,
+            provider_data: None,
         });
 
-        // Session history
-        for entry in &branch {
-            if let crate::core::sessions::SessionEntry::Message {
-                role,
-                content,
-                tool_calls,
-                tool_call_id,
-                ..
-            } = entry
-            {
-                messages.push(Message {
-                    role: role.clone(),
-                    content: MessageContent::Text(content.clone()),
-                    tool_calls: tool_calls.clone(),
-                    tool_call_id: tool_call_id.clone(),
-                    provider_data: None,
-                });
+        if !low_memory {
+            let branch = self
+                .sessions
+                .get_branch(chat_id)
+                .map_err(|e| GatewayError::Session(e.to_string()))?;
+
+            for entry in &branch {
+                if let crate::core::sessions::SessionEntry::Message {
+                    role,
+                    content,
+                    tool_calls,
+                    tool_call_id,
+                    ..
+                } = entry
+                {
+                    messages.push(Message {
+                        role: role.clone(),
+                        content: MessageContent::Text(content.clone()),
+                        tool_calls: tool_calls.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        provider_data: None,
+                    });
+                }
             }
         }
 
-        // User message
         messages.push(Message {
             role: Role::User,
             content: MessageContent::Text(message.to_string()),
             tool_calls: None,
             tool_call_id: None,
-                    provider_data: None,
+            provider_data: None,
         });
 
         // Persist user message to session
@@ -185,6 +202,18 @@ impl Gateway {
         } else {
             false
         }
+    }
+}
+
+/// Returns total heap in KB (ESP32) or a large value (desktop).
+fn heap_total_kb() -> usize {
+    #[cfg(feature = "esp32")]
+    {
+        (unsafe { esp_idf_svc::sys::heap_caps_get_total_size(4096) }) / 1024 // MALLOC_CAP_DEFAULT
+    }
+    #[cfg(not(feature = "esp32"))]
+    {
+        8192 // Desktop — always enough
     }
 }
 

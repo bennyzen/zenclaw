@@ -992,13 +992,20 @@ fn tg_api(token: &str, method: &str) -> String {
 }
 
 #[cfg(feature = "esp32")]
+fn log_heap(tag: &str) {
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let largest = unsafe { esp_idf_svc::sys::heap_caps_get_largest_free_block(4096) }; // MALLOC_CAP_DEFAULT
+    log::info!("HEAP[{}]: free={}KB largest_block={}KB", tag, free / 1024, largest / 1024);
+}
+
 fn tg_http_get(url: &str) -> Result<String, String> {
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use esp_idf_svc::http::Method;
 
+    log_heap("tg_get:pre");
     let config = HttpConfig {
-        buffer_size: Some(4096),
-        buffer_size_tx: Some(2048),
+        buffer_size: Some(1024),
+        buffer_size_tx: Some(1024),
         timeout: Some(std::time::Duration::from_secs(30)),
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
@@ -1006,13 +1013,15 @@ fn tg_http_get(url: &str) -> Result<String, String> {
     let mut conn = EspHttpConnection::new(&config).map_err(|e| format!("HTTP: {}", e))?;
     conn.initiate_request(Method::Get, url, &[]).map_err(|e| format!("req: {}", e))?;
     conn.initiate_response().map_err(|e| format!("resp: {}", e))?;
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 2048];
     let mut body = Vec::new();
     loop {
         let n = conn.read(&mut buf).map_err(|e| format!("read: {}", e))?;
         if n == 0 { break; }
         body.extend_from_slice(&buf[..n]);
     }
+    drop(conn);
+    log_heap("tg_get:post");
     String::from_utf8(body).map_err(|e| format!("utf8: {}", e))
 }
 
@@ -1021,9 +1030,10 @@ fn tg_http_post(url: &str, json_body: &str) -> Result<String, String> {
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use esp_idf_svc::http::Method;
 
+    log_heap("tg_post:pre");
     let config = HttpConfig {
-        buffer_size: Some(4096),
-        buffer_size_tx: Some(4096),
+        buffer_size: Some(1024),
+        buffer_size_tx: Some(1024),
         timeout: Some(std::time::Duration::from_secs(15)),
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
@@ -1036,13 +1046,15 @@ fn tg_http_post(url: &str, json_body: &str) -> Result<String, String> {
     ]).map_err(|e| format!("req: {}", e))?;
     conn.write_all(json_body.as_bytes()).map_err(|e| format!("write: {}", e))?;
     conn.initiate_response().map_err(|e| format!("resp: {}", e))?;
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 2048];
     let mut body = Vec::new();
     loop {
         let n = conn.read(&mut buf).map_err(|e| format!("read: {}", e))?;
         if n == 0 { break; }
         body.extend_from_slice(&buf[..n]);
     }
+    drop(conn);
+    log_heap("tg_post:post");
     String::from_utf8(body).map_err(|e| format!("utf8: {}", e))
 }
 
@@ -1055,71 +1067,78 @@ fn telegram_poll_loop(
     log::info!("Telegram poll loop running");
 
     loop {
-        let url = format!("{}?offset={}&timeout=15", tg_api(token, "getUpdates"), offset);
-        let body = match tg_http_get(&url) {
-            Ok(b) => b,
-            Err(e) => {
-                log::error!("Telegram poll: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                continue;
+        // Step 1: Poll — one TLS connection, then fully drop it
+        let incoming = {
+            let url = format!("{}?offset={}&timeout=15", tg_api(token, "getUpdates"), offset);
+            let body = match tg_http_get(&url) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::error!("Telegram poll: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            };
+            // Parse and extract only (chat_id, text) pairs — drop raw JSON immediately
+            let data: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("Telegram parse: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            };
+            drop(body); // Free raw string before extracting
+
+            let mut msgs: Vec<(String, String)> = Vec::new();
+            if let Some(updates) = data.get("result").and_then(|r| r.as_array()) {
+                for update in updates {
+                    if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
+                        if uid >= offset { offset = uid + 1; }
+                    }
+                    if let Some(msg) = update.get("message") {
+                        let chat_id = msg.get("chat").and_then(|c| c.get("id"))
+                            .and_then(|id| id.as_i64()).map(|id| id.to_string());
+                        let text = msg.get("text").and_then(|t| t.as_str()).map(String::from);
+                        if let (Some(cid), Some(txt)) = (chat_id, text) {
+                            msgs.push((cid, txt));
+                        }
+                    }
+                }
             }
+            msgs
+            // `data` dropped here — all JSON freed before any outbound calls
         };
 
-        let data: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("Telegram parse: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                continue;
-            }
-        };
+        // Step 2: Process each message — one TLS connection at a time
+        for (chat_id, text) in incoming {
+            log::info!("Telegram msg from {}: {}B", chat_id, text.len());
 
-        let updates = match data.get("result").and_then(|r| r.as_array()) {
-            Some(arr) => arr.clone(),
-            None => continue,
-        };
+            // Typing indicator — one connection, fully closed before next
+            let typing = format!(r#"{{"chat_id":"{}","action":"typing"}}"#, chat_id);
+            let _ = tg_http_post(&tg_api(token, "sendChatAction"), &typing);
+            drop(typing);
 
-        for update in &updates {
-            if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
-                if uid >= offset { offset = uid + 1; }
-            }
+            // LLM call — one connection inside gateway.chat()
+            let reply = esp_idf_svc::hal::task::block_on(
+                gateway.chat(&chat_id, &text, "telegram")
+            );
+            drop(text); // Free input before building reply payload
 
-            let msg = match update.get("message") {
-                Some(m) => m,
-                None => continue,
+            let reply_text = match reply {
+                Ok(r) => r,
+                Err(e) => format!("Error: {}", e),
             };
 
-            let chat_id = msg.get("chat").and_then(|c| c.get("id"))
-                .and_then(|id| id.as_i64()).map(|id| id.to_string());
-            let text = msg.get("text").and_then(|t| t.as_str());
-
-            if let (Some(chat_id), Some(text)) = (chat_id, text) {
-                log::info!("Telegram msg from {}: {}B", chat_id, text.len());
-
-                // Send typing indicator
-                let typing = serde_json::json!({"chat_id": chat_id, "action": "typing"});
-                let _ = tg_http_post(&tg_api(token, "sendChatAction"), &typing.to_string());
-
-                // Process via gateway
-                let reply = esp_idf_svc::hal::task::block_on(
-                    gateway.chat(&chat_id, text, "telegram")
-                );
-
-                let reply_text = match reply {
-                    Ok(r) => r,
-                    Err(e) => format!("Error: {}", e),
-                };
-
-                // Send reply
-                let send = serde_json::json!({
-                    "chat_id": chat_id,
-                    "text": reply_text,
-                    "parse_mode": "Markdown"
-                });
-                match tg_http_post(&tg_api(token, "sendMessage"), &send.to_string()) {
-                    Ok(_) => log::info!("Telegram reply sent to {}", chat_id),
-                    Err(e) => log::error!("Telegram send: {}", e),
-                }
+            // Send reply — one connection
+            let send = format!(
+                r#"{{"chat_id":"{}","text":"{}","parse_mode":"Markdown"}}"#,
+                chat_id,
+                reply_text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+            );
+            drop(reply_text);
+            match tg_http_post(&tg_api(token, "sendMessage"), &send) {
+                Ok(_) => log::info!("Telegram reply sent to {}", chat_id),
+                Err(e) => log::error!("Telegram send: {}", e),
             }
         }
     }
