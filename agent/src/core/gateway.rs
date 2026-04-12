@@ -13,7 +13,6 @@ use crate::core::sessions::SessionManager;
 use crate::core::tools::{ToolContext, ToolRegistry};
 use crate::core::types::{Message, MessageContent, Role};
 use crate::core::workspace;
-use crate::platform::http_client::HttpClient;
 
 /// Core orchestrator. Holds config, tools, sessions, memory, and provides the chat() entry point.
 pub struct Gateway {
@@ -28,11 +27,11 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(config: Config, data_dir: &str, http: Arc<dyn HttpClient>) -> Self {
+    pub fn new(config: Config, data_dir: &str) -> Self {
         let sessions_dir = format!("{}/sessions", data_dir);
         let config = Arc::new(config);
         Self {
-            runner: Runner::new(config.clone(), http),
+            runner: Runner::new(config.clone()),
             config: config.clone(),
             tools: ToolRegistry::new(),
             sessions: Arc::new(SessionManager::new(&sessions_dir)),
@@ -88,6 +87,7 @@ impl Gateway {
             content: MessageContent::Text(system_prompt),
             tool_calls: None,
             tool_call_id: None,
+                    provider_data: None,
         });
 
         // Session history
@@ -105,6 +105,7 @@ impl Gateway {
                     content: MessageContent::Text(content.clone()),
                     tool_calls: tool_calls.clone(),
                     tool_call_id: tool_call_id.clone(),
+                    provider_data: None,
                 });
             }
         }
@@ -115,6 +116,7 @@ impl Gateway {
             content: MessageContent::Text(message.to_string()),
             tool_calls: None,
             tool_call_id: None,
+                    provider_data: None,
         });
 
         // Persist user message to session

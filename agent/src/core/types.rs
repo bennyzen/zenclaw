@@ -17,6 +17,18 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Opaque provider-specific data (e.g. genai ToolCall objects with thought_signatures).
+    /// Preserved across turns to satisfy provider round-trip requirements.
+    #[serde(skip)]
+    pub provider_data: Option<ProviderData>,
+}
+
+/// Opaque provider data that must be round-tripped through the agent loop.
+#[derive(Debug, Clone)]
+pub enum ProviderData {
+    /// Raw genai tool calls with thought_signatures for Gemini 3.x compatibility.
+    #[cfg(feature = "desktop")]
+    GenaiToolCalls(Vec<genai::chat::ToolCall>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +67,14 @@ pub struct FunctionCall {
 #[derive(Debug, Clone)]
 pub enum LlmResponse {
     Text(String),
-    ToolCalls(Vec<ToolCall>),
+    ToolCalls {
+        tool_calls: Vec<ToolCall>,
+        provider_data: Option<ProviderData>,
+    },
     Mixed {
         text: String,
         tool_calls: Vec<ToolCall>,
+        provider_data: Option<ProviderData>,
     },
 }
 

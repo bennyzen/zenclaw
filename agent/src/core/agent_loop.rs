@@ -4,7 +4,7 @@ use tracing::{info, error};
 use crate::core::runner::{Runner, RunnerError};
 use crate::core::tool_loop::{LoopDetector, LoopLevel};
 use crate::core::tools::{ToolContext, ToolRegistry};
-use crate::core::types::{LlmResponse, Message, MessageContent, Role, ToolCall};
+use crate::core::types::{LlmResponse, Message, MessageContent, ProviderData, Role, ToolCall};
 
 const MAX_CONSECUTIVE_ERRORS: usize = 3;
 const MAX_TOOL_RESULT_LEN: usize = 8000;
@@ -63,13 +63,15 @@ pub async fn run_loop(
                     content: MessageContent::Text(text),
                     tool_calls: None,
                     tool_call_id: None,
+                    provider_data: None,
                 });
                 break;
             }
-            LlmResponse::ToolCalls(tool_calls) => {
+            LlmResponse::ToolCalls { tool_calls, provider_data } => {
                 execute_tool_calls(
                     &tool_calls,
                     None,
+                    provider_data,
                     messages,
                     tools,
                     ctx,
@@ -78,11 +80,12 @@ pub async fn run_loop(
                 )
                 .await?;
             }
-            LlmResponse::Mixed { text, tool_calls } => {
+            LlmResponse::Mixed { text, tool_calls, provider_data } => {
                 last_content = text.clone();
                 execute_tool_calls(
                     &tool_calls,
                     Some(&text),
+                    provider_data,
                     messages,
                     tools,
                     ctx,
@@ -100,12 +103,16 @@ pub async fn run_loop(
 async fn execute_tool_calls(
     tool_calls: &[ToolCall],
     assistant_text: Option<&str>,
+    provider_data: Option<ProviderData>,
     messages: &mut Vec<Message>,
     tools: &ToolRegistry,
     ctx: &ToolContext,
     cancel: Option<&CancellationToken>,
     loop_detector: &mut LoopDetector,
 ) -> Result<(), AgentLoopError> {
+    // provider_data carries thought_signatures from Gemini; attach to first tool call's message
+    let mut remaining_provider_data = provider_data;
+
     for tc in tool_calls {
         let name = &tc.function.name;
         let args: serde_json::Value =
@@ -120,6 +127,7 @@ async fn execute_tool_calls(
                     tc,
                     assistant_text,
                     &check.message,
+                    remaining_provider_data.take(),
                 );
                 info!(tool = %name, detector = check.detector, "Loop detector blocked tool call");
                 continue;
@@ -130,13 +138,14 @@ async fn execute_tool_calls(
                 content: MessageContent::Text(check.message),
                 tool_calls: None,
                 tool_call_id: None,
+                provider_data: None,
             });
         }
 
         // Check cancellation
         if let Some(token) = cancel {
             if token.is_cancelled() {
-                push_tool_exchange(messages, tc, assistant_text, "Skipped: operation cancelled.");
+                push_tool_exchange(messages, tc, assistant_text, "Skipped: operation cancelled.", remaining_provider_data.take());
                 info!(tool = %name, "Tool skipped — cancelled");
                 continue;
             }
@@ -153,7 +162,7 @@ async fn execute_tool_calls(
         // Trim large results
         let trimmed = soft_trim(&result_str, MAX_TOOL_RESULT_LEN);
 
-        push_tool_exchange(messages, tc, assistant_text, &trimmed);
+        push_tool_exchange(messages, tc, assistant_text, &trimmed, remaining_provider_data.take());
 
         info!(tool = %name, result_len = result_str.len(), "Tool executed");
     }
@@ -167,8 +176,9 @@ fn push_tool_exchange(
     tc: &ToolCall,
     assistant_text: Option<&str>,
     result: &str,
+    provider_data: Option<ProviderData>,
 ) {
-    // Assistant message with tool call
+    // Assistant message with tool call (provider_data carries thought_signatures for Gemini)
     messages.push(Message {
         role: Role::Assistant,
         content: MessageContent::Text(
@@ -176,6 +186,7 @@ fn push_tool_exchange(
         ),
         tool_calls: Some(vec![tc.clone()]),
         tool_call_id: None,
+        provider_data,
     });
 
     // Tool result message
@@ -184,6 +195,7 @@ fn push_tool_exchange(
         content: MessageContent::Text(result.to_string()),
         tool_calls: None,
         tool_call_id: Some(tc.id.clone()),
+        provider_data: None,
     });
 }
 

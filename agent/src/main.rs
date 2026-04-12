@@ -28,12 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "data"
     };
 
-    // Initialize HTTP client
-    let http: std::sync::Arc<dyn zenclaw_agent::platform::http_client::HttpClient> =
-        std::sync::Arc::new(zenclaw_agent::desktop::ReqwestHttpClient::new());
-
-    // Initialize gateway
-    let mut gateway = zenclaw_agent::core::gateway::Gateway::new(config.clone(), data_dir, http);
+    // Initialize gateway (genai crate handles HTTP internally)
+    let mut gateway = zenclaw_agent::core::gateway::Gateway::new(config.clone(), data_dir);
 
     // Register tools
     use zenclaw_agent::core::tools::*;

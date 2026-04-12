@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = ["desktop"]
-desktop = ["tokio", "axum", "reqwest", "teloxide", "tower-http", "reqwest-eventsource", "tokio-util", "futures"]
+desktop = ["tokio", "axum", "reqwest", "teloxide", "tower-http", "reqwest-eventsource", "tokio-util", "futures", "genai"]
 esp32 = []
 hnsw = ["usearch"]
 
@@ -32,6 +32,7 @@ futures = { version = "0.3", optional = true }
 
 # Optional
 usearch = { version = "2", optional = true }
+genai = { version = "0.6.0-beta", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
