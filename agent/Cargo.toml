@@ -36,3 +36,8 @@ genai = { version = "0.6.0-beta", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
