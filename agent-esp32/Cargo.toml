@@ -7,6 +7,7 @@ edition = "2021"
 default = ["esp32"]
 desktop = ["dep:teloxide", "dep:reqwest-eventsource", "dep:reqwest", "dep:genai", "dep:hostname", "dep:tokio", "dep:axum", "dep:tower-http", "dep:tokio-util"]
 esp32 = ["dep:esp-idf-svc", "dep:embedded-svc"]
+usb_storage = ["esp32"]
 hnsw = ["dep:usearch"]
 
 [dependencies]
@@ -63,3 +64,7 @@ file = "partitions.csv"
 # ESP-IDF managed components (pulled via component manager)
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/mdns", version = "1.2" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/usb_host_msc", version = "1.2.0" }
+bindings_header = "bindings_usb_msc.h"

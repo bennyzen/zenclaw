@@ -4,5 +4,7 @@ pub mod core;
 pub mod desktop;
 #[cfg(feature = "esp32")]
 pub mod esp32;
+#[cfg(feature = "usb_storage")]
+pub mod usb_storage;
 #[cfg(feature = "desktop")]
 pub mod platform;

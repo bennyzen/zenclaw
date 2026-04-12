@@ -11,3 +11,5 @@ build-std = ["std", "panic_abort"]
 
 [env]
 ESP_IDF_VERSION = "v5.4"
+# Board profile: override with ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.sdcard"
+ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.board.devkitc"

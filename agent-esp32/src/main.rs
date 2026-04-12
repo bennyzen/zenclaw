@@ -181,6 +181,10 @@ fn main() {
         log::info!("SPIFFS mounted at /data ({}KB total, {}KB used)", total / 1024, used / 1024);
     }
 
+    // --- USB mass storage (optional) ---
+    #[cfg(feature = "usb_storage")]
+    zenclaw_agent::usb_storage::init();
+
     // --- Create gateway ---
     let data_dir = "/data";
     let _ = std::fs::create_dir_all(format!("{}/sessions", data_dir));
@@ -457,6 +461,23 @@ a{{color:#60a5fa;text-decoration:none}}
             "storage": {
                 "total_kb": spiffs_total / 1024,
                 "free_kb": (spiffs_total - spiffs_used) / 1024,
+            },
+            "channels": {
+                "telegram": {
+                    "configured": gw.config.channels.telegram.is_some(),
+                    "enabled": gw.config.channels.telegram.as_ref().map_or(false, |t| t.enabled),
+                    "has_token": gw.config.channels.telegram.as_ref().map_or(false, |t| !t.bot_token.is_empty()),
+                },
+            },
+            "provider": gw.config.providers.default,
+            "usb": {
+                "mounted": cfg!(feature = "usb_storage") && {
+                    #[cfg(feature = "usb_storage")]
+                    { zenclaw_agent::usb_storage::is_mounted() }
+                    #[cfg(not(feature = "usb_storage"))]
+                    { false }
+                },
+                "path": if cfg!(feature = "usb_storage") { "/usb" } else { "" },
             },
             "uptime_s": uptime_us / 1_000_000
         });
