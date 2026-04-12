@@ -1,0 +1,4 @@
+[toolchain]
+channel = "esp"
+components = ["rust-src"]
+targets = ["xtensa-esp32s3-espidf"]
