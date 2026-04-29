@@ -1,0 +1,7 @@
+chip = "esp32s3"
+target = "xtensa-esp32s3-espidf"
+sdkconfig = ["sdkconfig.defaults", "sdkconfig.board.devkitc"]
+bootloader = "bootloaders/esp32s3.bin"
+features = []
+default_baud = 921600
+description = "ESP32-S3-DevKitC (PSRAM, USB Host capable)"
