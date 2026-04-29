@@ -44,14 +44,54 @@ fn checkpoint_1_chip_info() {
     );
 }
 
+fn checkpoint_2_psram() {
+    use esp_idf_svc::sys::{
+        esp_psram_get_size, heap_caps_get_free_size, heap_caps_malloc, heap_caps_free,
+        MALLOC_CAP_SPIRAM,
+    };
+
+    let psram_bytes = unsafe { esp_psram_get_size() } as usize;
+    if psram_bytes == 0 {
+        fail(2, "psram", "no PSRAM detected — check sdkconfig CONFIG_SPIRAM");
+    }
+    let psram_mb = psram_bytes / (1024 * 1024);
+    let free_psram = unsafe { heap_caps_get_free_size(MALLOC_CAP_SPIRAM) } as usize;
+
+    // Pattern test: allocate 4 MB in PSRAM, write/read a known pattern.
+    const TEST_BYTES: usize = 4 * 1024 * 1024;
+    let buf = unsafe { heap_caps_malloc(TEST_BYTES, MALLOC_CAP_SPIRAM) as *mut u8 };
+    if buf.is_null() {
+        fail(2, "psram", "could not allocate 4 MB in PSRAM");
+    }
+    unsafe {
+        for i in 0..TEST_BYTES {
+            *buf.add(i) = ((i * 31 + 7) & 0xFF) as u8;
+        }
+        for i in 0..TEST_BYTES {
+            let expected = ((i * 31 + 7) & 0xFF) as u8;
+            if *buf.add(i) != expected {
+                fail(2, "psram", &format!("pattern mismatch at byte {}", i));
+            }
+        }
+        heap_caps_free(buf as *mut _);
+    }
+
+    pass(
+        2,
+        "psram",
+        &format!("{} MiB detected, {} KiB free, 4 MiB pattern test OK", psram_mb, free_psram / 1024),
+    );
+}
+
 fn main() -> anyhow::Result<()> {
     link_patches();
     EspLogger::initialize_default();
     log::info!("zenclaw P4 smoke test booting");
 
     checkpoint_1_chip_info();
+    checkpoint_2_psram();
 
-    log::info!("(checkpoints 2-6 not yet implemented)");
+    log::info!("(checkpoints 3-6 not yet implemented)");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
