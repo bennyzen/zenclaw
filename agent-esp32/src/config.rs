@@ -5,6 +5,14 @@ fn default_agent_name() -> String {
     "ZenClaw".to_string()
 }
 
+fn deserialize_nonempty_or_default_name<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(de)?;
+    Ok(s.filter(|v| !v.is_empty()).unwrap_or_else(default_agent_name))
+}
+
 fn default_provider() -> String {
     "google".to_string()
 }
@@ -33,7 +41,7 @@ fn default_stream_debounce_ms() -> u64 {
 pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
-    #[serde(default = "default_agent_name")]
+    #[serde(default = "default_agent_name", deserialize_with = "deserialize_nonempty_or_default_name")]
     pub agent_name: String,
     #[serde(default)]
     pub channels: ChannelsConfig,

@@ -217,7 +217,11 @@ storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
 - **USB PHY sharing**: ESP32-S3 has one USB PHY shared between Serial/JTAG and OTG. `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` claims it, blocking USB Host. DevKitC uses UART console to free the PHY.
 - **USB Host VBUS**: DevKitC USB-C port doesn't supply 5V in host mode. USB devices need a powered hub.
 - **Main thread must not block**: The main thread parks in `loop { sleep(60s) }` after spawning HTTP server and Telegram poller threads. HTTP server runs in esp-idf's httpd thread pool.
-- **S3 Xtensa LLVM bug**: The current `esp` Rust toolchain fails to compile `serde_json` deserialization with `XtensaISD::PCREL_WRAPPER` selector errors — `lto = true`, `lto = "thin"`, and `lto = false` all trigger it (the bug is in the Xtensa backend, not the LTO pass). Workaround: build with an older `espup`-installed toolchain, or wait for an upstream fix in esp-rs/rust. P4 (RISC-V) builds are unaffected.
+- **S3 Xtensa LLVM bug (1.94.0.0–1.95.0.0)**: `xtensa-esp32s3-espidf` builds fail with `XtensaISD::PCREL_WRAPPER` LLVM ICE in `serde_json::Vec` deserialization on every `esp-rs/rust` release from 1.94.0.0 through 1.95.0.0 (tracked at [esp-rs/rust#277](https://github.com/esp-rs/rust/issues/277), regression introduced by the LLVM 20→21 bump). Workaround — pin the toolchain to 1.93.0.0: `espup install --toolchain-version 1.93.0.0`. P4 (RISC-V) is unaffected and uses the standard toolchain.
+
+### Deferred / TODO
+
+- **Vector memory**: the `agent-esp32/src/core/memory/` module persists memories as text only. The `embedding: Vec<f32>` field on `MemoryEntry` is never populated, and `BruteForceStore::search()` does substring matching, not cosine similarity. The MicroPython equivalent (`firmware/agent/memory.py` + `embeddings.py`) generates Gemini/OpenAI embeddings on save and blends vector + text scores at query time (default vector weight 0.7). To restore parity: add an `embeddings` provider that calls the same LLM provider's embedding endpoint, populate the vector on `do_save`, and either (a) implement cosine search in `BruteForceStore` or (b) enable the `hnsw` Cargo feature and use usearch. Costs money per embedding call, hence deferred.
 
 ## MicroPython Agent (`firmware/`)
 

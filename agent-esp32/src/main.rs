@@ -172,6 +172,7 @@ fn main() {
     let data_dir = "/data";
     let _ = std::fs::create_dir_all(format!("{}/sessions", data_dir));
     let _ = std::fs::create_dir_all(format!("{}/memory", data_dir));
+    zenclaw_agent::core::workspace::seed_defaults(data_dir);
 
     let config_for_tg = config.clone();
     let config_arc = std::sync::Arc::new(config.clone());

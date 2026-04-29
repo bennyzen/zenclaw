@@ -64,11 +64,11 @@ fn do_save(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {
 
     let path = memory_path(ctx);
 
-    // Ensure directory exists
+    // Ensure directory exists. SPIFFS rejects mkdir with ENOTSUP — that's
+    // fine, paths like "/data/MEMORY.md" are flat filenames there, so
+    // ignore the error and let the open call below create the file.
     if let Some(parent) = std::path::Path::new(&path).parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return ToolResult::Error(format!("Failed to create memory dir: {}", e));
-        }
+        let _ = std::fs::create_dir_all(parent);
     }
 
     let id = uuid::Uuid::new_v4().to_string();

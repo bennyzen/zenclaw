@@ -120,6 +120,24 @@ fn read_file_trimmed(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+/// Default SOUL.md content shipped with the firmware. Written to the data
+/// directory on first boot if no SOUL/IDENTITY/USER file already exists.
+const DEFAULT_SOUL_MD: &str = "You are ZenClaw, an AI agent running on an ESP32 embedded device.\nYou are helpful, concise, and resourceful.\n";
+
+/// Seed default bootstrap files into the data directory if missing.
+/// Idempotent — only writes a file when none of the SOUL_FILENAMES exist,
+/// so a user-edited SOUL.md (or one uploaded via /api/files) is never
+/// overwritten.
+pub fn seed_defaults(data_dir: &str) {
+    let any_soul = SOUL_FILENAMES
+        .iter()
+        .any(|f| Path::new(&format!("{}/{}", data_dir, f)).exists());
+    if !any_soul {
+        let path = format!("{}/SOUL.md", data_dir);
+        let _ = fs::write(&path, DEFAULT_SOUL_MD);
+    }
+}
+
 /// Resolve a user-supplied path against the data directory.
 /// Absolute paths are returned as-is; relative paths are prefixed with data_dir.
 pub fn resolve_path(data_dir: &str, path: &str) -> String {
