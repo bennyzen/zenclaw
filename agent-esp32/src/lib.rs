@@ -6,6 +6,8 @@ pub mod desktop;
 pub mod esp32;
 #[cfg(feature = "esp32")]
 pub mod led_status;
+#[cfg(feature = "esp32")]
+pub mod net;
 #[cfg(feature = "usb_storage")]
 pub mod usb_storage;
 #[cfg(feature = "desktop")]
