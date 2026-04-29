@@ -1,0 +1,7 @@
+chip = "esp32p4"
+target = "riscv32imafc-esp-espidf"
+sdkconfig = ["sdkconfig.defaults", "sdkconfig.board.guition-p4"]
+bootloader = "bootloaders/esp32p4.bin"
+features = []
+default_baud = 460800
+description = "Guition JC-ESP32P4-M3-DEV (Ethernet, 32MB PSRAM, 16MB flash)"
