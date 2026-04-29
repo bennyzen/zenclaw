@@ -101,6 +101,7 @@ for board in "${BOARDS[@]}"; do
     echo "==> Saving merged image -> $out"
     espflash save-image \
         --chip "$chip" \
+        --flash-size 16mb \
         --partition-table partitions.csv \
         --bootloader "$bootloader" \
         --merge \
