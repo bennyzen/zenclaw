@@ -40,3 +40,6 @@ pub mod wifi;
 // Always compiled — owns NVS-based credential read/write and the driver label,
 // independent of which radio (or none) is active. /api/wifi handlers use it.
 pub mod wifi_ui;
+
+#[cfg(feature = "nic-eth")]
+pub mod eth;
