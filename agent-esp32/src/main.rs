@@ -137,6 +137,18 @@ fn main() {
     #[cfg(not(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled)))]
     log::warn!("mDNS: not available (needs cargo clean && cargo build)");
 
+    // --- SNTP (UTC clock sync) ---
+    // R2/S3 SigV4 rejects requests with skew >15 min. Sync once at boot so
+    // any cloud calls have a valid x-amz-date. Service runs in the
+    // background; we don't block startup waiting for it.
+    match esp_idf_svc::sntp::EspSntp::new_default() {
+        Ok(sntp) => {
+            log::info!("SNTP: started default service");
+            std::mem::forget(sntp); // keep the service alive for the lifetime of the program
+        }
+        Err(e) => log::warn!("SNTP: start failed: {} (cloud SigV4 will fail until clock is set)", e),
+    }
+
     // --- Load config ---
     let config = load_config(&nvs);
     log::info!("Config: agent={}, provider={}", config.agent_name, config.providers.default);

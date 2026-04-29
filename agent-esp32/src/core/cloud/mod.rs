@@ -6,3 +6,8 @@
 //! pull a heavy AWS SDK onto the device.
 
 pub mod sigv4;
+
+// Helpers (XML parser, URL encoder) live here unconditionally so they
+// can be unit-tested on host. The S3Client itself is feature-gated
+// inside the file because it needs esp-idf-svc.
+pub mod client;
