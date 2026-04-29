@@ -1,0 +1,51 @@
+set shell := ["bash", "-cu"]
+
+# List supported boards with descriptions
+list:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Available boards:"
+    for f in boards/*.toml; do
+        name=$(basename "$f" .toml)
+        desc=$(awk -F' *= *' '/^description/ {gsub(/"/,"",$2); print $2; exit}' "$f")
+        printf "  %-15s %s\n" "$name" "$desc"
+    done
+
+# Build firmware: just build <board> [extra cargo args...]
+build board *args="--release":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(scripts/board-env.sh {{board}})"
+    extra_features=""
+    [[ -n "$FEATURES" ]] && extra_features="--features=$FEATURES"
+    CARGO_BUILD_TARGET="$TARGET" \
+    ESP_IDF_SDKCONFIG_DEFAULTS="$SDKCONFIG" \
+        cargo build $extra_features {{args}}
+
+# Flash: just flash <board> [/dev/ttyACM0]
+flash board port="/dev/ttyACM0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(scripts/board-env.sh {{board}})"
+    bin="target/$TARGET/release/zenclaw-smoke-p4"
+    [[ -f "$bin" ]] || { echo "binary not found: $bin — run 'just build {{board}}' first" >&2; exit 1; }
+    if [[ -f "$BOOTLOADER" ]]; then
+        espflash flash --port {{port}} --partition-table partitions.csv \
+            --bootloader "$BOOTLOADER" --baud "$BAUD" "$bin"
+    else
+        echo "WARN: $BOOTLOADER not present yet — flashing without --bootloader (first-build path)"
+        espflash flash --port {{port}} --partition-table partitions.csv \
+            --baud "$BAUD" "$bin"
+    fi
+
+# Stream serial console
+monitor port="/dev/ttyACM0":
+    espflash monitor --port {{port}} --non-interactive
+
+# Wipe esp-idf-sys cache for a board (use after switching architectures)
+clean board:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(scripts/board-env.sh {{board}})"
+    rm -rf "target/$TARGET/release/build/esp-idf-sys-"*
+    echo "cleaned esp-idf-sys cache for $TARGET"
