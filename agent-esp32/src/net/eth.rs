@@ -139,12 +139,12 @@ pub fn bring_up(
     _peripherals: esp_idf_svc::hal::peripherals::Peripherals,
     _sysloop: esp_idf_svc::eventloop::EspSystemEventLoop,
 ) -> anyhow::Result<Box<dyn Nic>> {
-    crate::led_status::set(crate::led_status::State::WifiConnecting);
+    crate::led_status::set(crate::led_status::State::LinkConnecting);
 
     match bring_up_inner() {
         Ok(nic) => Ok(nic),
         Err(e) => {
-            crate::led_status::set(crate::led_status::State::WifiFailed);
+            crate::led_status::set(crate::led_status::State::LinkFailed);
             Err(e)
         }
     }

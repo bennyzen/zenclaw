@@ -15,8 +15,8 @@ const STACK_SIZE: usize = 4096;
 pub enum State {
     Off = 0,
     Boot = 1,
-    WifiConnecting = 2,
-    WifiFailed = 3,
+    LinkConnecting = 2,
+    LinkFailed = 3,
     Idle = 4,
     Thinking = 5,
     Error = 6,
@@ -82,8 +82,8 @@ unsafe fn create_strip(gpio_pin: i32) -> sys::led_strip_handle_t {
 fn color(state: u8) -> (u8, u8, u8) {
     match state {
         1 => (MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT), // Boot: white
-        2 => (0, 0, MAX_BRIGHT),                   // WiFi connecting: blue
-        3 => (MAX_BRIGHT, 0, 0),                   // WiFi failed: red
+        2 => (0, 0, MAX_BRIGHT),                   // Link connecting: blue
+        3 => (MAX_BRIGHT, 0, 0),                   // Link failed: red
         4 => (0, MAX_BRIGHT / 3, 0),               // Idle: dim green
         5 => (0, MAX_BRIGHT / 2, MAX_BRIGHT / 2),  // Thinking: cyan
         6 => (MAX_BRIGHT, 0, 0),                   // Error: red
@@ -97,8 +97,8 @@ fn scale(state: u8, tick: u32) -> u8 {
     match state {
         0 => 0,
         1 => 255,                                                        // Boot: solid
-        2 => if (tick % 10) < 5 { 255 } else { 0 },                     // WiFi: blink 2Hz
-        3 => if (tick % 20) < 10 { 255 } else { 0 },                    // WiFi fail: blink 1Hz
+        2 => if (tick % 10) < 5 { 255 } else { 0 },                     // Link: blink 2Hz
+        3 => if (tick % 20) < 10 { 255 } else { 0 },                    // Link fail: blink 1Hz
         4 => 255,                                                        // Idle: solid
         5 => {                                                           // Thinking: breathe
             let period = 24u32;

@@ -128,7 +128,7 @@ fn main() {
         })).unwrap();
         wifi.start().unwrap();
         wifi.connect().unwrap();
-        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiConnecting);
+        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::LinkConnecting);
         log::info!("WiFi connecting...");
 
         let mut ip_str = String::new();
@@ -147,7 +147,7 @@ fn main() {
         }
         if ip_str.is_empty() {
             log::error!("WiFi: no IP after 15s — halting");
-            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiFailed);
+            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::LinkFailed);
             loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
         }
         // Keep WiFi alive (C3/C6 will manage this properly)

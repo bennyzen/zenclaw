@@ -88,9 +88,9 @@ pub fn bring_up_internal(
         ..Default::default()
     }))?;
     wifi.start()?;
-    crate::led_status::set(crate::led_status::State::WifiConnecting);
+    crate::led_status::set(crate::led_status::State::LinkConnecting);
     if wifi.connect().is_err() {
-        crate::led_status::set(crate::led_status::State::WifiFailed);
+        crate::led_status::set(crate::led_status::State::LinkFailed);
         anyhow::bail!("wifi.connect() failed");
     }
 
@@ -104,7 +104,7 @@ pub fn bring_up_internal(
         std::thread::sleep(Duration::from_millis(500));
     }
     if !wifi.is_connected().unwrap_or(false) {
-        crate::led_status::set(crate::led_status::State::WifiFailed);
+        crate::led_status::set(crate::led_status::State::LinkFailed);
         anyhow::bail!("wifi did not connect within 15s");
     }
 
