@@ -131,7 +131,9 @@ onMounted(async () => {
     if (data.apiModel) apiModel.value = data.apiModel
     if (data.deviceName) deviceName.value = data.deviceName
     if (data.baseUrl) baseUrl.value = data.baseUrl
-    if (data.boardId) boardId.value = data.boardId
+    if (data.boardId && boards.value.some(b => b.id === data.boardId)) {
+      boardId.value = data.boardId
+    }
   } catch { /* ignore */ }
   // Wait for deferred watchers (apiProvider watcher) to flush before
   // clearing the flag — otherwise the watcher sees _restoring=false
