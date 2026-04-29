@@ -93,71 +93,36 @@ fn main() {
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    // --- WiFi (only on boards with internal WiFi radio) ---
-    #[cfg(feature = "nic-wifi-internal")]
-    let ip_str = {
-        use esp_idf_svc::hal::peripherals::Peripherals;
-        use esp_idf_svc::eventloop::EspSystemEventLoop;
-        use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
+    // --- Primary NIC (WiFi or Ethernet, selected by cargo features) ---
+    let peripherals = esp_idf_svc::hal::peripherals::Peripherals::take().unwrap();
+    let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take().unwrap();
 
-        let peripherals = Peripherals::take().unwrap();
-        let sysloop = EspSystemEventLoop::take().unwrap();
-
-        let nvs_handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "wifi", true).unwrap();
-        let ssid = nvs_get_string(&nvs_handle, "ssid").unwrap_or_default();
-        let password = nvs_get_string(&nvs_handle, "password").unwrap_or_default();
-        drop(nvs_handle);
-
-        if ssid.is_empty() {
-            log::error!("No WiFi SSID in NVS — halting");
-            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Error);
-            loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
+    let nic: Box<dyn zenclaw_agent::net::Nic> = match zenclaw_agent::net::bring_up_primary(
+        peripherals,
+        sysloop.clone(),
+        nvs.clone(),
+    ) {
+        Ok(n) => {
+            log::info!(
+                "Primary NIC up: kind={:?} ip={:?}",
+                n.kind(),
+                n.ip_info().map(|i| i.ip),
+            );
+            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
+            n
         }
-
-        let mut wifi = EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs.clone())).unwrap();
-        let mut ssid_h: heapless::String<32> = heapless::String::new();
-        ssid_h.push_str(&ssid).unwrap();
-        let mut pass_h: heapless::String<64> = heapless::String::new();
-        pass_h.push_str(&password).unwrap();
-
-        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: ssid_h,
-            password: pass_h,
-            auth_method: AuthMethod::WPA2Personal,
-            ..Default::default()
-        })).unwrap();
-        wifi.start().unwrap();
-        wifi.connect().unwrap();
-        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::LinkConnecting);
-        log::info!("WiFi connecting...");
-
-        let mut ip_str = String::new();
-        for i in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if wifi.is_connected().unwrap_or(false) {
-                let netif = wifi.sta_netif();
-                if let Ok(info) = netif.get_ip_info() {
-                    if !info.ip.is_unspecified() {
-                        ip_str = format!("{}", info.ip);
-                        log::info!("Got IP: {} (after {}ms)", ip_str, i * 500);
-                        break;
-                    }
-                }
-            }
-        }
-        if ip_str.is_empty() {
-            log::error!("WiFi: no IP after 15s — halting");
+        Err(e) => {
+            log::error!("NIC bring-up failed: {}", e);
             zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::LinkFailed);
             loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
         }
-        // Keep WiFi alive (C3/C6 will manage this properly)
-        std::mem::forget(wifi);
-        ip_str
     };
-    // On boards without internal WiFi (e.g. P4 with Ethernet), ip_str is populated
-    // by the NIC driver in C4/C6. For now, placeholder so the crate compiles.
-    #[cfg(not(feature = "nic-wifi-internal"))]
-    let ip_str = String::from("0.0.0.0");
+    let nic = std::sync::Arc::new(nic);
+
+    let ip_str = nic
+        .ip_info()
+        .map(|i| i.ip.to_string())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
 
     // --- mDNS ---
     #[cfg(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled))]
@@ -219,7 +184,7 @@ fn main() {
     let chat_tx = std::sync::Arc::new(std::sync::Mutex::new(chat_tx));
 
     // --- Start HTTP server ---
-    start_http_server(gateway.clone(), &ip_str, nvs, chat_tx);
+    start_http_server(gateway.clone(), nic.clone(), &ip_str, nvs, chat_tx);
     zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
 
     // --- Start agent thread (handles both Telegram + HTTP chat) ---
@@ -287,33 +252,13 @@ fn load_config(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> zenclaw_agent:
 
 #[cfg(feature = "esp32")]
 fn save_config_nvs(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition, json: &str) -> Result<(), String> {
-    let mut handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "config", true)
+    let handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "config", true)
         .map_err(|e| format!("NVS open: {}", e))?;
     handle.set_blob("json", json.as_bytes())
         .map_err(|e| format!("NVS write: {}", e))?;
     Ok(())
 }
 
-#[cfg(all(feature = "esp32", feature = "nic-wifi-internal"))]
-fn get_wifi_info() -> (Option<i32>, Option<String>) {
-    let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
-    let ret = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
-    if ret == 0 {
-        let rssi = Some(ap_info.rssi as i32);
-        let ssid = ap_info.ssid.iter()
-            .take_while(|&&b| b != 0)
-            .map(|&b| b as char)
-            .collect::<String>();
-        (rssi, if ssid.is_empty() { None } else { Some(ssid) })
-    } else {
-        (None, None)
-    }
-}
-
-#[cfg(all(feature = "esp32", not(feature = "nic-wifi-internal")))]
-fn get_wifi_info() -> (Option<i32>, Option<String>) {
-    (None, None)
-}
 
 #[cfg(feature = "esp32")]
 fn read_temp(handle_val: usize) -> Option<f64> {
@@ -368,6 +313,7 @@ const CORS_HEADERS: &[(&str, &str)] = &[
 #[cfg(feature = "esp32")]
 fn start_http_server(
     gateway: std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
+    nic: std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
     ip_str: &str,
     nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
     chat_tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<ChatRequest>>>,
@@ -459,7 +405,8 @@ a{{color:#60a5fa;text-decoration:none}}
 
     // --- /api/status ---
     let gw = gateway.clone();
-    let ip_for_status = ip_str.to_string();
+    let nic_for_status = nic.clone();
+    let nvs_for_status = nvs.clone();
     let th = temp_handle;
     server.fn_handler::<anyhow::Error, _>("/api/status", Method::Get, move |req| {
         let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
@@ -474,20 +421,42 @@ a{{color:#60a5fa;text-decoration:none}}
                 &mut spiffs_used,
             );
         }
+        let info = nic_for_status.ip_info();
+        let nic_kind_str = match nic_for_status.kind() {
+            zenclaw_agent::net::NicKind::Wifi => "wifi",
+            zenclaw_agent::net::NicKind::Ethernet => "ethernet",
+        };
+        let mac = nic_for_status.mac();
+        let mac_str = format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        );
+        let is_wifi = nic_for_status.kind() == zenclaw_agent::net::NicKind::Wifi;
         let body = serde_json::json!({
             "agent_name": gw.config.agent_name,
             "version": env!("CARGO_PKG_VERSION"),
-            "platform": "esp32s3",
+            "platform": "esp32",
             "memory": {
                 "free_kb": heap_free / 1024,
                 "total_kb": heap_total / 1024,
                 "used_kb": heap_total.saturating_sub(heap_free) / 1024,
             },
             "temperature_c": read_temp(th),
+            "network": {
+                "kind": nic_kind_str,
+                "ip": info.map(|i| i.ip.to_string()),
+                "link_speed_mbps": nic_for_status.link_speed_mbps(),
+                "mac": mac_str,
+            },
             "wifi": {
-                "connected": true,
-                "ip": ip_for_status,
-                "rssi": get_wifi_info().0,
+                "connected": is_wifi && nic_for_status.link_up(),
+                "ip": if is_wifi { info.map(|i| i.ip.to_string()) } else { None },
+                "ssid": nic_for_status.ssid().or_else(|| {
+                    zenclaw_agent::net::wifi_ui::read_credentials(&nvs_for_status)
+                        .map(|(s, _)| s)
+                }),
+                "rssi": nic_for_status.rssi(),
+                "driver": zenclaw_agent::net::wifi_ui::driver_label(),
             },
             "storage": {
                 "total_kb": spiffs_total / 1024,
@@ -664,15 +633,15 @@ a{{color:#60a5fa;text-decoration:none}}
     }).unwrap();
 
     // --- /api/wifi (GET) ---
-    let ip = ip_str.to_string();
+    let nic_for_wifi_get = nic.clone();
+    let nvs_for_wifi_get = nvs.clone();
     server.fn_handler::<anyhow::Error, _>("/api/wifi", Method::Get, move |req| {
-        let (rssi, ssid) = get_wifi_info();
+        let creds = zenclaw_agent::net::wifi_ui::read_credentials(&nvs_for_wifi_get);
         let body = serde_json::json!({
-            "ssid": ssid,
-            "connected": true,
-            "ip": ip,
-            "rssi": rssi,
-            "hostname": "zenclaw"
+            "connected": nic_for_wifi_get.kind() == zenclaw_agent::net::NicKind::Wifi && nic_for_wifi_get.link_up(),
+            "ssid": creds.as_ref().map(|(s, _)| s.clone()).or_else(|| nic_for_wifi_get.ssid()),
+            "rssi": nic_for_wifi_get.rssi(),
+            "driver": zenclaw_agent::net::wifi_ui::driver_label(),
         }).to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(body.as_bytes())?;
@@ -680,7 +649,7 @@ a{{color:#60a5fa;text-decoration:none}}
     }).unwrap();
 
     // --- PUT /api/wifi (save credentials + restart) ---
-    let nvs_wifi = nvs.clone();
+    let nvs_for_wifi_put = nvs.clone();
     server.fn_handler::<anyhow::Error, _>("/api/wifi", Method::Put, move |mut req| {
         let mut buf = [0u8; 1024];
         let mut body = Vec::new();
@@ -691,31 +660,21 @@ a{{color:#60a5fa;text-decoration:none}}
         }
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         let new_ssid = parsed.get("ssid").and_then(|s| s.as_str()).unwrap_or("");
-        let new_pass = parsed.get("password").and_then(|s| s.as_str()).unwrap_or("");
+        let new_pass = parsed.get("password").and_then(|s| s.as_str());
         if new_ssid.is_empty() {
             let err = serde_json::json!({"error": "ssid required"}).to_string();
             let mut resp = req.into_response(400, None, CORS_HEADERS)?;
             resp.write_all(err.as_bytes())?;
             return Ok(());
         }
-        match esp_idf_svc::nvs::EspNvs::new(nvs_wifi.clone(), "wifi", true) {
-            Ok(mut handle) => {
-                let _ = handle.set_str("ssid", new_ssid);
-                let _ = handle.set_str("password", new_pass);
-                log::info!("WiFi credentials saved, restarting...");
-            }
-            Err(e) => {
-                let err = serde_json::json!({"error": format!("NVS: {}", e)}).to_string();
-                let mut resp = req.into_response(500, None, CORS_HEADERS)?;
-                resp.write_all(err.as_bytes())?;
-                return Ok(());
-            }
-        }
-        let resp_body = serde_json::json!({"ok": true, "connected": false, "ip": null}).to_string();
+        zenclaw_agent::net::wifi_ui::write_credentials(&nvs_for_wifi_put, new_ssid, new_pass)
+            .map_err(|e| anyhow::anyhow!("write_credentials: {}", e))?;
+        log::info!("WiFi credentials saved, restarting...");
+        let resp_body = serde_json::json!({"ok": true, "restart": true}).to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(resp_body.as_bytes())?;
         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_secs(1));
             unsafe { esp_idf_svc::sys::esp_restart(); }
         });
         Ok(())
@@ -896,12 +855,14 @@ a{{color:#60a5fa;text-decoration:none}}
     // --- WS /ws/stats (live stats stream) ---
     {
         use embedded_svc::ws::FrameType;
+        let nic_for_ws = nic.clone();
         let ip_for_ws = ip_str.to_string();
         let th = temp_handle;
         server.ws_handler::<_, anyhow::Error>("/ws/stats", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() {
                 let sender = ws.create_detached_sender()?;
                 let ip = ip_for_ws.clone();
+                let nic_clone = nic_for_ws.clone();
                 std::thread::Builder::new()
                     .name("ws-stats".into())
                     .stack_size(8192)
@@ -921,7 +882,8 @@ a{{color:#60a5fa;text-decoration:none}}
                                     &mut used,
                                 );
                             }
-                            let (rssi, _) = get_wifi_info();
+                            let rssi = nic_clone.rssi();
+                            let is_wifi = nic_clone.kind() == zenclaw_agent::net::NicKind::Wifi;
                             let stats = serde_json::json!({
                                 "memory": {
                                     "free_kb": heap_free / 1024,
@@ -929,7 +891,11 @@ a{{color:#60a5fa;text-decoration:none}}
                                     "used_kb": heap_total.saturating_sub(heap_free) / 1024,
                                 },
                                 "temperature_c": read_temp(th),
-                                "wifi": {"connected": true, "ip": ip, "rssi": rssi},
+                                "wifi": {
+                                    "connected": is_wifi && nic_clone.link_up(),
+                                    "ip": ip,
+                                    "rssi": rssi,
+                                },
                                 "storage": {
                                     "total_kb": total / 1024,
                                     "free_kb": total.saturating_sub(used) / 1024,

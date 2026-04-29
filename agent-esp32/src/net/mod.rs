@@ -43,3 +43,39 @@ pub mod wifi_ui;
 
 #[cfg(feature = "nic-eth")]
 pub mod eth;
+
+/// Bring up the primary NIC chosen by cargo features. Each board's manifest
+/// enables exactly one of `nic-eth`, `nic-wifi-internal`, or `nic-wifi-hosted`,
+/// so only the matching arm compiles.
+#[cfg(feature = "esp32")]
+pub fn bring_up_primary(
+    peripherals: esp_idf_svc::hal::peripherals::Peripherals,
+    sysloop: esp_idf_svc::eventloop::EspSystemEventLoop,
+    nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
+) -> anyhow::Result<Box<dyn Nic>> {
+    #[cfg(feature = "nic-eth")]
+    {
+        let _ = nvs; // unused on Eth — credentials come from DHCP
+        return eth::bring_up(peripherals, sysloop);
+    }
+    #[cfg(all(feature = "nic-wifi-internal", not(feature = "nic-eth")))]
+    {
+        return wifi::bring_up_internal(peripherals, sysloop, nvs);
+    }
+    #[cfg(all(
+        feature = "nic-wifi-hosted",
+        not(feature = "nic-wifi-internal"),
+        not(feature = "nic-eth")
+    ))]
+    {
+        return wifi::bring_up_hosted(peripherals, sysloop, nvs);
+    }
+    #[cfg(not(any(
+        feature = "nic-wifi-internal",
+        feature = "nic-wifi-hosted",
+        feature = "nic-eth",
+    )))]
+    {
+        compile_error!("at least one NIC feature must be enabled (nic-wifi-internal | nic-wifi-hosted | nic-eth)");
+    }
+}
