@@ -89,63 +89,75 @@ fn main() {
     zenclaw_agent::led_status::init(40);
     zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Boot);
 
-    // --- WiFi ---
-    use esp_idf_svc::hal::prelude::Peripherals;
-    use esp_idf_svc::eventloop::EspSystemEventLoop;
+    // --- NVS (always needed for config) ---
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
-    use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
-
-    let peripherals = Peripherals::take().unwrap();
-    let sysloop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
-    let nvs_handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "wifi", true).unwrap();
-    let ssid = nvs_get_string(&nvs_handle, "ssid").unwrap_or_default();
-    let password = nvs_get_string(&nvs_handle, "password").unwrap_or_default();
-    drop(nvs_handle);
+    // --- WiFi (only on boards with internal WiFi radio) ---
+    #[cfg(feature = "nic-wifi-internal")]
+    let ip_str = {
+        use esp_idf_svc::hal::peripherals::Peripherals;
+        use esp_idf_svc::eventloop::EspSystemEventLoop;
+        use esp_idf_svc::wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi};
 
-    if ssid.is_empty() {
-        log::error!("No WiFi SSID in NVS — halting");
-        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Error);
-        loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
-    }
+        let peripherals = Peripherals::take().unwrap();
+        let sysloop = EspSystemEventLoop::take().unwrap();
 
-    let mut wifi = EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs.clone())).unwrap();
-    let mut ssid_h: heapless::String<32> = heapless::String::new();
-    ssid_h.push_str(&ssid).unwrap();
-    let mut pass_h: heapless::String<64> = heapless::String::new();
-    pass_h.push_str(&password).unwrap();
+        let nvs_handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "wifi", true).unwrap();
+        let ssid = nvs_get_string(&nvs_handle, "ssid").unwrap_or_default();
+        let password = nvs_get_string(&nvs_handle, "password").unwrap_or_default();
+        drop(nvs_handle);
 
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: ssid_h,
-        password: pass_h,
-        auth_method: AuthMethod::WPA2Personal,
-        ..Default::default()
-    })).unwrap();
-    wifi.start().unwrap();
-    wifi.connect().unwrap();
-    zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiConnecting);
-    log::info!("WiFi connecting...");
+        if ssid.is_empty() {
+            log::error!("No WiFi SSID in NVS — halting");
+            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Error);
+            loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
+        }
 
-    let mut ip_str = String::new();
-    for i in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if wifi.is_connected().unwrap_or(false) {
-            let netif = wifi.sta_netif();
-            if let Ok(info) = netif.get_ip_info() {
-                if !info.ip.is_unspecified() {
-                    ip_str = format!("{}", info.ip);
-                    log::info!("Got IP: {} (after {}ms)", ip_str, i * 500);
-                    break;
+        let mut wifi = EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs.clone())).unwrap();
+        let mut ssid_h: heapless::String<32> = heapless::String::new();
+        ssid_h.push_str(&ssid).unwrap();
+        let mut pass_h: heapless::String<64> = heapless::String::new();
+        pass_h.push_str(&password).unwrap();
+
+        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+            ssid: ssid_h,
+            password: pass_h,
+            auth_method: AuthMethod::WPA2Personal,
+            ..Default::default()
+        })).unwrap();
+        wifi.start().unwrap();
+        wifi.connect().unwrap();
+        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiConnecting);
+        log::info!("WiFi connecting...");
+
+        let mut ip_str = String::new();
+        for i in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if wifi.is_connected().unwrap_or(false) {
+                let netif = wifi.sta_netif();
+                if let Ok(info) = netif.get_ip_info() {
+                    if !info.ip.is_unspecified() {
+                        ip_str = format!("{}", info.ip);
+                        log::info!("Got IP: {} (after {}ms)", ip_str, i * 500);
+                        break;
+                    }
                 }
             }
         }
-    }
-    if ip_str.is_empty() {
-        log::error!("WiFi: no IP after 15s — halting");
-        zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiFailed);
-        loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
-    }
+        if ip_str.is_empty() {
+            log::error!("WiFi: no IP after 15s — halting");
+            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::WifiFailed);
+            loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
+        }
+        // Keep WiFi alive (C3/C6 will manage this properly)
+        std::mem::forget(wifi);
+        ip_str
+    };
+    // On boards without internal WiFi (e.g. P4 with Ethernet), ip_str is populated
+    // by the NIC driver in C4/C6. For now, placeholder so the crate compiles.
+    #[cfg(not(feature = "nic-wifi-internal"))]
+    let ip_str = String::from("0.0.0.0");
 
     // --- mDNS ---
     #[cfg(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled))]
@@ -282,7 +294,7 @@ fn save_config_nvs(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition, json: &str) -
     Ok(())
 }
 
-#[cfg(feature = "esp32")]
+#[cfg(all(feature = "esp32", feature = "nic-wifi-internal"))]
 fn get_wifi_info() -> (Option<i32>, Option<String>) {
     let mut ap_info: esp_idf_svc::sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
     let ret = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap_info) };
@@ -296,6 +308,11 @@ fn get_wifi_info() -> (Option<i32>, Option<String>) {
     } else {
         (None, None)
     }
+}
+
+#[cfg(all(feature = "esp32", not(feature = "nic-wifi-internal")))]
+fn get_wifi_info() -> (Option<i32>, Option<String>) {
+    (None, None)
 }
 
 #[cfg(feature = "esp32")]
@@ -881,7 +898,7 @@ a{{color:#60a5fa;text-decoration:none}}
         use embedded_svc::ws::FrameType;
         let ip_for_ws = ip_str.to_string();
         let th = temp_handle;
-        server.ws_handler::<_, anyhow::Error>("/ws/stats", move |ws| {
+        server.ws_handler::<_, anyhow::Error>("/ws/stats", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() {
                 let sender = ws.create_detached_sender()?;
                 let ip = ip_for_ws.clone();
@@ -937,7 +954,7 @@ a{{color:#60a5fa;text-decoration:none}}
     {
         use embedded_svc::ws::FrameType;
         let gw_ws = gateway.clone();
-        server.ws_handler::<_, anyhow::Error>("/ws/chat", move |ws| {
+        server.ws_handler::<_, anyhow::Error>("/ws/chat", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() { return Ok(()); }
             if ws.is_closed() { return Ok(()); }
             let (_ft, len) = ws.recv(&mut [])?;
@@ -980,7 +997,7 @@ a{{color:#60a5fa;text-decoration:none}}
     // --- WS /ws/logs (stream log entries as JSON) ---
     {
         use embedded_svc::ws::FrameType;
-        server.ws_handler::<_, anyhow::Error>("/ws/logs", |ws| {
+        server.ws_handler::<_, anyhow::Error>("/ws/logs", None, |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() {
                 let sender = ws.create_detached_sender()?;
                 std::thread::Builder::new()
