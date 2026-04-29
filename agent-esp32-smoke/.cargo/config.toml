@@ -1,0 +1,10 @@
+[target.'cfg(target_arch = "riscv32")']
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64", "--cfg", "mio_unsupported_force_poll_poll"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+ESP_IDF_VERSION = "v5.4"

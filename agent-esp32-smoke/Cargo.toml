@@ -1,0 +1,21 @@
+[package]
+name = "zenclaw-smoke-p4"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-idf-svc = "0.51"
+embedded-svc = "0.28"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[[package.metadata.espflash.partition_table]]
+file = "partitions.csv"
