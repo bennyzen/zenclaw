@@ -298,6 +298,43 @@ fn checkpoint_3_4_ethernet_dhcp() -> (esp_idf_svc::netif::EspNetif, sys::esp_eth
     (netif, eth_handle)
 }
 
+fn checkpoint_5_outbound_https() {
+    use embedded_svc::http::client::Client;
+    use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+    use std::time::Duration;
+
+    let conn = match EspHttpConnection::new(&HttpConfig {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        timeout: Some(Duration::from_secs(15)),
+        ..Default::default()
+    }) {
+        Ok(c) => c,
+        Err(e) => fail(5, "outbound_https", &format!("connection setup: {}", e)),
+    };
+    let mut client = Client::wrap(conn);
+    let request = match client.get("https://httpbin.org/ip") {
+        Ok(r) => r,
+        Err(e) => fail(5, "outbound_https", &format!("request setup: {}", e)),
+    };
+    let mut response = match request.submit() {
+        Ok(r) => r,
+        Err(e) => fail(5, "outbound_https", &format!("submit: {}", e)),
+    };
+    let status = response.status();
+    if status != 200 {
+        fail(5, "outbound_https", &format!("HTTP {}", status));
+    }
+    let mut buf = [0u8; 256];
+    let n = match response.read(&mut buf) {
+        Ok(n) => n,
+        Err(e) => fail(5, "outbound_https", &format!("body read: {}", e)),
+    };
+    if n == 0 {
+        fail(5, "outbound_https", "read 0 bytes from body");
+    }
+    pass(5, "outbound_https", &format!("GET https://httpbin.org/ip → 200 ({} bytes)", n));
+}
+
 fn main() -> anyhow::Result<()> {
     link_patches();
     EspLogger::initialize_default();
@@ -312,7 +349,9 @@ fn main() -> anyhow::Result<()> {
 
     let _eth = checkpoint_3_4_ethernet_dhcp();
 
-    log::info!("(checkpoints 5-6 not yet implemented)");
+    checkpoint_5_outbound_https();
+
+    log::info!("(checkpoint 6 not yet implemented)");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
