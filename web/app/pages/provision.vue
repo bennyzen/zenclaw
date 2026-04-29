@@ -341,7 +341,17 @@ async function pollForDevice() {
           <USeparator />
 
           <UFormField label="Device Name" class="w-full">
-            <UInput v-model="deviceName" class="w-full" size="xl" />
+            <div class="flex gap-2 items-stretch">
+              <UInput v-model="deviceName" class="flex-1" size="xl" />
+              <UButton
+                size="xl"
+                color="neutral"
+                variant="outline"
+                icon="i-lucide-dice-5"
+                aria-label="Generate random name"
+                @click="deviceName = randomName()"
+              />
+            </div>
           </UFormField>
           <p class="text-xs text-dimmed">
             Reachable at <strong class="text-muted">{{ deviceName }}.local</strong> on your network
