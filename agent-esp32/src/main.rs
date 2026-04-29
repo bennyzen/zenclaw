@@ -941,10 +941,14 @@ a{{color:#60a5fa;text-decoration:none}}
         server.ws_handler::<_, anyhow::Error>("/ws/chat", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() { return Ok(()); }
             if ws.is_closed() { return Ok(()); }
-            let (_ft, len) = ws.recv(&mut [])?;
+            // Single-call recv with a sized buffer. The two-call peek-then-fill
+            // pattern does not behave reliably under esp-idf v5.4 on ESP32-P4 —
+            // the second httpd_ws_recv_frame returns success but leaves the
+            // buffer zeroed, causing the JSON parse to silently fail.
+            let mut buf = vec![0u8; 4096];
+            let (_ft, len) = ws.recv(&mut buf)?;
             if len == 0 { return Ok(()); }
-            let mut buf = vec![0u8; len];
-            ws.recv(&mut buf)?;
+            buf.truncate(len);
             let sender = ws.create_detached_sender()?;
             let gw = gw_ws.clone();
             std::thread::Builder::new()

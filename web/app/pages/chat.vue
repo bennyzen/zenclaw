@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const { state, sendChatStream, getChatHistory } = useConnection()
+const { state, sendChat, getChatHistory } = useConnection()
 
 interface Message {
   id: string
@@ -39,7 +39,7 @@ async function loadHistory() {
   loading.value = false
 }
 
-function send() {
+async function send() {
   const text = input.value.trim()
   if (!text || sending.value) return
 
@@ -48,29 +48,21 @@ function send() {
   addMessage('user', text)
   sending.value = true
 
-  // Create an empty assistant message to stream into
-  const assistantMsg = addMessage('assistant', '')
+  addMessage('assistant', '')
   const msgIdx = messages.value.length - 1
 
-  sendChatStream(
-    text,
-    (delta) => {
-      const msg = messages.value[msgIdx]
-      if (msg) {
-        msg.parts = [{ type: 'text', text: (msg.parts[0]?.text || '') + delta }]
-      }
-    },
-    (_fullText) => {
-      sending.value = false
-    },
-    (err) => {
-      error.value = err
-      if (!messages.value[msgIdx]?.parts[0]?.text) {
-        messages.value.splice(msgIdx, 1)
-      }
-      sending.value = false
-    },
-  )
+  try {
+    const { reply } = await sendChat(text)
+    const msg = messages.value[msgIdx]
+    if (msg) msg.parts = [{ type: 'text', text: reply }]
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+    if (!messages.value[msgIdx]?.parts[0]?.text) {
+      messages.value.splice(msgIdx, 1)
+    }
+  } finally {
+    sending.value = false
+  }
 }
 
 onMounted(() => {
