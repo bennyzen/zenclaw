@@ -137,17 +137,25 @@ fn main() {
     #[cfg(not(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled)))]
     log::warn!("mDNS: not available (needs cargo clean && cargo build)");
 
-    // --- SNTP (UTC clock sync) ---
-    // R2/S3 SigV4 rejects requests with skew >15 min. Sync once at boot so
-    // any cloud calls have a valid x-amz-date. Service runs in the
-    // background; we don't block startup waiting for it.
-    match esp_idf_svc::sntp::EspSntp::new_default() {
-        Ok(sntp) => {
-            log::info!("SNTP: started default service");
-            std::mem::forget(sntp); // keep the service alive for the lifetime of the program
-        }
-        Err(e) => log::warn!("SNTP: start failed: {} (cloud SigV4 will fail until clock is set)", e),
-    }
+    // --- SNTP (UTC clock sync, deferred) ---
+    // R2/S3 SigV4 rejects requests with skew >15 min. Kick this off in a
+    // background thread so a slow NTP handshake (or an esp-idf service
+    // init that touches the network stack) can never block the main boot
+    // path. The service keeps running for the lifetime of the program.
+    std::thread::Builder::new()
+        .name("sntp-init".into())
+        .stack_size(8192)
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            match esp_idf_svc::sntp::EspSntp::new_default() {
+                Ok(sntp) => {
+                    log::info!("SNTP: started default service");
+                    std::mem::forget(sntp);
+                }
+                Err(e) => log::warn!("SNTP: start failed: {} (cloud SigV4 will fail until clock is set)", e),
+            }
+        })
+        .ok();
 
     // --- Load config ---
     let config = load_config(&nvs);
@@ -310,6 +318,66 @@ fn get_query_param(uri: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Cache for the `/api/status.cloud_storage` block. R2 LIST is rate-
+/// metered and we don't want to hit it on every status poll; the
+/// MicroPython side caches this for 60s and we match.
+#[cfg(feature = "esp32")]
+static CLOUD_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "esp32")]
+fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json::Value> {
+    use zenclaw_agent::core::cloud::client::S3Client;
+    let storage = cfg.storage.as_ref()?;
+    if !storage.is_cloud_configured() {
+        return None;
+    }
+
+    {
+        let cache = CLOUD_STATUS_CACHE.lock().ok()?;
+        if let Some((ts, val)) = cache.as_ref() {
+            if ts.elapsed() < std::time::Duration::from_secs(60) {
+                return Some(val.clone());
+            }
+        }
+    }
+
+    let provider = storage.provider();
+    let bucket = storage.bucket.clone().unwrap_or_default();
+
+    let block = match S3Client::from_config(storage) {
+        Some(client) => match client.list("", None, 1000) {
+            Ok(listing) => {
+                let total: u64 = listing.objects.iter().map(|o| o.size).sum();
+                serde_json::json!({
+                    "configured": true,
+                    "provider": provider,
+                    "bucket": bucket,
+                    "objects": listing.objects.len(),
+                    "total_bytes": total,
+                })
+            }
+            Err(e) => serde_json::json!({
+                "configured": true,
+                "provider": provider,
+                "bucket": bucket,
+                "error": e.to_string(),
+            }),
+        },
+        None => serde_json::json!({
+            "configured": true,
+            "provider": provider,
+            "bucket": bucket,
+            "error": "client init failed",
+        }),
+    };
+
+    if let Ok(mut cache) = CLOUD_STATUS_CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), block.clone()));
+    }
+    Some(block)
+}
+
 #[cfg(feature = "esp32")]
 fn url_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(s.len());
@@ -379,7 +447,7 @@ fn start_http_server(
     for path in &[
         "/api/status", "/api/chat", "/api/chat/history", "/api/config", "/api/wifi",
         "/api/files", "/api/files/read", "/api/files/write", "/api/files/mkdir",
-        "/api/files/upload", "/api/restart",
+        "/api/files/upload", "/api/restart", "/api/cloud/files", "/api/cloud/sign",
     ] {
         server.fn_handler::<anyhow::Error, _>(path, Method::Options, |req| {
             let mut resp = req.into_response(204, None, &[
@@ -515,6 +583,10 @@ a{{color:#60a5fa;text-decoration:none}}
             },
             "uptime_s": uptime_us / 1_000_000
         });
+        let mut body = body;
+        if let Some(cloud) = cloud_status_block(&gw.config) {
+            body["cloud_storage"] = cloud;
+        }
         let body_str = body.to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(body_str.as_bytes())?;
@@ -660,6 +732,110 @@ a{{color:#60a5fa;text-decoration:none}}
                 resp.write_all(err.as_bytes())?;
             }
         }
+        Ok(())
+    }).unwrap();
+
+    // --- /api/cloud/files (GET) — directory-style listing of R2 bucket ---
+    let gw_cloud_list = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/cloud/files", Method::Get, move |req| {
+        use zenclaw_agent::core::cloud::client::S3Client;
+        let prefix = get_query_param(req.uri(), "prefix").unwrap_or_default();
+
+        let client = match gw_cloud_list
+            .config
+            .storage
+            .as_ref()
+            .and_then(S3Client::from_config)
+        {
+            Some(c) => c,
+            None => {
+                let body = r#"{"error":"cloud storage not configured"}"#;
+                let mut resp = req.into_response(503, None, CORS_HEADERS)?;
+                resp.write_all(body.as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        let body = match client.list(&prefix, Some("/"), 1000) {
+            Ok(listing) => {
+                let mut entries: Vec<serde_json::Value> = Vec::new();
+                for cp in &listing.common_prefixes {
+                    // Strip the prefix to get the trailing dir name.
+                    let display = cp
+                        .strip_prefix(&prefix as &str)
+                        .unwrap_or(cp)
+                        .trim_end_matches('/');
+                    entries.push(serde_json::json!({
+                        "name": display,
+                        "path": cp,
+                        "is_dir": true,
+                        "size": serde_json::Value::Null,
+                    }));
+                }
+                for obj in &listing.objects {
+                    let display = obj
+                        .key
+                        .strip_prefix(&prefix as &str)
+                        .unwrap_or(&obj.key);
+                    if display.is_empty() { continue; } // S3 sometimes returns the prefix itself
+                    entries.push(serde_json::json!({
+                        "name": display,
+                        "path": obj.key,
+                        "is_dir": false,
+                        "size": obj.size,
+                    }));
+                }
+                serde_json::json!({"prefix": prefix, "entries": entries}).to_string()
+            }
+            Err(e) => {
+                serde_json::json!({"error": e.to_string()}).to_string()
+            }
+        };
+        let mut resp = req.into_response(200, None, CORS_HEADERS)?;
+        resp.write_all(body.as_bytes())?;
+        Ok(())
+    }).unwrap();
+
+    // --- /api/cloud/sign (GET) — presigned URL for browser-direct R2 ops ---
+    let gw_cloud_sign = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/cloud/sign", Method::Get, move |req| {
+        use zenclaw_agent::core::cloud::client::S3Client;
+        let method = get_query_param(req.uri(), "method").unwrap_or_default().to_uppercase();
+        let key = get_query_param(req.uri(), "key").unwrap_or_default();
+
+        if !matches!(method.as_str(), "GET" | "PUT" | "DELETE") {
+            let body = r#"{"error":"method must be GET, PUT or DELETE"}"#;
+            let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+            resp.write_all(body.as_bytes())?;
+            return Ok(());
+        }
+        if key.is_empty() {
+            let body = r#"{"error":"missing key"}"#;
+            let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+            resp.write_all(body.as_bytes())?;
+            return Ok(());
+        }
+
+        let client = match gw_cloud_sign
+            .config
+            .storage
+            .as_ref()
+            .and_then(S3Client::from_config)
+        {
+            Some(c) => c,
+            None => {
+                let body = r#"{"error":"cloud storage not configured"}"#;
+                let mut resp = req.into_response(503, None, CORS_HEADERS)?;
+                resp.write_all(body.as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        // Match the MicroPython side's hardcoded 15-minute expiry.
+        let url = client.presign(&method, &key, 900);
+        let body = serde_json::json!({"url": url, "method": method, "key": key}).to_string();
+        let mut resp = req.into_response(200, None, CORS_HEADERS)?;
+        resp.write_all(body.as_bytes())?;
         Ok(())
     }).unwrap();
 
