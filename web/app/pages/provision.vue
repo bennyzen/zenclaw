@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { StepperItem } from '@nuxt/ui'
 import type { FlashProgress } from '~/composables/useSerial'
+import { loadBoardManifest, FALLBACK_BOARDS, type BoardManifest } from '~/types/firmware'
 
 const serial = useSerial()
 
@@ -23,6 +24,15 @@ const apiProvider = ref('google')
 const apiModel = ref('gemini-2.5-flash')
 const baseUrl = ref('https://generativelanguage.googleapis.com/v1beta')
 const deviceName = ref(randomName())
+
+const boards = ref<BoardManifest[]>(FALLBACK_BOARDS)
+const boardId = ref<string>(FALLBACK_BOARDS.find(b => b.default)?.id ?? FALLBACK_BOARDS[0]!.id)
+const selectedBoard = computed<BoardManifest>(() =>
+  boards.value.find(b => b.id === boardId.value) ?? boards.value[0]!,
+)
+const boardItems = computed(() =>
+  boards.value.map(b => ({ label: `${b.name} (${b.chip})`, value: b.id })),
+)
 
 const BASE_URLS: Record<string, string> = {
   'google': 'https://generativelanguage.googleapis.com/v1beta',
@@ -105,6 +115,10 @@ watch(apiProvider, (name) => {
 })
 
 onMounted(async () => {
+  boards.value = await loadBoardManifest(useRuntimeConfig().app.baseURL)
+  if (!boards.value.some(b => b.id === boardId.value)) {
+    boardId.value = boards.value.find(b => b.default)?.id ?? boards.value[0]!.id
+  }
   await fetchModels()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
@@ -117,6 +131,7 @@ onMounted(async () => {
     if (data.apiModel) apiModel.value = data.apiModel
     if (data.deviceName) deviceName.value = data.deviceName
     if (data.baseUrl) baseUrl.value = data.baseUrl
+    if (data.boardId) boardId.value = data.boardId
   } catch { /* ignore */ }
   // Wait for deferred watchers (apiProvider watcher) to flush before
   // clearing the flag — otherwise the watcher sees _restoring=false
@@ -136,7 +151,11 @@ const serialSupported = computed(() =>
   import.meta.client ? 'serial' in navigator : false,
 )
 
-const configValid = computed(() => wifiSsid.value && apiKey.value)
+const configValid = computed(() => {
+  if (!apiKey.value) return false
+  if (selectedBoard.value.network === 'wifi' && !wifiSsid.value) return false
+  return true
+})
 
 const items: StepperItem[] = [
   { title: 'Configure', description: 'WiFi and API keys', icon: 'i-lucide-settings' },
@@ -146,7 +165,7 @@ const items: StepperItem[] = [
 ]
 
 // Save to localStorage on change
-watch([wifiSsid, wifiPassword, apiKey, apiProvider, apiModel, baseUrl, deviceName], () => {
+watch([wifiSsid, wifiPassword, apiKey, apiProvider, apiModel, baseUrl, deviceName, boardId], () => {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     wifiSsid: wifiSsid.value,
     wifiPassword: wifiPassword.value,
@@ -155,6 +174,7 @@ watch([wifiSsid, wifiPassword, apiKey, apiProvider, apiModel, baseUrl, deviceNam
     apiModel: apiModel.value,
     baseUrl: baseUrl.value,
     deviceName: deviceName.value,
+    boardId: boardId.value,
   }))
 })
 
@@ -177,7 +197,12 @@ async function flash() {
   error.value = null
 
   const ok = await serial.flashDevice(
-    { ssid: wifiSsid.value, password: wifiPassword.value, hostname: deviceName.value },
+    {
+      hostname: deviceName.value,
+      board: selectedBoard.value,
+      ssid: selectedBoard.value.network === 'wifi' ? wifiSsid.value : undefined,
+      password: selectedBoard.value.network === 'wifi' ? wifiPassword.value : undefined,
+    },
     (p) => { progress.value = p },
   )
 
@@ -246,12 +271,33 @@ async function pollForDevice() {
       <template #content="{ item }">
         <!-- Configure -->
         <div v-if="item.title === 'Configure'" class="space-y-4 pt-10">
-          <UFormField label="WiFi SSID" class="w-full">
-            <UInput v-model="wifiSsid" placeholder="Your WiFi network" class="w-full" size="xl" />
+          <UFormField label="Board" class="w-full">
+            <USelectMenu
+              v-model="boardId"
+              class="w-full"
+              size="xl"
+              :items="boardItems"
+              value-key="value"
+            />
           </UFormField>
-          <UFormField label="WiFi Password" class="w-full">
-            <UInput v-model="wifiPassword" class="w-full" size="xl" />
-          </UFormField>
+          <p v-if="selectedBoard.description" class="text-xs text-dimmed">
+            {{ selectedBoard.description }}
+          </p>
+
+          <USeparator />
+
+          <template v-if="selectedBoard.network === 'wifi'">
+            <UFormField label="WiFi SSID" class="w-full">
+              <UInput v-model="wifiSsid" placeholder="Your WiFi network" class="w-full" size="xl" />
+            </UFormField>
+            <UFormField label="WiFi Password" class="w-full">
+              <UInput v-model="wifiPassword" class="w-full" size="xl" />
+            </UFormField>
+          </template>
+          <div v-else class="rounded border border-default bg-elevated p-3 text-sm text-muted">
+            <p class="font-semibold text-toned mb-1">Ethernet device</p>
+            <p>Plug an Ethernet cable into the device before flashing — no WiFi credentials needed.</p>
+          </div>
 
           <USeparator />
 
@@ -305,8 +351,12 @@ async function pollForDevice() {
         <!-- Flash -->
         <div v-else-if="item.title === 'Flash'" class="space-y-4 pt-10">
           <p class="text-sm text-muted">
-            Plug your ESP32-S3 into this computer via USB and click Flash.
-            If the device is already running MicroPython, it will reboot into bootloader mode automatically.
+            Plug your <strong>{{ selectedBoard.name }}</strong> ({{ selectedBoard.chip }}) into this
+            computer via USB and click Flash.
+          </p>
+          <p v-if="selectedBoard.network === 'ethernet'" class="text-sm text-muted">
+            Make sure the Ethernet cable is connected before the device boots — the agent gets its
+            network address via DHCP.
           </p>
 
           <div class="rounded border border-default bg-elevated p-3 text-xs text-muted">

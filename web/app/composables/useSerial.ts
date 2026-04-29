@@ -1,4 +1,5 @@
-import { buildNvsPartition } from '~/utils/nvs'
+import { buildNvsPartition, type NvsBlob } from '~/utils/nvs'
+import type { BoardManifest } from '~/types/firmware'
 
 export interface FlashProgress {
   stage: 'connecting' | 'erasing' | 'flashing' | 'done' | 'error'
@@ -7,9 +8,10 @@ export interface FlashProgress {
 }
 
 export interface DeviceConfig {
-  ssid: string
-  password: string
   hostname: string
+  board: BoardManifest
+  ssid?: string      // required when board.network === 'wifi'
+  password?: string  // required when board.network === 'wifi'
 }
 
 export function useSerial() {
@@ -179,43 +181,53 @@ export function useSerial() {
 
       log('Connecting to bootloader...')
       await loader.main()
-      const chipName = loader.chip?.CHIP_NAME || 'ESP32'
-      log(`Chip detected: ${chipName}`)
-      onProgress({ stage: 'connecting', percent: 10, message: `Chip: ${chipName}` })
+      // --- Chip-vs-board guard ---
+      const detectedChip = loader.chip?.CHIP_NAME || 'ESP32'
+      log(`Chip detected: ${detectedChip}`)
+      onProgress({ stage: 'connecting', percent: 10, message: `Chip: ${detectedChip}` })
+      if (detectedChip !== config.board.chip) {
+        throw new Error(
+          `Selected ${config.board.name} (${config.board.chip}) but detected ${detectedChip}. `
+          + `Plug in the correct board or change selection.`,
+        )
+      }
 
-      // Download firmware files
+      // --- Download merged firmware image ---
       onProgress({ stage: 'flashing', percent: 15, message: 'Downloading firmware...' })
-
       const base = useRuntimeConfig().app.baseURL
-      const [fwResponse, fsResponse] = await Promise.all([
-        fetch(base + 'firmware/micropython.bin'),
-        fetch(base + 'firmware/zenclaw.img'),
-      ])
-      if (!fwResponse.ok) throw new Error(`Failed to download micropython.bin (HTTP ${fwResponse.status})`)
-      if (!fsResponse.ok) throw new Error(`Failed to download zenclaw.img (HTTP ${fsResponse.status})`)
+      const fwResponse = await fetch(base + 'firmware/' + config.board.image)
+      if (!fwResponse.ok) {
+        throw new Error(
+          `Firmware ${config.board.image} missing (HTTP ${fwResponse.status}) — `
+          + `rebuild via scripts/build-rust-firmware.sh`,
+        )
+      }
+      const fwData = new Uint8Array(await fwResponse.arrayBuffer())
+      log(`Firmware: ${fwData.length} bytes`)
 
-      const [fwData, fsData] = await Promise.all([
-        fwResponse.arrayBuffer().then(b => new Uint8Array(b)),
-        fsResponse.arrayBuffer().then(b => new Uint8Array(b)),
-      ])
-      log(`Firmware: ${fwData.length} bytes, Filesystem: ${fsData.length} bytes`)
-
-      // Build NVS partition with WiFi credentials + hostname
-      log(`Building NVS: WiFi=${config.ssid}, hostname=${config.hostname}`)
-      const nvsData = buildNvsPartition([
-        { namespace: 'wifi', key: 'ssid', value: config.ssid },
-        { namespace: 'wifi', key: 'password', value: config.password },
+      // --- Build NVS partition ---
+      const nvsEntries: NvsBlob[] = [
         { namespace: 'device', key: 'hostname', value: config.hostname },
-      ])
+      ]
+      if (config.board.network === 'wifi') {
+        if (!config.ssid) throw new Error('WiFi SSID is required for this board')
+        nvsEntries.push(
+          { namespace: 'wifi', key: 'ssid', value: config.ssid },
+          { namespace: 'wifi', key: 'password', value: config.password ?? '' },
+        )
+        log(`Building NVS: hostname=${config.hostname}, WiFi=${config.ssid}`)
+      } else {
+        log(`Building NVS: hostname=${config.hostname} (Ethernet — no WiFi creds)`)
+      }
+      const nvsData = buildNvsPartition(nvsEntries)
 
-      // Flash all three images in one operation
-      log('Flashing firmware + filesystem + NVS...')
+      // --- Flash merged image + NVS ---
+      log('Flashing firmware + NVS...')
       onProgress({ stage: 'flashing', percent: 25, message: 'Flashing...' })
       await loader.writeFlash({
         fileArray: [
-          { data: fwData, address: 0x0 },        // MicroPython (bootloader + app)
-          { data: nvsData, address: 0x9000 },     // NVS partition (WiFi creds)
-          { data: fsData, address: 0x200000 },    // littlefs VFS partition
+          { data: fwData,  address: 0x0 },     // bootloader + partition table + app (chip-correct internal layout)
+          { data: nvsData, address: 0x9000 },  // NVS partition (hostname + WiFi creds if applicable)
         ],
         flashSize: 'keep',
         flashMode: 'keep',
