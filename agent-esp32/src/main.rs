@@ -139,9 +139,7 @@ fn main() {
 
     // --- SNTP (UTC clock sync, deferred) ---
     // R2/S3 SigV4 rejects requests with skew >15 min. Kick this off in a
-    // background thread so a slow NTP handshake (or an esp-idf service
-    // init that touches the network stack) can never block the main boot
-    // path. The service keeps running for the lifetime of the program.
+    // background thread so a slow NTP handshake can never block boot.
     std::thread::Builder::new()
         .name("sntp-init".into())
         .stack_size(8192)
@@ -152,7 +150,7 @@ fn main() {
                     log::info!("SNTP: started default service");
                     std::mem::forget(sntp);
                 }
-                Err(e) => log::warn!("SNTP: start failed: {} (cloud SigV4 will fail until clock is set)", e),
+                Err(e) => log::warn!("SNTP: start failed: {}", e),
             }
         })
         .ok();
@@ -423,7 +421,9 @@ fn start_http_server(
     let mut server = EspHttpServer::new(&HttpConfig {
         http_port: 80,
         stack_size: 16384,
-        max_uri_handlers: 32,
+        // We register ~36 handlers (REST + OPTIONS preflights + WS). Leave
+        // headroom for future routes; the per-handler memory cost is tiny.
+        max_uri_handlers: 64,
         ..Default::default()
     }).unwrap();
 
