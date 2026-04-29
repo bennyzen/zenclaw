@@ -10,8 +10,8 @@ export interface FlashProgress {
 export interface DeviceConfig {
   hostname: string
   board: BoardManifest
-  ssid?: string      // required when board.network === 'wifi'
-  password?: string  // required when board.network === 'wifi'
+  ssid?: string      // optional; written to NVS when non-empty
+  password?: string  // optional; paired with ssid
 }
 
 export function useSerial() {
@@ -209,15 +209,14 @@ export function useSerial() {
       const nvsEntries: NvsBlob[] = [
         { namespace: 'device', key: 'hostname', value: config.hostname },
       ]
-      if (config.board.network === 'wifi') {
-        if (!config.ssid) throw new Error('WiFi SSID is required for this board')
+      if (config.ssid) {
         nvsEntries.push(
           { namespace: 'wifi', key: 'ssid', value: config.ssid },
           { namespace: 'wifi', key: 'password', value: config.password ?? '' },
         )
         log(`Building NVS: hostname=${config.hostname}, WiFi=${config.ssid}`)
       } else {
-        log(`Building NVS: hostname=${config.hostname} (Ethernet — no WiFi creds)`)
+        log(`Building NVS: hostname=${config.hostname} (no WiFi creds)`)
       }
       const nvsData = buildNvsPartition(nvsEntries)
 

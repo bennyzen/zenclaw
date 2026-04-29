@@ -30,6 +30,11 @@ const boardId = ref<string>(FALLBACK_BOARDS.find(b => b.default)?.id ?? FALLBACK
 const selectedBoard = computed<BoardManifest>(() =>
   boards.value.find(b => b.id === boardId.value) ?? boards.value[0]!,
 )
+function wifiLabel(field: 'SSID' | 'Password'): string {
+  return selectedBoard.value.network === 'ethernet'
+    ? `WiFi ${field} (optional)`
+    : `WiFi ${field}`
+}
 const boardItems = computed(() =>
   boards.value.map(b => ({ label: `${b.name} (${b.chip})`, value: b.id })),
 )
@@ -202,8 +207,8 @@ async function flash() {
     {
       hostname: deviceName.value,
       board: selectedBoard.value,
-      ssid: selectedBoard.value.network === 'wifi' ? wifiSsid.value : undefined,
-      password: selectedBoard.value.network === 'wifi' ? wifiPassword.value : undefined,
+      ssid: wifiSsid.value || undefined,
+      password: wifiPassword.value || undefined,
     },
     (p) => { progress.value = p },
   )
@@ -288,18 +293,17 @@ async function pollForDevice() {
 
           <USeparator />
 
-          <template v-if="selectedBoard.network === 'wifi'">
-            <UFormField label="WiFi SSID" class="w-full">
-              <UInput v-model="wifiSsid" placeholder="Your WiFi network" class="w-full" size="xl" />
-            </UFormField>
-            <UFormField label="WiFi Password" class="w-full">
-              <UInput v-model="wifiPassword" class="w-full" size="xl" />
-            </UFormField>
-          </template>
-          <div v-else class="rounded border border-default bg-elevated p-3 text-sm text-muted">
+          <div v-if="selectedBoard.network === 'ethernet'" class="rounded border border-default bg-elevated p-3 text-sm text-muted">
             <p class="font-semibold text-toned mb-1">Ethernet device</p>
-            <p>Plug an Ethernet cable into the device before flashing — no WiFi credentials needed.</p>
+            <p>Plug an Ethernet cable into the device before flashing — the agent gets its address via DHCP. WiFi credentials below are optional and written to NVS for future dual-mode use.</p>
           </div>
+
+          <UFormField :label="wifiLabel('SSID')" class="w-full">
+            <UInput v-model="wifiSsid" placeholder="Your WiFi network" class="w-full" size="xl" />
+          </UFormField>
+          <UFormField :label="wifiLabel('Password')" class="w-full">
+            <UInput v-model="wifiPassword" class="w-full" size="xl" />
+          </UFormField>
 
           <USeparator />
 
