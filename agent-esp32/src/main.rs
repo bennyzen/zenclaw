@@ -126,16 +126,21 @@ fn main() {
 
     // --- mDNS ---
     #[cfg(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled))]
-    {
+    let hostname = {
+        let h = resolve_hostname(&nvs);
         let mut mdns = esp_idf_svc::mdns::EspMdns::take().unwrap();
-        mdns.set_hostname("zenclaw").unwrap();
+        mdns.set_hostname(&h).unwrap();
         mdns.set_instance_name("ZenClaw Agent").unwrap();
         mdns.add_service(None, "_http", "_tcp", 80, &[]).unwrap();
-        log::info!("mDNS: zenclaw.local");
+        log::info!("mDNS: {}.local", h);
         std::mem::forget(mdns);
-    }
+        h
+    };
     #[cfg(not(any(esp_idf_comp_mdns_enabled, esp_idf_comp_espressif__mdns_enabled)))]
-    log::warn!("mDNS: not available (needs cargo clean && cargo build)");
+    let hostname = {
+        log::warn!("mDNS: not available (needs cargo clean && cargo build)");
+        resolve_hostname(&nvs)
+    };
 
     // --- SNTP (UTC clock sync, deferred) ---
     // R2/S3 SigV4 rejects requests with skew >15 min. Kick this off in a
@@ -203,7 +208,7 @@ fn main() {
     let chat_tx = std::sync::Arc::new(std::sync::Mutex::new(chat_tx));
 
     // --- Start HTTP server ---
-    start_http_server(gateway.clone(), nic.clone(), &ip_str, nvs, chat_tx);
+    start_http_server(gateway.clone(), nic.clone(), &ip_str, &hostname, nvs, chat_tx);
     zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
 
     // --- Start agent thread (handles both Telegram + HTTP chat) ---
@@ -243,6 +248,31 @@ fn nvs_get_string(
         }
     }
     None
+}
+
+#[cfg(feature = "esp32")]
+fn read_device_hostname(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
+    let handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "device", false).ok()?;
+    nvs_get_string(&handle, "hostname").filter(|s| !s.is_empty())
+}
+
+#[cfg(feature = "esp32")]
+fn resolve_hostname(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> String {
+    if let Some(h) = read_device_hostname(nvs) {
+        return h;
+    }
+    let mut mac = [0u8; 6];
+    let err = unsafe {
+        esp_idf_svc::sys::esp_read_mac(
+            mac.as_mut_ptr(),
+            esp_idf_svc::sys::esp_mac_type_t_ESP_MAC_WIFI_STA,
+        )
+    };
+    if err != 0 {
+        log::warn!("esp_read_mac failed: {} — using static fallback", err);
+        return "zenclaw".to_string();
+    }
+    format!("zenclaw-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5])
 }
 
 #[cfg(feature = "esp32")]
@@ -422,6 +452,7 @@ fn start_http_server(
     gateway: std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
     nic: std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
     ip_str: &str,
+    hostname: &str,
     nvs: esp_idf_svc::nvs::EspDefaultNvsPartition,
     chat_tx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<ChatRequest>>>,
 ) {
@@ -1214,7 +1245,7 @@ a{{color:#60a5fa;text-decoration:none}}
         }).unwrap();
     }
 
-    log::info!("HTTP server on :80 — http://{}/ or http://zenclaw.local/", ip_str);
+    log::info!("HTTP server on :80 — http://{}/ or http://{}.local/", ip_str, hostname);
 
     // Leak the server so it stays alive
     std::mem::forget(server);
@@ -1415,3 +1446,22 @@ fn agent_thread(
 
 #[cfg(feature = "desktop")]
 fn main() { unimplemented!() }
+
+#[cfg(test)]
+mod hostname_tests {
+    fn format_mac_suffix(mac: &[u8; 6]) -> String {
+        format!("zenclaw-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5])
+    }
+
+    #[test]
+    fn format_mac_suffix_uses_lower_three_bytes_lowercase_hex() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(format_mac_suffix(&mac), "zenclaw-ddeeff");
+    }
+
+    #[test]
+    fn format_mac_suffix_zero_pads_each_byte() {
+        let mac = [0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
+        assert_eq!(format_mac_suffix(&mac), "zenclaw-010203");
+    }
+}
