@@ -4,21 +4,25 @@ AI agent framework. Two implementations: a **Rust agent** (`agent-esp32/`) targe
 
 ## Rust Agent (`agent-esp32/`)
 
-The Rust agent is the primary ESP32-S3 target. Built with `esp-idf-svc` (ESP-IDF v5.4), no tokio — uses `block_on` for async and `std::thread` for concurrency.
+The Rust agent targets ESP32-S3 and ESP32-P4 boards. Built with `esp-idf-svc` (ESP-IDF v5.4), no tokio — uses `block_on` for async and `std::thread` for concurrency.
 
 ### Quick Start
 
 ```bash
 cd agent-esp32
 
-# Build for default board (DevKitC with PSRAM)
-cargo build --release
+# Build for DevKitC (ESP32-S3)
+just build devkitc
 
-# Build for a specific board profile (IMPORTANT: must match hardware!)
-ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.sdcard" cargo build --release
+# Build for Guition P4
+just build guition-p4
 
-# Flash (ALWAYS use --bootloader flag — bundled bootloader causes boot loops)
-espflash flash --port /dev/ttyACM0 --partition-table partitions.csv --bootloader bootloader.bin target/xtensa-esp32s3-espidf/release/zenclaw-agent
+# Flash (board manifest supplies the correct --bootloader automatically)
+just flash devkitc /dev/ttyACM0
+just flash guition-p4 /dev/ttyACM0
+
+# List all available boards
+just list
 
 # Monitor serial output
 espflash monitor --port /dev/ttyACM0 --non-interactive
@@ -28,20 +32,63 @@ espflash monitor --port /dev/ttyACM0 --non-interactive
 
 The board profile MUST match the hardware. Flashing a PSRAM-enabled build onto a board without PSRAM will crash at boot (`Failed to init external RAM!`).
 
-Board profiles are layered via `ESP_IDF_SDKCONFIG_DEFAULTS` (semicolon-separated):
+`just build <board>` is the canonical build path. It reads `boards/<name>.toml` to set the correct cargo target, sdkconfig stack, features, and bootloader automatically. The legacy `ESP_IDF_SDKCONFIG_DEFAULTS` env-var override still works for one-off builds but is no longer the default workflow.
 
-| Profile | File | Hardware | Key Config |
-|---------|------|----------|------------|
-| **DevKitC** | `sdkconfig.board.devkitc` | ESP32-S3-DevKitC (2x USB, 8MB PSRAM) | `CONFIG_SPIRAM=y`, UART console, USB Host enabled |
-| **SD Card** | `sdkconfig.board.sdcard` | LILYGO T-Dongle-S3 (1x USB, no PSRAM, SD slot) | USB Serial/JTAG console, no SPIRAM |
-
-Default board is set in `.cargo/config.toml` (`ESP_IDF_SDKCONFIG_DEFAULTS`). Override with env var.
+| Board | Manifest | Hardware | Key Config |
+|-------|----------|----------|------------|
+| **devkitc** | `boards/devkitc.toml` | ESP32-S3-DevKitC (2x USB, 8MB PSRAM) | `CONFIG_SPIRAM=y`, UART console, USB Host enabled |
+| **sdcard** | `boards/sdcard.toml` | LILYGO T-Dongle-S3 (1x USB, no PSRAM, SD slot) | USB Serial/JTAG console, no SPIRAM |
+| **guition-p4** | `boards/guition-p4.toml` | Guition JC-ESP32P4-M3-DEV (Ethernet, 32MB PSRAM) | RISC-V target, IP101 PHY, no WiFi provisioning needed |
 
 **CRITICAL**: When switching board profiles, the esp-idf-sys build cache may retain the old sdkconfig. If the board doesn't boot, clean and rebuild:
 ```bash
-rm -rf target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-*
-ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.sdcard" cargo build --release
+just clean devkitc
+just build devkitc
 ```
+
+### Multi-board build system
+
+Each board is described by a TOML manifest in `boards/<name>.toml`:
+
+```toml
+chip        = "esp32s3"                                  # chip family (used for bootloader lookup)
+target      = "xtensa-esp32s3-espidf"                    # cargo build target
+sdkconfig   = ["sdkconfig.defaults", "sdkconfig.board.devkitc"]  # ordered sdkconfig layers
+bootloader  = "bootloaders/esp32s3.bin"                  # vendored bootloader
+features    = ["esp32", "nic-wifi-internal"]             # cargo features (no-default-features implied)
+default_baud = 921600                                    # espflash baud rate
+description = "ESP32-S3-DevKitC (PSRAM, USB Host capable)"
+```
+
+- `just list` — prints all boards with descriptions
+- `just build <board>` — builds with the correct target + sdkconfig + features
+- `just flash <board> [port]` — flashes with the correct bootloader
+- `just clean <board>` — wipes the esp-idf-sys cache for that target
+- `bootloaders/<chip>.bin` are vendored from clean `esp-idf-sys` builds for each chip
+- `agent-esp32-smoke/` is the minimal reference template for porting to new chips
+
+### ESP32-P4 (Guition JC-ESP32P4-M3-DEV)
+
+- **Target**: `riscv32imafc-esp-espidf` (RISC-V; no Xtensa toolchain needed)
+- **Network**: Ethernet via IP101 PHY — plug in an Ethernet cable; no WiFi provisioning needed
+- **Key pin map** (RMII bus):
+  | Signal | GPIO |
+  |--------|------|
+  | TX_EN  | 49   |
+  | TXD0   | 34   |
+  | TXD1   | 35   |
+  | CRS_DV | 28   |
+  | RXD0   | 29   |
+  | RXD1   | 30   |
+  | MDC    | 31   |
+  | MDIO   | 52   |
+  | REF_CLK| 50   | (50 MHz input from PHY oscillator) |
+  | PHY_PWR| 51   | (hw-reset GPIO) |
+  | PHY_ADDR | 1  | |
+- **Workflow**: `just build guition-p4 && just flash guition-p4 /dev/ttyACM0`
+- **Discovery**: mDNS `zenclaw.local` works identically to S3 builds; boot to agent-ready in ~5s
+- **Config**: provision via `/api/config` POST after Ethernet comes up (same as S3)
+- **C6 WiFi co-processor**: the onboard ESP32-C6 is held in reset; WiFi deferred to v2
 
 ### WiFi & Config Provisioning (NVS)
 
@@ -64,7 +111,7 @@ curl -X POST http://zenclaw.local/api/config \
 
 ### Deploy, Test & Iterate
 
-After flashing, wait ~12s for WiFi + HTTP server, then:
+After flashing, wait ~12s for network + HTTP server (S3: WiFi connect; P4: Ethernet DHCP ~5s), then:
 
 ```bash
 # Smoke-test
@@ -106,6 +153,12 @@ agent-esp32/src/
     background/               Background task management
     memory/                   Vector memory store
 
+  net/                        NIC abstraction (trait + per-driver modules)
+    mod.rs                    Nic trait, IpInfo, bring_up_primary dispatch
+    wifi.rs                   EspWifi driver (feature: nic-wifi-internal)
+    wifi_ui.rs                NVS credential read/write + /api/wifi handlers
+    eth.rs                    IP101 EMAC driver via raw FFI (feature: nic-eth)
+
   esp32/                      ESP32-specific implementations
     mod.rs                    Module exports
     runner.rs                 EspRunner — HTTP calls via esp-idf-svc
@@ -139,6 +192,9 @@ agent-esp32/src/
 |---------|-------------|
 | `esp32` (default) | ESP32 target — esp-idf-svc, embedded-svc |
 | `desktop` | Desktop target — tokio, axum, reqwest |
+| `nic-wifi-internal` | Native WiFi via EspWifi (S3/S2); enabled by devkitc + sdcard board manifests |
+| `nic-wifi-hosted` | WiFi via esp_hosted (C6/C5 SDIO co-proc) — v2, not yet implemented |
+| `nic-eth` | Internal EMAC + external PHY (P4); enabled by guition-p4 board manifest |
 | `usb_storage` | USB Host MSC support (requires `esp32`, DevKitC board + powered USB hub) |
 | `hnsw` | HNSW vector index via usearch |
 
@@ -154,13 +210,14 @@ storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
 ### Common Pitfalls (Rust)
 
 - **Board profile mismatch**: Flashing a PSRAM-enabled build onto no-PSRAM hardware crashes at boot before any Rust code runs. Always verify `CONFIG_SPIRAM` matches hardware.
-- **Bootloader flag**: Always pass `--bootloader bootloader.bin` to `espflash flash`. The bundled bootloader causes boot loops on ESP32-S3.
-- **Build cache**: `esp-idf-sys` caches the sdkconfig. Changing board profile without cleaning `target/.../build/esp-idf-sys-*` has no effect.
+- **Bootloader flag**: `just flash` always supplies the correct `--bootloader` from the board manifest. If calling `espflash` directly, always pass `--bootloader bootloaders/<chip>.bin`. The bundled bootloader causes boot loops.
+- **Build cache**: `esp-idf-sys` caches the sdkconfig. Changing board profile without cleaning `target/.../build/esp-idf-sys-*` has no effect. Use `just clean <board>` to wipe it.
 - **No tokio on ESP32**: The ESP32 feature uses `esp_idf_svc::hal::task::block_on` for async and `std::thread` for concurrency. Do not add tokio.
 - **NVS erase**: Never use `espflash erase-flash` — it wipes NVS (WiFi creds + config). Flash specific partition offsets instead.
 - **USB PHY sharing**: ESP32-S3 has one USB PHY shared between Serial/JTAG and OTG. `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` claims it, blocking USB Host. DevKitC uses UART console to free the PHY.
 - **USB Host VBUS**: DevKitC USB-C port doesn't supply 5V in host mode. USB devices need a powered hub.
 - **Main thread must not block**: The main thread parks in `loop { sleep(60s) }` after spawning HTTP server and Telegram poller threads. HTTP server runs in esp-idf's httpd thread pool.
+- **S3 Xtensa LLVM bug**: The current `esp` Rust toolchain fails to compile `serde_json` deserialization with `XtensaISD::PCREL_WRAPPER` selector errors — `lto = true`, `lto = "thin"`, and `lto = false` all trigger it (the bug is in the Xtensa backend, not the LTO pass). Workaround: build with an older `espup`-installed toolchain, or wait for an upstream fix in esp-rs/rust. P4 (RISC-V) builds are unaffected.
 
 ## MicroPython Agent (`firmware/`)
 
@@ -265,16 +322,22 @@ ESP32-S3: 512 KB SRAM + optional 2-8 MB PSRAM. Boards without PSRAM (T-Dongle-S3
 
 ```
 zenclaw/
-  agent-esp32/              Rust agent (ESP32-S3 + desktop targets)
-    .cargo/config.toml        Build target + default board profile
+  agent-esp32/              Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
+    justfile                  Multi-board build system (just build/flash/clean/list)
+    boards/                   Per-board TOML manifests (devkitc, sdcard, guition-p4)
+    bootloaders/              Vendored bootloaders (esp32s3.bin, esp32p4.bin)
+    scripts/board-env.sh      Reads a board manifest and exports build env vars
     Cargo.toml                Dependencies, features, ESP-IDF components
     partitions.csv            Flash partition layout (NVS + 4MB app + 8MB SPIFFS)
-    bootloader.bin            Pre-built bootloader (always use with espflash)
     sdkconfig.defaults        Shared ESP-IDF config (flash size, TLS, HTTP server)
     sdkconfig.board.devkitc   DevKitC profile (PSRAM, UART console, USB Host)
     sdkconfig.board.sdcard    T-Dongle-S3 profile (no PSRAM, USB Serial/JTAG)
+    sdkconfig.board.guition-p4  Guition P4 profile (EMAC, RISC-V, 32MB PSRAM)
     bindings_usb_msc.h        Bindgen header for USB Host MSC component
+    bindings_led_strip.h      Bindgen header for LED strip component
     src/                      Rust source (see Architecture above)
+
+  agent-esp32-smoke/        Minimal reference crate for porting to new chips
 
   firmware/                 MicroPython agent (ESP32 + desktop)
     boot.py                   ESP32 boot (WiFi from NVS)
