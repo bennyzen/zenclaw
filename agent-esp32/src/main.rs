@@ -250,6 +250,10 @@ fn nvs_get_string(
     None
 }
 
+fn format_mac_suffix(mac: &[u8; 6]) -> String {
+    format!("zenclaw-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5])
+}
+
 #[cfg(feature = "esp32")]
 fn read_device_hostname(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> Option<String> {
     let handle = esp_idf_svc::nvs::EspNvs::new(nvs.clone(), "device", false).ok()?;
@@ -262,6 +266,7 @@ fn resolve_hostname(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> String {
         return h;
     }
     let mut mac = [0u8; 6];
+    // SAFETY: esp_read_mac writes exactly 6 bytes into `mac`, which is sized [u8; 6].
     let err = unsafe {
         esp_idf_svc::sys::esp_read_mac(
             mac.as_mut_ptr(),
@@ -272,7 +277,7 @@ fn resolve_hostname(nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition) -> String {
         log::warn!("esp_read_mac failed: {} — using static fallback", err);
         return "zenclaw".to_string();
     }
-    format!("zenclaw-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5])
+    format_mac_suffix(&mac)
 }
 
 #[cfg(feature = "esp32")]
@@ -1449,9 +1454,7 @@ fn main() { unimplemented!() }
 
 #[cfg(test)]
 mod hostname_tests {
-    fn format_mac_suffix(mac: &[u8; 6]) -> String {
-        format!("zenclaw-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5])
-    }
+    use super::format_mac_suffix;
 
     #[test]
     fn format_mac_suffix_uses_lower_three_bytes_lowercase_hex() {
