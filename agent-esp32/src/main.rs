@@ -269,6 +269,23 @@ fn read_temp(handle_val: usize) -> Option<f64> {
 }
 
 #[cfg(feature = "esp32")]
+fn chip_label() -> &'static str {
+    use esp_idf_svc::sys;
+    let mut info: sys::esp_chip_info_t = unsafe { std::mem::zeroed() };
+    unsafe { sys::esp_chip_info(&mut info) };
+    match info.model {
+        m if m == sys::esp_chip_model_t_CHIP_ESP32 => "ESP32",
+        m if m == sys::esp_chip_model_t_CHIP_ESP32S2 => "ESP32-S2",
+        m if m == sys::esp_chip_model_t_CHIP_ESP32S3 => "ESP32-S3",
+        m if m == sys::esp_chip_model_t_CHIP_ESP32C3 => "ESP32-C3",
+        m if m == sys::esp_chip_model_t_CHIP_ESP32C6 => "ESP32-C6",
+        m if m == sys::esp_chip_model_t_CHIP_ESP32H2 => "ESP32-H2",
+        m if m == sys::esp_chip_model_t_CHIP_ESP32P4 => "ESP32-P4",
+        _ => "ESP32",
+    }
+}
+
+#[cfg(feature = "esp32")]
 fn get_query_param(uri: &str, key: &str) -> Option<String> {
     let query = uri.split('?').nth(1)?;
     for pair in query.split('&') {
@@ -385,13 +402,14 @@ h1{{font-size:1.5rem;margin-bottom:.5rem}}
 a{{color:#60a5fa;text-decoration:none}}
 </style></head><body><div class="c">
 <h1>{name}</h1>
-<p class="sub">ESP32-S3 &middot; v{ver}</p>
+<p class="sub">{chip} &middot; v{ver}</p>
 <div class="stat"><span class="label">IP</span><span>{ip}</span></div>
 <div class="stat"><span class="label">Heap free</span><span>{heap}KB</span></div>
 <div class="stat"><span class="label">API</span><a href="/api/status">/api/status</a></div>
 <div class="stat"><span class="label">Chat</span><span>POST /api/chat</span></div>
 </div></body></html>"#,
             name = name,
+            chip = chip_label(),
             ver = env!("CARGO_PKG_VERSION"),
             ip = ip_owned,
             heap = heap / 1024,
@@ -435,7 +453,7 @@ a{{color:#60a5fa;text-decoration:none}}
         let body = serde_json::json!({
             "agent_name": gw.config.agent_name,
             "version": env!("CARGO_PKG_VERSION"),
-            "platform": "esp32",
+            "platform": chip_label(),
             "memory": {
                 "free_kb": heap_free / 1024,
                 "total_kb": heap_total / 1024,

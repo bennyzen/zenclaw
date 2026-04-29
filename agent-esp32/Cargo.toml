@@ -68,6 +68,12 @@ codegen-units = 1
 file = "partitions.csv"
 
 # ESP-IDF managed components (pulled via component manager)
+# Top-level bindings extension: pulls esp_chip_info.h so we can detect the
+# actual chip model at runtime (ESP32-S3 vs ESP32-P4 vs …) for /api/status
+# and the landing page.
+[[package.metadata.esp-idf-sys.extra_components]]
+bindings_header = "bindings.h"
+
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/mdns", version = "1.2" }
 
