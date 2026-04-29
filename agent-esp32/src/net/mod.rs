@@ -33,3 +33,10 @@ pub trait Nic: Send + Sync {
     fn rssi(&self) -> Option<i32>;
     fn mac(&self) -> [u8; 6];
 }
+
+#[cfg(any(feature = "nic-wifi-internal", feature = "nic-wifi-hosted"))]
+pub mod wifi;
+
+// Always compiled — owns NVS-based credential read/write and the driver label,
+// independent of which radio (or none) is active. /api/wifi handlers use it.
+pub mod wifi_ui;
