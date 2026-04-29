@@ -335,6 +335,25 @@ fn checkpoint_5_outbound_https() {
     pass(5, "outbound_https", &format!("GET https://httpbin.org/ip → 200 ({} bytes)", n));
 }
 
+fn checkpoint_6_inbound_http(ip: std::net::Ipv4Addr) -> esp_idf_svc::http::server::EspHttpServer<'static> {
+    use esp_idf_svc::http::server::{Configuration as ServerConfig, EspHttpServer};
+    use embedded_svc::http::Method;
+    use embedded_svc::io::Write;
+
+    let mut server = match EspHttpServer::new(&ServerConfig::default()) {
+        Ok(s) => s,
+        Err(e) => fail(6, "inbound_http", &format!("server new: {}", e)),
+    };
+    if let Err(e) = server.fn_handler::<anyhow::Error, _>("/ping", Method::Get, |req| {
+        req.into_ok_response()?.write_all(b"pong")?;
+        Ok(())
+    }) {
+        fail(6, "inbound_http", &format!("register handler: {}", e));
+    }
+    pass(6, "inbound_http", &format!("server listening on :80, try GET http://{}/ping", ip));
+    server
+}
+
 fn main() -> anyhow::Result<()> {
     link_patches();
     EspLogger::initialize_default();
@@ -348,10 +367,13 @@ fn main() -> anyhow::Result<()> {
     checkpoint_2_psram();
 
     let _eth = checkpoint_3_4_ethernet_dhcp();
+    // _eth is (EspNetif, esp_eth_handle_t); query the netif for our IP.
+    let ip = _eth.0.get_ip_info()?.ip;
 
     checkpoint_5_outbound_https();
+    let _server = checkpoint_6_inbound_http(ip);
 
-    log::info!("(checkpoint 6 not yet implemented)");
+    log::info!("SMOKE PASS — toolchain, bootloader, PSRAM, EMAC+IP101, lwIP, mbedtls, httpd all OK");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
