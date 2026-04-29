@@ -15,6 +15,15 @@ pub struct WifiNic {
     ssid: Option<String>,
 }
 
+// SAFETY: `EspWifi` holds raw pointers to esp-netif objects that are not `Sync`
+// by default.  The ESP-IDF WiFi stack is internally thread-safe — all operations
+// on the underlying netif are serialised by the driver's FreeRTOS task; read-only
+// access from multiple threads (e.g. `ip_info()` / `link_up()` polling) is safe.
+#[cfg(feature = "nic-wifi-internal")]
+unsafe impl Send for WifiNic {}
+#[cfg(feature = "nic-wifi-internal")]
+unsafe impl Sync for WifiNic {}
+
 #[cfg(feature = "nic-wifi-internal")]
 impl Nic for WifiNic {
     fn kind(&self) -> NicKind {
