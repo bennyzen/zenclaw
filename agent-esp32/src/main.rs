@@ -343,35 +343,46 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
     let provider = storage.provider();
     let bucket = storage.bucket.clone().unwrap_or_default();
 
-    let block = match S3Client::from_config(storage) {
+    let (block, cache_ok) = match S3Client::from_config(storage) {
         Some(client) => match client.list("", None, 1000) {
             Ok(listing) => {
                 let total: u64 = listing.objects.iter().map(|o| o.size).sum();
-                serde_json::json!({
+                let v = serde_json::json!({
                     "configured": true,
                     "provider": provider,
                     "bucket": bucket,
                     "objects": listing.objects.len(),
                     "total_bytes": total,
-                })
+                });
+                (v, true)
             }
-            Err(e) => serde_json::json!({
+            Err(e) => (
+                serde_json::json!({
+                    "configured": true,
+                    "provider": provider,
+                    "bucket": bucket,
+                    "error": e.to_string(),
+                }),
+                false,
+            ),
+        },
+        None => (
+            serde_json::json!({
                 "configured": true,
                 "provider": provider,
                 "bucket": bucket,
-                "error": e.to_string(),
+                "error": "client init failed",
             }),
-        },
-        None => serde_json::json!({
-            "configured": true,
-            "provider": provider,
-            "bucket": bucket,
-            "error": "client init failed",
-        }),
+            false,
+        ),
     };
 
-    if let Ok(mut cache) = CLOUD_STATUS_CACHE.lock() {
-        *cache = Some((std::time::Instant::now(), block.clone()));
+    // Only cache successful results — caching transient failures (e.g.
+    // RequestTimeTooSkewed before SNTP syncs) would freeze them in for 60s.
+    if cache_ok {
+        if let Ok(mut cache) = CLOUD_STATUS_CACHE.lock() {
+            *cache = Some((std::time::Instant::now(), block.clone()));
+        }
     }
     Some(block)
 }
