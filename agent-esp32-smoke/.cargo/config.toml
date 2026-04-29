@@ -1,4 +1,4 @@
-[target.'cfg(target_arch = "riscv32")']
+[target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
 runner = "espflash flash --monitor"
 rustflags = ["--cfg", "espidf_time64", "--cfg", "mio_unsupported_force_poll_poll"]

@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-esp-idf-svc = "0.51"
-embedded-svc = "0.28"
+# 0.52+ required for ESP32-P4 support (esp-idf-hal 0.46+ has Core::Core1, hys_ctrl_mode GPIO field, etc.)
+esp-idf-svc = "0.52"
+embedded-svc = "0.29"
 log = "0.4"
 anyhow = "1"
 
