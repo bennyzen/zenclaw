@@ -22,11 +22,21 @@ cd "$AGENT_DIR"
 declare -a BOARDS
 if [[ $# -gt 0 ]]; then
     BOARDS=("$@")
+    FULL_BUILD=0
 else
     BOARDS=(devkitc sdcard guition-p4)
+    FULL_BUILD=1
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+# Full builds start from a clean slate so a previous partial run can't
+# leave a stale .bin or firmware.json behind. Subset builds preserve
+# the existing manifest because regenerating it from a subset would
+# silently drop boards that weren't passed on the command line.
+if [[ "$FULL_BUILD" -eq 1 ]]; then
+    rm -f "$OUTPUT_DIR"/zenclaw-*.bin "$OUTPUT_DIR/firmware.json"
+fi
 
 # Manifest entries written as we go.
 declare -a MANIFEST_ENTRIES
@@ -97,7 +107,7 @@ for board in "${BOARDS[@]}"; do
         --skip-padding \
         "$elf" "$out"
 
-    size=$(stat -c %s "$out")
+    size=$(wc -c < "$out" | tr -d ' ')
     echo "    $(basename "$out"): ${size} bytes"
 
     MANIFEST_ENTRIES+=("$(cat <<JSON
@@ -114,18 +124,19 @@ JSON
 )")
 done
 
-# Join manifest entries with commas
-joined=""
-for entry in "${MANIFEST_ENTRIES[@]}"; do
-    if [[ -z "$joined" ]]; then
-        joined="$entry"
-    else
-        joined="$joined,
+if [[ "$FULL_BUILD" -eq 1 ]]; then
+    # Join manifest entries with commas
+    joined=""
+    for entry in "${MANIFEST_ENTRIES[@]}"; do
+        if [[ -z "$joined" ]]; then
+            joined="$entry"
+        else
+            joined="$joined,
 $entry"
-    fi
-done
+        fi
+    done
 
-cat > "$OUTPUT_DIR/firmware.json" <<JSON
+    cat > "$OUTPUT_DIR/firmware.json" <<JSON
 {
   "boards": [
 $joined
@@ -133,7 +144,11 @@ $joined
 }
 JSON
 
-echo "==> Wrote $OUTPUT_DIR/firmware.json"
+    echo "==> Wrote $OUTPUT_DIR/firmware.json"
+else
+    echo "==> Subset build: $OUTPUT_DIR/firmware.json preserved (run without args to regenerate)"
+fi
+
 echo
 echo "Done. Outputs:"
-ls -lh "$OUTPUT_DIR"/zenclaw-*.bin "$OUTPUT_DIR/firmware.json"
+ls -lh "$OUTPUT_DIR"/zenclaw-*.bin "$OUTPUT_DIR"/firmware.json 2>/dev/null || true
