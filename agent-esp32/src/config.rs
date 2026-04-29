@@ -164,9 +164,46 @@ pub struct ApiConfig {
     pub tls: bool,
 }
 
+fn default_storage_region() -> String {
+    "auto".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
     pub path: Option<String>,
+
+    // S3/R2-compatible cloud storage. Mirrors the MicroPython config shape
+    // (firmware/lib/api/routes_status.py, firmware/lib/s3.py).
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default = "default_storage_region")]
+    pub region: String,
+}
+
+impl StorageConfig {
+    /// True only when all four required fields for cloud storage are present
+    /// and non-empty.
+    pub fn is_cloud_configured(&self) -> bool {
+        let nonempty = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.is_empty());
+        nonempty(&self.access_key_id)
+            && nonempty(&self.secret_access_key)
+            && nonempty(&self.endpoint)
+            && nonempty(&self.bucket)
+    }
+
+    /// "r2" if the endpoint hostname contains r2.cloudflarestorage, else "s3".
+    pub fn provider(&self) -> &'static str {
+        match self.endpoint.as_deref() {
+            Some(ep) if ep.contains("r2.cloudflarestorage") => "r2",
+            _ => "s3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
