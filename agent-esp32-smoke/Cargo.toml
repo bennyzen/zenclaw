@@ -20,3 +20,7 @@ codegen-units = 1
 
 [[package.metadata.espflash.partition_table]]
 file = "partitions.csv"
+
+# Extend the esp-idf-sys bindings to include esp_chip_info.h (chip detection).
+[[package.metadata.esp-idf-sys.extra_components]]
+bindings_header = "bindings.h"
