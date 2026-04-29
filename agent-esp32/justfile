@@ -17,7 +17,11 @@ build board *args="--release":
     set -euo pipefail
     eval "$(scripts/board-env.sh {{board}})"
     extra_features=""
-    [[ -n "$FEATURES" ]] && extra_features="--features=$FEATURES"
+    if [[ -n "$FEATURES" ]]; then
+        # Board manifests list all required features explicitly; disable defaults
+        # so nic-wifi-internal isn't activated for boards that don't have WiFi.
+        extra_features="--no-default-features --features=$FEATURES"
+    fi
     CARGO_BUILD_TARGET="$TARGET" \
     ESP_IDF_SDKCONFIG_DEFAULTS="$SDKCONFIG" \
         cargo build $extra_features {{args}}

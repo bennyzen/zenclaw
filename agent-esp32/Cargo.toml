@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["esp32"]
+default = ["esp32", "nic-wifi-internal"]
 desktop = ["dep:teloxide", "dep:reqwest-eventsource", "dep:reqwest", "dep:genai", "dep:hostname", "dep:tokio", "dep:axum", "dep:tower-http", "dep:tokio-util"]
 esp32 = ["dep:esp-idf-svc", "dep:embedded-svc"]
+
+# NIC drivers — chosen per board manifest
+nic-wifi-internal = ["esp32"]   # S3/S2 native WiFi via EspWifi
+nic-wifi-hosted   = ["esp32"]   # WiFi via esp_hosted (C6/C5) — v2
+nic-eth           = ["esp32"]   # Internal EMAC + external PHY (P4)
+
 usb_storage = ["esp32"]
 hnsw = ["dep:usearch"]
 

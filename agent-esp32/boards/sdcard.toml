@@ -2,6 +2,6 @@ chip = "esp32s3"
 target = "xtensa-esp32s3-espidf"
 sdkconfig = ["sdkconfig.defaults", "sdkconfig.board.sdcard"]
 bootloader = "bootloaders/esp32s3.bin"
-features = []
+features = ["esp32", "nic-wifi-internal"]
 default_baud = 921600
 description = "LILYGO T-Dongle-S3 (no PSRAM, SD slot)"
