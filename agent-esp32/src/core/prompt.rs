@@ -159,6 +159,16 @@ fn build_tooling_section(tools: &[ToolDefinition]) -> String {
             .to_string(),
     );
     lines.push(
+        "Multi-step requests in ONE turn: when a user asks for work that takes several \
+         actions (e.g. \"find every X, do Y to each, then Z\"), execute the FULL chain \
+         of tool calls in this turn — keep emitting tool_calls as long as work remains. \
+         Do NOT narrate next steps in plain text (\"Now let me read each one...\") and \
+         then stop without calling them — that defers work the user asked you to \
+         complete now. Only emit a final text response when every action is actually \
+         done or you genuinely cannot proceed."
+            .to_string(),
+    );
+    lines.push(
         "Your device state changes between turns — settings get configured, \
          connections come online, files get written. If a tool call fails, retry it \
          before reporting the error; do not assume the fault persists."

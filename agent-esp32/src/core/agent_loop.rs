@@ -37,6 +37,10 @@ pub async fn run_loop(
     let mut consecutive_errors: usize = 0;
     let mut loop_detector = LoopDetector::new();
     let mut in_tool_loop = false;
+    let mut tool_calls_this_turn: usize = 0;
+    let mut tool_names_this_turn: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut continuation_nudges: usize = 0;
     loop {
         // Check cancellation before LLM call
         if let Some(flag) = cancel {
@@ -78,9 +82,52 @@ pub async fn run_loop(
                     tool_call_id: None,
                     provider_data: None,
                 });
+
+                // The LLM sometimes narrates next steps ("Let me read each
+                // one..." ending in a colon or bare announcement) and stops
+                // emitting tool_calls — leaving multi-step work undone. If
+                // we've already executed at least one tool this turn and
+                // the final text looks like an unkept promise, push a system
+                // reminder and re-call the LLM. Limit to MAX_CONTINUATION_NUDGES
+                // per turn to avoid loops on edge cases.
+                if tool_calls_this_turn > 0
+                    && continuation_nudges < MAX_CONTINUATION_NUDGES
+                    && looks_like_incomplete_narrative(&text, &tool_names_this_turn)
+                {
+                    continuation_nudges += 1;
+                    info!(
+                        "Continuation nudge {}/{}: text looks incomplete after {} tool calls",
+                        continuation_nudges, MAX_CONTINUATION_NUDGES, tool_calls_this_turn
+                    );
+                    messages.push(Message {
+                        role: Role::System,
+                        content: MessageContent::Text(
+                            "REMINDER: your previous response did not advance the task. \
+                             Either you described next steps but stopped emitting \
+                             tool_calls, OR you wrote tool-call markup (<tool_call ...>) \
+                             as TEXT instead of using the proper tool_calls JSON schema. \
+                             Continue the task NOW by emitting a proper tool_calls field \
+                             on your next response — do not put tool calls inside the \
+                             content string. Only return a final text response when every \
+                             step is actually done."
+                                .to_string(),
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        provider_data: None,
+                    });
+                    // Re-include tool schemas so the LLM can call them.
+                    in_tool_loop = false;
+                    continue;
+                }
+
                 return Ok(text);
             }
             LlmResponse::ToolCalls { tool_calls, provider_data } => {
+                tool_calls_this_turn += tool_calls.len();
+                for tc in &tool_calls {
+                    tool_names_this_turn.insert(tc.function.name.clone());
+                }
                 execute_tool_calls(
                     &tool_calls,
                     None,
@@ -95,6 +142,10 @@ pub async fn run_loop(
                 in_tool_loop = true;
             }
             LlmResponse::Mixed { text, tool_calls, provider_data } => {
+                tool_calls_this_turn += tool_calls.len();
+                for tc in &tool_calls {
+                    tool_names_this_turn.insert(tc.function.name.clone());
+                }
                 execute_tool_calls(
                     &tool_calls,
                     Some(&text),
@@ -111,6 +162,149 @@ pub async fn run_loop(
         }
     }
 }
+
+/// Cap on continuation nudges per single chat turn — prevents nudge loops
+/// on pathological assistants that always emit narrative-style replies.
+/// Sized for compound prompts that need multiple chained tool calls
+/// (e.g. "find every X, do Y to each, then Z" — 4+ steps is realistic).
+const MAX_CONTINUATION_NUDGES: usize = 4;
+
+/// Heuristic: does this assistant text look like it stopped mid-task,
+/// promising more work but not actually doing it? We only consult this
+/// when the LLM has already executed at least one tool this turn, so
+/// every check is in the context of "should we let it finish?"
+///
+/// `tools_called` is the set of tool names already invoked this turn.
+/// We use it to detect "I'll save these to memory" prose that's
+/// followed by inline content but never an actual `memory` call.
+///
+/// Triggers on:
+/// - Trailing colon, ellipsis, or unfinished markdown markers
+/// - Inline tool-call markup (`<tool_call ...>`, `<parameter ...>`) which
+///   means the model intended to call a tool but rendered it as text
+///   instead of using the proper tool_calls JSON schema. Observed
+///   repeatedly with z.ai glm-5.1 on chained multi-call turns.
+/// - Action-narrative phrases ("Let me", "I'll now", "Next, I'll")
+///   appearing in the trailing window of the response
+/// - "Save/store/remember it" promises about a tool that wasn't called
+fn looks_like_incomplete_narrative(
+    text: &str,
+    tools_called: &std::collections::HashSet<String>,
+) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        // An empty Text response after tool calls is itself a non-answer.
+        return true;
+    }
+
+    // Inline tool-call markup as text content — the model tried to call
+    // a tool but used the wrong format. A textual <tool_call> never
+    // executes; we need to nudge the model to retry with proper tool_calls.
+    if trimmed.contains("<tool_call")
+        || trimmed.contains("</tool_call")
+        || trimmed.contains("<parameter")
+    {
+        return true;
+    }
+
+    // Trailing punctuation that almost always means "continuing".
+    let last_char = trimmed.chars().last();
+    if matches!(last_char, Some(':')) {
+        return true;
+    }
+    if trimmed.ends_with("...") || trimmed.ends_with("…") {
+        return true;
+    }
+    // Bare bold markdown announcement at the very end ("**NextStep**")
+    if trimmed.ends_with("**") {
+        // Check it's a closing bold marker (preceded by content), not
+        // an opening that the model already handles.
+        let no_trail = &trimmed[..trimmed.len() - 2];
+        if no_trail.contains("**") {
+            return true;
+        }
+    }
+
+    // Action-narrative phrase appearing in the SUFFIX of the response.
+    // Looking at the trailing window (not the whole text) — narrative
+    // phrases at the start of a long response are normal explanation;
+    // the same phrases near the end are unkept promises. Suffix-based
+    // because per-sentence parsing is fragile around filenames like
+    // "AGENTS.md" where periods look like sentence terminators.
+    let suffix = trailing_window(trimmed, NARRATIVE_SUFFIX_BYTES);
+    let lower = suffix.to_ascii_lowercase();
+    const NARRATIVE_PREFIXES: &[&str] = &[
+        "let me ",
+        "i'll ",
+        "i will ",
+        "now let me ",
+        "now i'll ",
+        "now i will ",
+        "next, i'll ",
+        "next i'll ",
+        "next, let me ",
+        "first, let me ",
+        "first i'll ",
+        "let's ",
+    ];
+    for p in NARRATIVE_PREFIXES {
+        if lower.contains(p) {
+            return true;
+        }
+    }
+
+    // Promised-tool-action-but-tool-not-called check. If the response
+    // talks about saving / storing / writing to memory but the `memory`
+    // tool was never invoked this turn, the model emitted prose where
+    // it should have emitted a tool call.
+    let full_lower = text.to_ascii_lowercase();
+    if !tools_called.contains("memory") {
+        const MEMORY_SAVE_PROMISES: &[&str] = &[
+            "save them as memory",
+            "save these as memory",
+            "save it as memory",
+            "save them to memory",
+            "save these to memory",
+            "save it to memory",
+            "store them as memory",
+            "store these as memory",
+            "store it as memory",
+            "write them to memory",
+            "write these to memory",
+            "save the summaries",
+            "save the summary",
+            "save as memory entries",
+            "save as a memory entry",
+            "save them as separate memory",
+            "save each as a memory",
+        ];
+        for p in MEMORY_SAVE_PROMISES {
+            if full_lower.contains(p) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// How much of the trailing text to inspect for action-narrative phrases.
+/// Tuned for typical reply lengths; long enough to catch a multi-clause
+/// "Let me also check X, then read Y" but short enough that earlier
+/// explanation doesn't false-positive.
+const NARRATIVE_SUFFIX_BYTES: usize = 200;
+
+fn trailing_window(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 
 async fn execute_tool_calls(
     tool_calls: &[ToolCall],
@@ -272,5 +466,105 @@ mod tests {
         assert!(result.contains("narrower scope"));
         // Crucially: original bytes are NOT in the error message.
         assert!(!result.contains("xxx"));
+    }
+
+    fn empty_tools() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    fn tools_with(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn narrative_trailing_colon_caught() {
+        assert!(looks_like_incomplete_narrative(
+            "Three .md files found. Let me read each one:",
+            &empty_tools(),
+        ));
+    }
+
+    #[test]
+    fn narrative_let_me_in_last_sentence_caught() {
+        assert!(looks_like_incomplete_narrative(
+            "Found the files. Let me check the contents of each.",
+            &empty_tools(),
+        ));
+    }
+
+    #[test]
+    fn narrative_ellipsis_caught() {
+        assert!(looks_like_incomplete_narrative("Now reading the files...", &empty_tools()));
+        assert!(looks_like_incomplete_narrative("Now reading the files…", &empty_tools()));
+    }
+
+    #[test]
+    fn narrative_completed_response_passes() {
+        assert!(!looks_like_incomplete_narrative(
+            "All three .md files have been summarized into memory entries: \
+             summary_AGENTS, summary_MEMORY, summary_SOUL. Done.",
+            &tools_with(&["file", "memory"]),
+        ));
+    }
+
+    #[test]
+    fn narrative_explanatory_let_me_earlier_does_not_trigger() {
+        let early = "let me try a few things. ".to_string();
+        let padding = "Successfully completed the task. ".repeat(10);
+        let text = format!("Earlier I said {}{}", early, padding);
+        assert!(text.len() > NARRATIVE_SUFFIX_BYTES);
+        assert!(!looks_like_incomplete_narrative(&text, &tools_with(&["memory"])));
+    }
+
+    #[test]
+    fn narrative_let_me_after_md_filenames_caught() {
+        assert!(looks_like_incomplete_narrative(
+            "The data/ directory only has scratch-v2.log. But I see .md files in the root: AGENTS.md, MEMORY.md, SOUL.md. Let me also check memory/ for .md files, and then read all of them.",
+            &empty_tools(),
+        ));
+    }
+
+    #[test]
+    fn narrative_empty_after_tools_caught() {
+        assert!(looks_like_incomplete_narrative("", &empty_tools()));
+        assert!(looks_like_incomplete_narrative("   \n\n  ", &empty_tools()));
+    }
+
+    #[test]
+    fn narrative_bare_bold_announcement_caught() {
+        assert!(looks_like_incomplete_narrative(
+            "Three files found. **AGENTS.md**",
+            &empty_tools(),
+        ));
+    }
+
+    #[test]
+    fn narrative_inline_tool_call_markup_caught() {
+        assert!(looks_like_incomplete_narrative(
+            "Reading the files. <tool_call tool=\"file\" action=\"read\" path=\"AGENTS.md\"></tool_call>",
+            &empty_tools(),
+        ));
+        assert!(looks_like_incomplete_narrative(
+            "<parameter name=\"path\">SOUL.md</parameter>",
+            &empty_tools(),
+        ));
+    }
+
+    #[test]
+    fn promise_to_save_memory_without_tool_call_caught() {
+        // The model says it'll save the summaries to memory but only
+        // writes them as inline text — memory tool was never called.
+        let text = "Now I have read all three files. Let me create one-line summaries for each and save them as memory entries.\n\n- AGENTS.md: \"foo\"\n- MEMORY.md: \"bar\"\n- SOUL.md: \"baz\"";
+        assert!(looks_like_incomplete_narrative(text, &tools_with(&["file"])));
+    }
+
+    #[test]
+    fn promise_to_save_memory_with_tool_call_passes() {
+        // Same prose but with memory.save actually called → not incomplete.
+        let text = "Saved all three summaries to memory: summary_AGENTS, summary_MEMORY, summary_SOUL.";
+        assert!(!looks_like_incomplete_narrative(
+            text,
+            &tools_with(&["file", "memory"])
+        ));
     }
 }
