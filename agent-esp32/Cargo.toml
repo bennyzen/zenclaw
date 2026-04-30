@@ -34,7 +34,7 @@ futures = { version = "0.3" }
 
 # Desktop-only: tokio runtime, axum HTTP server
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time", "fs", "signal", "process"], optional = true }
-axum = { version = "0.8", features = ["json"], optional = true }
+axum = { version = "0.8", features = ["json", "ws"], optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 tokio-util = { version = "0.7", optional = true }
 
