@@ -40,6 +40,9 @@ fn default_compaction_keep_recent() -> usize {
 fn default_compaction_max_summary_bytes() -> usize {
     5 * 1024
 }
+fn default_compaction_max_kept_message_bytes() -> usize {
+    24 * 1024
+}
 
 fn default_heartbeat_secs() -> u64 {
     300
@@ -154,6 +157,14 @@ pub struct CompactionConfig {
     pub keep_recent: usize,
     #[serde(default = "default_compaction_max_summary_bytes")]
     pub max_summary_bytes: usize,
+    /// If a kept Message's content exceeds this, it is replaced with a
+    /// short redaction marker during compaction. None disables the cap.
+    /// Default catches single huge tool results (e.g. a 491 KB web_fetch
+    /// body) sitting inside the keep_recent window — without it, the
+    /// byte threshold can re-trip on subsequent turns until the message
+    /// rotates out organically.
+    #[serde(default = "default_compaction_max_kept_message_bytes")]
+    pub max_kept_message_bytes: usize,
 }
 
 impl Default for CompactionConfig {
@@ -164,6 +175,7 @@ impl Default for CompactionConfig {
             byte_threshold: default_compaction_byte_threshold(),
             keep_recent: default_compaction_keep_recent(),
             max_summary_bytes: default_compaction_max_summary_bytes(),
+            max_kept_message_bytes: default_compaction_max_kept_message_bytes(),
         }
     }
 }

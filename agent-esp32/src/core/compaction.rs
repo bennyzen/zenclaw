@@ -205,7 +205,12 @@ pub async fn compact_session(
     }
 
     sessions
-        .compact(chat_id, &summary, cfg.keep_recent)
+        .compact(
+            chat_id,
+            &summary,
+            cfg.keep_recent,
+            Some(cfg.max_kept_message_bytes),
+        )
         .map_err(|e| format!("session compact failed: {e}"))?;
 
     let stats = CompactionStats {
@@ -290,6 +295,7 @@ mod tests {
             byte_threshold: 200 * 1024,
             keep_recent: 6,
             max_summary_bytes: 5 * 1024,
+            max_kept_message_bytes: 24 * 1024,
         }
     }
 

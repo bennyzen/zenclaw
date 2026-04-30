@@ -349,11 +349,18 @@ impl SessionManager {
     /// Compact: keep the most recent `keep_recent` messages, replace all
     /// earlier entries with a single Compaction entry containing the summary.
     /// Rewrites the entire file.
+    ///
+    /// `max_kept_message_bytes`: if Some(cap), any kept Message whose
+    /// content exceeds the cap has its content replaced with a short
+    /// redaction marker. Stops a single huge tool result inside the
+    /// `keep_recent` window from re-tripping the byte threshold on the
+    /// next turn — the summary is expected to carry the gist forward.
     pub fn compact(
         &self,
         chat_id: &str,
         summary: &str,
         keep_recent: usize,
+        max_kept_message_bytes: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let branch = self.get_branch(chat_id)?;
         if branch.is_empty() {
@@ -415,18 +422,27 @@ impl SessionManager {
                     content,
                     tool_calls,
                     tool_call_id,
-                } => SessionEntry::Message {
-                    id: id.clone(),
-                    parent: if i == 0 {
-                        Some(last_id.clone())
-                    } else {
-                        entry.parent().map(|s| s.to_string())
-                    },
-                    role: role.clone(),
-                    content: content.clone(),
-                    tool_calls: tool_calls.clone(),
-                    tool_call_id: tool_call_id.clone(),
-                },
+                } => {
+                    let kept_content = match max_kept_message_bytes {
+                        Some(cap) if content.len() > cap => format!(
+                            "[redacted during compaction: {} bytes — see preceding compaction summary]",
+                            content.len()
+                        ),
+                        _ => content.clone(),
+                    };
+                    SessionEntry::Message {
+                        id: id.clone(),
+                        parent: if i == 0 {
+                            Some(last_id.clone())
+                        } else {
+                            entry.parent().map(|s| s.to_string())
+                        },
+                        role: role.clone(),
+                        content: kept_content,
+                        tool_calls: tool_calls.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                    }
+                }
                 other => other.clone(),
             };
             writeln!(file, "{}", serde_json::to_string(&rewritten)?)?;
@@ -563,7 +579,7 @@ mod tests {
         mgr.append("compact_test", &m5).unwrap();
 
         // Compact keeping 2 recent
-        mgr.compact("compact_test", "Summary of first 3 messages", 2)
+        mgr.compact("compact_test", "Summary of first 3 messages", 2, None)
             .unwrap();
 
         // Load entries: should have compaction + info + 2 messages (each with info)
