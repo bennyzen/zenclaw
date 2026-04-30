@@ -7,7 +7,15 @@ use crate::core::tools::{ToolContext, ToolRegistry};
 use crate::core::types::{LlmResponse, Message, MessageContent, ProviderData, Role, ToolCall};
 
 const MAX_CONSECUTIVE_ERRORS: usize = 3;
-const MAX_TOOL_RESULT_LEN: usize = 8000;
+
+/// Maximum size of a single tool result, in bytes, before we refuse it
+/// back to the LLM with a "narrow your scope" error. Desktop is uncapped
+/// so we can observe what real tool outputs look like; ESP32 is sized
+/// for comfortable PSRAM headroom (DevKitC 8MB, P4 32MB).
+#[cfg(feature = "desktop")]
+const MAX_TOOL_RESULT_BYTES: usize = usize::MAX;
+#[cfg(not(feature = "desktop"))]
+const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
 /// Run the LLM <-> tool execution loop until a text response is produced.
 ///
@@ -160,15 +168,24 @@ async fn execute_tool_calls(
         // Execute the tool
         let result = tools.execute(name, args.clone(), ctx).await;
         let result_str = result.to_string();
+        let result_len = result_str.len();
 
         loop_detector.record_outcome(name, &args, &result_str);
 
-        // Trim large results
-        let trimmed = soft_trim(&result_str, MAX_TOOL_RESULT_LEN);
+        // Cap or refuse — never destructively truncate. Past behavior was a
+        // head+tail split that mangled structured outputs (JSON / markdown /
+        // code) into syntactic garbage halfway through. The LLM then quoted
+        // that garbage back hallucinated. The new rule: if the result is too
+        // big, the LLM gets a clear error it can act on (narrow scope,
+        // paginate, etc.) instead of corrupted bytes.
+        let payload = cap_or_refuse(result_str, MAX_TOOL_RESULT_BYTES);
 
-        push_tool_exchange(messages, tc, assistant_text, &trimmed, remaining_provider_data.take());
+        push_tool_exchange(messages, tc, assistant_text, &payload, remaining_provider_data.take());
 
-        info!("Tool executed: {} ({}B result)", name, result_str.len());
+        info!(
+            "Tool executed: {} (raw={}B, sent={}B)",
+            name, result_len, payload.len()
+        );
     }
 
     Ok(())
@@ -203,17 +220,19 @@ fn push_tool_exchange(
     });
 }
 
-/// Trim tool results that are too large for the context window.
-fn soft_trim(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        return text.to_string();
+/// Return `result` unchanged if it fits, otherwise return an actionable
+/// error message naming the actual size and cap so the LLM can narrow scope
+/// on retry. Never truncates; preservation over destruction.
+fn cap_or_refuse(result: String, cap: usize) -> String {
+    if result.len() <= cap {
+        return result;
     }
-    let half = max_len / 2;
     format!(
-        "{}\n\n... ({} chars trimmed) ...\n\n{}",
-        &text[..half],
-        text.len() - max_len,
-        &text[text.len() - half..],
+        "Tool result was {} bytes, exceeded the {} byte cap. Re-run with \
+         narrower scope (paginated read, smaller result limit, or more \
+         specific query) so the response fits.",
+        result.len(),
+        cap,
     )
 }
 
@@ -232,16 +251,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_soft_trim_short() {
-        let result = soft_trim("hello", 100);
+    fn cap_or_refuse_passes_under_cap_unchanged() {
+        let result = cap_or_refuse("hello".to_string(), 100);
         assert_eq!(result, "hello");
     }
 
     #[test]
-    fn test_soft_trim_long() {
-        let text = "a".repeat(10000);
-        let result = soft_trim(&text, 100);
-        assert!(result.len() < text.len());
-        assert!(result.contains("trimmed"));
+    fn cap_or_refuse_passes_at_cap_unchanged() {
+        let result = cap_or_refuse("a".repeat(100), 100);
+        assert_eq!(result.len(), 100);
+        assert!(result.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn cap_or_refuse_over_cap_returns_actionable_error() {
+        let result = cap_or_refuse("x".repeat(200), 100);
+        // Names the actual size, the cap, and what to do — no garbage payload.
+        assert!(result.contains("200 bytes"));
+        assert!(result.contains("100 byte cap"));
+        assert!(result.contains("narrower scope"));
+        // Crucially: original bytes are NOT in the error message.
+        assert!(!result.contains("xxx"));
     }
 }
