@@ -163,29 +163,36 @@ async function load() {
     agentName.value = config.agent_name || ''
     heartbeatEnabled.value = config.heartbeat?.enabled || false
 
-    const search = config.search || {}
-    searchProvider.value = search.provider || 'google'
-    braveApiKey.value = search.brave_api_key || ''
-
-    const stor = config.storage || {}
-    storageEndpoint.value = stor.endpoint || ''
-    storageAccessKey.value = stor.access_key_id || ''
-    storageSecretKey.value = stor.secret_access_key || ''
-    storageBucket.value = stor.bucket || ''
-    storageRegion.value = stor.region || 'auto'
-    // Extract account ID from R2 endpoint
-    const r2Match = storageEndpoint.value.match(/https:\/\/([^.]+)\.r2\.cloudflarestorage\.com/)
-    if (r2Match) {
-      storageAccountId.value = r2Match[1]!
-      storageProvider.value = 'r2'
-    } else if (storageEndpoint.value) {
-      storageProvider.value = 'other'
+    // Only override locally-restored values when the device explicitly returns
+    // a config block. Otherwise we'd blow away unsaved typing every time
+    // the network reconnects.
+    if (config.search) {
+      searchProvider.value = config.search.provider || 'google'
+      braveApiKey.value = config.search.brave_api_key || ''
     }
 
-    const telegram = config.channels?.telegram || {}
-    telegramEnabled.value = telegram.enabled || false
-    botToken.value = telegram.bot_token || ''
-    defaultChatId.value = telegram.default_chat_id || ''
+    if (config.storage) {
+      const stor = config.storage
+      storageEndpoint.value = stor.endpoint || ''
+      storageAccessKey.value = stor.access_key_id || ''
+      storageSecretKey.value = stor.secret_access_key || ''
+      storageBucket.value = stor.bucket || ''
+      storageRegion.value = stor.region || 'auto'
+      const r2Match = storageEndpoint.value.match(/https:\/\/([^.]+)\.r2\.cloudflarestorage\.com/)
+      if (r2Match) {
+        storageAccountId.value = r2Match[1]!
+        storageProvider.value = 'r2'
+      } else if (storageEndpoint.value) {
+        storageProvider.value = 'other'
+      }
+    }
+
+    const telegram = config.channels?.telegram
+    if (telegram) {
+      telegramEnabled.value = telegram.enabled || false
+      botToken.value = telegram.bot_token || ''
+      defaultChatId.value = telegram.default_chat_id || ''
+    }
     // WiFi (separate endpoint, won't fail if unavailable)
     try {
       const wifi = await getWifi()
