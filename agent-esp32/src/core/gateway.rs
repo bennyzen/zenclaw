@@ -10,7 +10,7 @@ use crate::core::prompt;
 use crate::core::runner::LlmRunner;
 use crate::core::sessions::SessionManager;
 use crate::core::tools::{ToolContext, ToolRegistry};
-use crate::core::types::{Message, MessageContent, Role};
+use crate::core::types::{ContentPart, Message, MessageContent, Role};
 use crate::core::workspace;
 
 /// Core orchestrator. Holds config, tools, sessions, memory, and provides the chat() entry point.
@@ -145,6 +145,12 @@ impl Gateway {
         // Get model override from session state
         let model_override = self.sessions.get_state(chat_id).model_override;
 
+        // Capture the message count before the loop runs so we can persist
+        // exactly the new messages it appends — assistant-with-tool-calls,
+        // tool results, and the final assistant reply. Pre-loop messages
+        // are either system (rebuilt next turn) or already in the session.
+        let pre_loop_msg_count = messages.len();
+
         info!("GW: agent_loop msgs={}", messages.len());
 
         // Run agent loop
@@ -161,18 +167,34 @@ impl Gateway {
 
         info!("GW: reply {}B", result.len());
 
-        // Persist assistant response to session
-        let assistant_entry = crate::core::sessions::SessionEntry::Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            parent: None,
-            role: Role::Assistant,
-            content: result.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-        };
-        if let Err(e) = self.sessions.append(chat_id, &assistant_entry) {
-            log::warn!("Session append failed (continuing): {}", e);
+        // Persist every new message the loop produced — including each
+        // tool-call exchange. Without this, the session JSONL only carried
+        // user/assistant text pairs, and the LLM had amnesia about its own
+        // tool history across turns. That surfaced as redundant tool calls
+        // (state desync). The schema already supported tool_calls and
+        // tool_call_id; the gateway just wasn't writing them.
+        let mut persisted = 0usize;
+        for msg in &messages[pre_loop_msg_count..] {
+            // Skip injected system warnings (circuit-breaker advisories) — they
+            // were transient guidance for this turn, not durable history.
+            if matches!(msg.role, Role::System) {
+                continue;
+            }
+            let entry = crate::core::sessions::SessionEntry::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                parent: None,
+                role: msg.role.clone(),
+                content: message_content_as_text(&msg.content),
+                tool_calls: msg.tool_calls.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+            };
+            if let Err(e) = self.sessions.append(chat_id, &entry) {
+                log::warn!("Session append failed (continuing): {}", e);
+            } else {
+                persisted += 1;
+            }
         }
+        log::debug!("GW: persisted {} new session entries", persisted);
 
         // Remove from active chats
         self.active_chats.lock().unwrap().remove(chat_id);
@@ -198,4 +220,51 @@ pub enum GatewayError {
     Session(String),
     #[error("Agent loop error: {0}")]
     AgentLoop(String),
+}
+
+/// Flatten MessageContent for JSONL persistence. Image parts are dropped
+/// (the bytes can't round-trip through plain text); text parts are joined
+/// with newlines so order is preserved.
+fn message_content_as_text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(s) => s.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::ImageUrl;
+
+    #[test]
+    fn message_content_text_passthrough() {
+        let c = MessageContent::Text("hello".to_string());
+        assert_eq!(message_content_as_text(&c), "hello");
+    }
+
+    #[test]
+    fn message_content_parts_flattens_text_drops_images() {
+        let c = MessageContent::Parts(vec![
+            ContentPart::Text { text: "first".to_string() },
+            ContentPart::ImageUrl { image_url: ImageUrl { url: "data:...".to_string() } },
+            ContentPart::Text { text: "second".to_string() },
+        ]);
+        assert_eq!(message_content_as_text(&c), "first\nsecond");
+    }
+
+    #[test]
+    fn message_content_parts_only_image_yields_empty() {
+        let c = MessageContent::Parts(vec![
+            ContentPart::ImageUrl { image_url: ImageUrl { url: "x".to_string() } },
+        ]);
+        assert_eq!(message_content_as_text(&c), "");
+    }
 }
