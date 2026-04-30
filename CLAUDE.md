@@ -1,6 +1,6 @@
 # ZenClaw
 
-AI agent framework. Two implementations: a **Rust agent** (`agent-esp32/`) targeting ESP32-S3 hardware (active development), and a **MicroPython agent** (`firmware/`) for MicroPython on ESP32 + desktop.
+AI agent framework. Two implementations: a **Rust agent** (`agent-esp32/`) targeting ESP32-S3 and ESP32-P4 hardware (active development, primary path), and a **MicroPython agent** (`firmware/`) kept for desktop development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC).
 
 ## Rust Agent (`agent-esp32/`)
 
@@ -90,9 +90,25 @@ description = "ESP32-S3-DevKitC (PSRAM, USB Host capable)"
 - **Config**: provision via `/api/config` POST after Ethernet comes up (same as S3)
 - **C6 WiFi co-processor**: the onboard ESP32-C6 is held in reset; WiFi deferred to v2
 
-### WiFi & Config Provisioning (NVS)
+### Provisioning
 
-WiFi credentials and config are stored in NVS (survives reflash). Provision via `espflash`:
+**Preferred: web UI wizard** — `web/app/pages/provision.vue` flashes the Rust agent over Web Serial (Chrome/Edge). Pick the board (DevKitC, T-Dongle-S3, or Guition P4), enter a device name (dice button rolls a fresh `zenclaw-{adj}-{noun}`), WiFi creds (optional for Ethernet boards), provider/API key, click Flash. The wizard:
+
+- Validates that the chip detected by esptool-js matches the chosen board (chip-mismatch is caught before any erase).
+- Flashes the merged image at `0x0` and a NVS partition at `0x9000` containing `device/hostname` plus optional `wifi/ssid` + `wifi/password`.
+- POSTs `/api/config` once the device announces on mDNS at `<hostname>.local`.
+
+**Build the wizard's firmware artifacts:**
+```bash
+./scripts/build-rust-firmware.sh           # builds all 3 boards + firmware.json
+./scripts/build-rust-firmware.sh devkitc   # rebuild a single board (manifest preserved)
+```
+
+**Multiple devices coexist** because each device's mDNS hostname is unique:
+- Web-UI provisioned: hostname = whatever the user typed (or the dice-rolled name).
+- CLI-flashed: hostname = `zenclaw-XXYYZZ` from the lower 3 bytes of the WiFi-STA MAC. Stable across reboots.
+
+**Manual NVS provisioning** (for headless/CLI flows; equivalent to what the wizard writes):
 
 ```bash
 # WiFi credentials (namespace: "wifi", keys: "ssid" and "password")
@@ -103,29 +119,34 @@ espflash write-nvs --port /dev/ttyACM0 wifi.csv
 # ssid,data,string,YOUR_SSID
 # password,data,string,YOUR_PASSWORD
 
-# Config is provisioned via /api/config POST after WiFi connects (triggers reboot)
-curl -X POST http://zenclaw.local/api/config \
+# Optional: set a custom hostname (otherwise falls back to MAC-derived)
+# Add to a separate device.csv with namespace "device" and key "hostname"
+
+# Push provider config after the device is online:
+curl -X POST http://<hostname>.local/api/config \
   -H 'Content-Type: application/json' \
   -d '{"providers":{"default":"google","google":{"api_key":"...","model":"gemini-2.5-flash"}}}'
 ```
 
 ### Deploy, Test & Iterate
 
-After flashing, wait ~12s for network + HTTP server (S3: WiFi connect; P4: Ethernet DHCP ~5s), then:
+After flashing, wait ~12s for network + HTTP server (S3: WiFi connect; P4: Ethernet DHCP ~5s), then (substitute your device's hostname):
 
 ```bash
+HOST=zenclaw-swift-fox.local
+
 # Smoke-test
-curl -sf http://zenclaw.local/api/status | python3 -m json.tool
+curl -sf http://$HOST/api/status | python3 -m json.tool
 
 # Chat
-curl -sf --max-time 60 http://zenclaw.local/api/chat \
+curl -sf --max-time 60 http://$HOST/api/chat \
   -H 'Content-Type: application/json' -d '{"message":"ping"}'
 
 # Chat history
-curl -sf "http://zenclaw.local/api/chat/history?chat_id=web" | python3 -m json.tool
+curl -sf "http://$HOST/api/chat/history?chat_id=web" | python3 -m json.tool
 ```
 
-**Web UI**: Nuxt dev server at `http://localhost:3000`. Connect to device by hostname on the Dashboard. Playwright MCP tools can drive the full UI.
+**Web UI**: Nuxt dev server at `http://localhost:3000`. Connect to a device by hostname on the Dashboard — multiple devices each have a unique `<name>.local` address. Playwright MCP tools can drive the full UI.
 
 ### Architecture
 
@@ -242,16 +263,7 @@ cd firmware && micropython -X heapsize=4m test_tools.py
 
 ### ESP32-S3 Deployment (MicroPython)
 
-**Preferred: Web UI provisioning** — Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome/Edge. Flashes MicroPython + LittleFS + NVS in one shot.
-
-**Alternative: Build + Flash via CLI**
-
-```bash
-./scripts/build-firmware-image.sh
-esptool --port /dev/ttyACM0 --chip esp32s3 write_flash 0x200000 web/public/firmware/zenclaw.img
-```
-
-**Alternative: mpremote cp** (device must be at REPL, not running main.py)
+The web UI no longer flashes MicroPython — the wizard now provisions the Rust agent. For MicroPython on hardware, use `mpremote cp` (device must be at REPL, not running main.py) or the legacy `scripts/build-firmware-image.sh` + `esptool write_flash` path. The desktop MicroPython port (`micropython -X heapsize=4m run.py`) remains the primary way to iterate on `firmware/` code.
 
 ### Architecture (MicroPython)
 
