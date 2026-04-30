@@ -8,7 +8,7 @@
 # (see CLAUDE.md → S3 Xtensa LLVM bug pitfall).
 #
 # Usage: ./scripts/build-rust-firmware.sh [board1 board2 ...]
-#        Defaults to all three boards if none specified.
+#        Defaults to all supported boards if none specified.
 
 set -euo pipefail
 
@@ -24,7 +24,7 @@ if [[ $# -gt 0 ]]; then
     BOARDS=("$@")
     FULL_BUILD=0
 else
-    BOARDS=(devkitc sdcard guition-p4)
+    BOARDS=(devkitc guition-p4)
     FULL_BUILD=1
 fi
 
@@ -51,7 +51,6 @@ read_manifest_field() {
 board_display_name() {
     case "$1" in
         devkitc)    echo "ESP32-S3 DevKitC" ;;
-        sdcard)     echo "LILYGO T-Dongle-S3" ;;
         guition-p4) echo "Guition JC-ESP32P4-M3-DEV" ;;
         *)          echo "$1" ;;
     esac
@@ -59,9 +58,9 @@ board_display_name() {
 
 board_chip_label() {
     case "$1" in
-        devkitc|sdcard) echo "ESP32-S3" ;;
-        guition-p4)     echo "ESP32-P4" ;;
-        *)              echo "ESP32" ;;
+        devkitc)    echo "ESP32-S3" ;;
+        guition-p4) echo "ESP32-P4" ;;
+        *)          echo "ESP32" ;;
     esac
 }
 
@@ -79,7 +78,6 @@ board_default() {
 board_description() {
     case "$1" in
         devkitc)    echo "8MB PSRAM, USB Host capable" ;;
-        sdcard)     echo "No PSRAM, SD card slot" ;;
         guition-p4) echo "32MB PSRAM, Ethernet via IP101 PHY" ;;
         *)          echo "" ;;
     esac

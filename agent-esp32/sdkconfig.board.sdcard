@@ -1,2 +1,0 @@
-# Board: ESP32-S3 with SD card slot (1x USB, no PSRAM)
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

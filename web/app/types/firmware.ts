@@ -30,14 +30,6 @@ export const FALLBACK_BOARDS: BoardManifest[] = [
     description: '8MB PSRAM, USB Host capable',
   },
   {
-    id: 'sdcard',
-    name: 'LILYGO T-Dongle-S3',
-    chip: 'ESP32-S3',
-    image: 'zenclaw-sdcard.bin',
-    network: 'wifi',
-    description: 'No PSRAM, SD card slot',
-  },
-  {
     id: 'guition-p4',
     name: 'Guition JC-ESP32P4-M3-DEV',
     chip: 'ESP32-P4',

@@ -85,7 +85,7 @@ fn main() {
     log_ring::init();
     log::info!("=== ZenClaw ESP32 boot ===");
 
-    // --- Status LED (WS2812 on T-Dongle-S3: GPIO 40) ---
+    // --- Status LED (WS2812; GPIO 40 — needs per-board pin mapping; benign no-op if unconnected) ---
     zenclaw_agent::led_status::init(40);
     zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Boot);
 

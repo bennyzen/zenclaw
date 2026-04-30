@@ -37,7 +37,6 @@ The board profile MUST match the hardware. Flashing a PSRAM-enabled build onto a
 | Board | Manifest | Hardware | Key Config |
 |-------|----------|----------|------------|
 | **devkitc** | `boards/devkitc.toml` | ESP32-S3-DevKitC (2x USB, 8MB PSRAM) | `CONFIG_SPIRAM=y`, UART console, USB Host enabled |
-| **sdcard** | `boards/sdcard.toml` | LILYGO T-Dongle-S3 (1x USB, no PSRAM, SD slot) | USB Serial/JTAG console, no SPIRAM |
 | **guition-p4** | `boards/guition-p4.toml` | Guition JC-ESP32P4-M3-DEV (Ethernet, 32MB PSRAM) | RISC-V target, IP101 PHY, no WiFi provisioning needed |
 
 **CRITICAL**: When switching board profiles, the esp-idf-sys build cache may retain the old sdkconfig. If the board doesn't boot, clean and rebuild:
@@ -92,7 +91,7 @@ description = "ESP32-S3-DevKitC (PSRAM, USB Host capable)"
 
 ### Provisioning
 
-**Preferred: web UI wizard** — `web/app/pages/provision.vue` flashes the Rust agent over Web Serial (Chrome/Edge). Pick the board (DevKitC, T-Dongle-S3, or Guition P4), enter a device name (dice button rolls a fresh `zenclaw-{adj}-{noun}`), WiFi creds (optional for Ethernet boards), provider/API key, click Flash. The wizard:
+**Preferred: web UI wizard** — `web/app/pages/provision.vue` flashes the Rust agent over Web Serial (Chrome/Edge). Pick the board (DevKitC or Guition P4), enter a device name (dice button rolls a fresh `zenclaw-{adj}-{noun}`), WiFi creds (optional for Ethernet boards), provider/API key, click Flash. The wizard:
 
 - Validates that the chip detected by esptool-js matches the chosen board (chip-mismatch is caught before any erase).
 - Flashes the merged image at `0x0` and a NVS partition at `0x9000` containing `device/hostname` plus optional `wifi/ssid` + `wifi/password`.
@@ -213,7 +212,7 @@ agent-esp32/src/
 |---------|-------------|
 | `esp32` (default) | ESP32 target — esp-idf-svc, embedded-svc |
 | `desktop` | Desktop target — tokio, axum, reqwest |
-| `nic-wifi-internal` | Native WiFi via EspWifi (S3/S2); enabled by devkitc + sdcard board manifests |
+| `nic-wifi-internal` | Native WiFi via EspWifi (S3/S2); enabled by devkitc board manifest |
 | `nic-wifi-hosted` | WiFi via esp_hosted (C6/C5 SDIO co-proc) — v2, not yet implemented |
 | `nic-eth` | Internal EMAC + external PHY (P4); enabled by guition-p4 board manifest |
 | `usb_storage` | USB Host MSC support (requires `esp32`, DevKitC board + powered USB hub) |
@@ -286,7 +285,7 @@ Each `chat_id` gets a JSONL file at `data/sessions/{chat_id}.jsonl` (or `/data/s
 
 ### Memory Considerations
 
-ESP32-S3: 512 KB SRAM + optional 2-8 MB PSRAM. Boards without PSRAM (T-Dongle-S3) have ~175KB free heap after WiFi+TLS. Session compaction keeps JSONL files bounded. TLS alone needs ~40-50KB.
+All supported boards ship PSRAM: DevKitC has 8MB, Guition P4 has 32MB. The internal SRAM is reserved for hot/IRQ-safe data; tool results, large strings, and the message queue land in PSRAM heap. TLS alone needs ~40-50KB; per-tool result budgets sit comfortably in the MB range. Session compaction keeps JSONL files bounded on flash. (Boards without PSRAM are not supported — see `legacy/micropython-final` git history for the prior T-Dongle-S3 era.)
 
 ## Project Structure
 
@@ -294,14 +293,13 @@ ESP32-S3: 512 KB SRAM + optional 2-8 MB PSRAM. Boards without PSRAM (T-Dongle-S3
 zenclaw/
   agent-esp32/              Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
     justfile                  Multi-board build system (just build/flash/clean/list)
-    boards/                   Per-board TOML manifests (devkitc, sdcard, guition-p4)
+    boards/                   Per-board TOML manifests (devkitc, guition-p4)
     bootloaders/              Vendored bootloaders (esp32s3.bin, esp32p4.bin)
     scripts/board-env.sh      Reads a board manifest and exports build env vars
     Cargo.toml                Dependencies, features, ESP-IDF components
     partitions.csv            Flash partition layout (NVS + 4MB app + 8MB SPIFFS)
     sdkconfig.defaults        Shared ESP-IDF config (flash size, TLS, HTTP server)
     sdkconfig.board.devkitc   DevKitC profile (PSRAM, UART console, USB Host)
-    sdkconfig.board.sdcard    T-Dongle-S3 profile (no PSRAM, USB Serial/JTAG)
     sdkconfig.board.guition-p4  Guition P4 profile (EMAC, RISC-V, 32MB PSRAM)
     bindings_usb_msc.h        Bindgen header for USB Host MSC component
     bindings_led_strip.h      Bindgen header for LED strip component
