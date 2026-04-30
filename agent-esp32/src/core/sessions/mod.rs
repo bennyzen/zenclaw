@@ -148,6 +148,12 @@ impl SessionManager {
         format!("{}/{}.jsonl", self.sessions_dir, safe_chat_id(chat_id))
     }
 
+    /// On-disk byte size of the session JSONL, or None if it doesn't exist.
+    pub fn session_size_bytes(&self, chat_id: &str) -> Option<usize> {
+        let path = self.session_path(chat_id);
+        fs::metadata(&path).ok().map(|m| m.len() as usize)
+    }
+
     // -- Core operations -----------------------------------------------------
 
     /// Load all entries from a session JSONL file.
@@ -176,6 +182,11 @@ impl SessionManager {
     }
 
     /// Append an entry to the session file (write-through).
+    /// If the entry is a Message or Compaction with `parent: None`, the
+    /// parent is auto-linked to the current leaf_id of the session — this
+    /// keeps `get_branch` traversable as a single chronological chain.
+    /// Callers that genuinely want a detached entry (none currently exist)
+    /// would need a separate API.
     /// If the entry is a Message or Compaction, also appends a session_info
     /// with the new leaf_id.
     pub fn append(
@@ -184,16 +195,59 @@ impl SessionManager {
         entry: &SessionEntry,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.session_path(chat_id);
+
+        // Auto-link parent for Message/Compaction entries that were
+        // constructed with `parent: None`. We compute it from the current
+        // leaf_id on disk; if there is no prior leaf this remains None
+        // (i.e. the new entry is the root of a fresh session).
+        let to_write = match entry {
+            SessionEntry::Message {
+                id,
+                parent: None,
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+            } => {
+                let parent = self.get_leaf_id(chat_id).ok().flatten();
+                SessionEntry::Message {
+                    id: id.clone(),
+                    parent,
+                    role: role.clone(),
+                    content: content.clone(),
+                    tool_calls: tool_calls.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                }
+            }
+            SessionEntry::Compaction {
+                id,
+                parent: None,
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+            } => {
+                let parent = self.get_leaf_id(chat_id).ok().flatten();
+                SessionEntry::Compaction {
+                    id: id.clone(),
+                    parent,
+                    summary: summary.clone(),
+                    first_kept_entry_id: first_kept_entry_id.clone(),
+                    tokens_before: *tokens_before,
+                }
+            }
+            other => other.clone(),
+        };
+
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
 
-        let line = serde_json::to_string(entry)?;
+        let line = serde_json::to_string(&to_write)?;
         writeln!(file, "{}", line)?;
 
         // Auto-append session_info when we add a message or compaction
-        if let Some(id) = entry.id() {
+        if let Some(id) = to_write.id() {
             let info = SessionEntry::Info {
                 leaf_id: id.to_string(),
             };
