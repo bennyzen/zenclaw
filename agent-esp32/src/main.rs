@@ -1450,7 +1450,10 @@ fn agent_thread(
 }
 
 #[cfg(feature = "desktop")]
-fn main() { unimplemented!() }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    zenclaw_agent::desktop::run().await
+}
 
 #[cfg(test)]
 mod hostname_tests {
