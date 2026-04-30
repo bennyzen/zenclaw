@@ -12,7 +12,7 @@ pub struct ContextFile {
 /// Files loaded directly from the data directory root (always attempted).
 const FLASH_FILENAMES: &[&str] = &["AGENTS.md", "TOOLS.md"];
 
-/// Identity files — tried from data_dir first, then fallback to data/.
+/// Identity files — agent persona / bootstrap. First match wins.
 const SOUL_FILENAMES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
@@ -29,27 +29,19 @@ const MAX_MEMORIES: usize = 3;
 
 /// Load all workspace context files from the data directory.
 ///
-/// Mirrors the MicroPython `workspace.load_bootstrap_files()`:
-/// 1. Flash files (AGENTS.md, TOOLS.md) from `data/`
-/// 2. Soul files (SOUL.md, etc.) from `data_dir`, falling back to `data/`
+/// 1. Flash files (AGENTS.md, TOOLS.md) — startup behavior guidance
+/// 2. Soul files (SOUL.md, etc.) — agent identity
 /// 3. Optional files (MEMORY.md) — only if present and non-empty
 /// 4. Recent memory files from `{data_dir}/memory/` (newest first, up to 3)
 pub fn load_bootstrap_files(data_dir: &str) -> Vec<ContextFile> {
     let mut results = Vec::new();
 
-    // Flash files — always from data/
     for filename in FLASH_FILENAMES {
-        let path = format!("data/{}", filename);
-        if let Some(content) = read_file_trimmed(&path) {
-            results.push(ContextFile {
-                name: filename.to_string(),
-                path,
-                content,
-            });
+        if let Some(cf) = resolve_file(data_dir, filename) {
+            results.push(cf);
         }
     }
 
-    // Soul files — try data_dir first, then data/
     for filename in SOUL_FILENAMES {
         if let Some(cf) = resolve_file(data_dir, filename) {
             results.push(cf);
@@ -95,23 +87,11 @@ pub fn load_bootstrap_files(data_dir: &str) -> Vec<ContextFile> {
     results
 }
 
-/// Try data_dir first, then fall back to data/.
 fn resolve_file(data_dir: &str, filename: &str) -> Option<ContextFile> {
-    let primary = format!("{}/{}", data_dir, filename);
-    if data_dir != "data" {
-        if let Some(content) = read_file_trimmed(&primary) {
-            return Some(ContextFile {
-                name: filename.to_string(),
-                path: primary,
-                content,
-            });
-        }
-    }
-
-    let fallback = format!("data/{}", filename);
-    read_file_trimmed(&fallback).map(|content| ContextFile {
+    let path = format!("{}/{}", data_dir, filename);
+    read_file_trimmed(&path).map(|content| ContextFile {
         name: filename.to_string(),
-        path: fallback,
+        path,
         content,
     })
 }
@@ -124,10 +104,13 @@ fn read_file_trimmed(path: &str) -> Option<String> {
 /// directory on first boot if no SOUL/IDENTITY/USER file already exists.
 const DEFAULT_SOUL_MD: &str = "You are ZenClaw, an AI agent running on an ESP32 embedded device.\nYou are helpful, concise, and resourceful.\n";
 
+/// Default AGENTS.md content. Written to the data directory on first boot
+/// if no AGENTS.md is already present.
+const DEFAULT_AGENTS_MD: &str = "# Startup Checklist\n- Greet the user\n- Be ready to help\n";
+
 /// Seed default bootstrap files into the data directory if missing.
-/// Idempotent — only writes a file when none of the SOUL_FILENAMES exist,
-/// so a user-edited SOUL.md (or one uploaded via /api/files) is never
-/// overwritten.
+/// Idempotent — each file is only written when no user-supplied version
+/// already exists, so content edited via the file manager is preserved.
 pub fn seed_defaults(data_dir: &str) {
     let any_soul = SOUL_FILENAMES
         .iter()
@@ -135,6 +118,11 @@ pub fn seed_defaults(data_dir: &str) {
     if !any_soul {
         let path = format!("{}/SOUL.md", data_dir);
         let _ = fs::write(&path, DEFAULT_SOUL_MD);
+    }
+
+    let agents_path = format!("{}/AGENTS.md", data_dir);
+    if !Path::new(&agents_path).exists() {
+        let _ = fs::write(&agents_path, DEFAULT_AGENTS_MD);
     }
 }
 
@@ -194,6 +182,38 @@ mod tests {
         let files = load_bootstrap_files(data_dir);
         // No soul/flash files exist — should be empty (no panics)
         assert!(files.iter().all(|f| !f.content.is_empty()));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn seed_defaults_writes_missing_files() {
+        let tmp = std::env::temp_dir().join(format!("zenclaw_ws_seed_{}", std::process::id()));
+        let data_dir = tmp.to_str().unwrap();
+        fs::create_dir_all(data_dir).unwrap();
+
+        seed_defaults(data_dir);
+
+        let soul = fs::read_to_string(format!("{}/SOUL.md", data_dir)).unwrap();
+        assert!(soul.contains("ZenClaw"));
+        let agents = fs::read_to_string(format!("{}/AGENTS.md", data_dir)).unwrap();
+        assert!(agents.contains("Startup Checklist"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn seed_defaults_preserves_existing_content() {
+        let tmp = std::env::temp_dir().join(format!("zenclaw_ws_seed_existing_{}", std::process::id()));
+        let data_dir = tmp.to_str().unwrap();
+        fs::create_dir_all(data_dir).unwrap();
+        fs::write(format!("{}/SOUL.md", data_dir), "user soul").unwrap();
+        fs::write(format!("{}/AGENTS.md", data_dir), "user agents").unwrap();
+
+        seed_defaults(data_dir);
+
+        assert_eq!(fs::read_to_string(format!("{}/SOUL.md", data_dir)).unwrap(), "user soul");
+        assert_eq!(fs::read_to_string(format!("{}/AGENTS.md", data_dir)).unwrap(), "user agents");
 
         let _ = fs::remove_dir_all(&tmp);
     }
