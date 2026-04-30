@@ -19,6 +19,7 @@ use tower_http::cors::CorsLayer;
 use crate::core::gateway::Gateway;
 use crate::core::sessions::SessionEntry;
 use crate::core::types::Role;
+use crate::desktop::MemStats;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -78,12 +79,28 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "agent_name": state.gateway.config.agent_name,
         "version": env!("CARGO_PKG_VERSION"),
         "built": "",
-        "memory": { "free_kb": null, "used_kb": null, "total_kb": null },
+        "memory": memory_json(),
         "temperature_c": null,
         "wifi": null,
         "storage": { "total_kb": null, "free_kb": null },
         "uptime_s": uptime
     }))
+}
+
+/// Shared shape for `/api/status` and `/ws/stats` memory fields. Maps Linux
+/// process + system stats onto the field names the ESP32 build populates,
+/// so consumers (web UI, harnesses) work against either platform unchanged.
+/// `used_kb` is this process's RSS; `free_kb` is system MemAvailable.
+fn memory_json() -> serde_json::Value {
+    match MemStats::read() {
+        Some(m) => json!({
+            "free_kb": m.system_available_kb,
+            "used_kb": m.rss_kb,
+            "total_kb": m.system_total_kb,
+            "rss_peak_kb": m.rss_peak_kb,
+        }),
+        None => json!({"free_kb": null, "used_kb": null, "total_kb": null}),
+    }
 }
 
 async fn api_restart() -> Response {
@@ -526,7 +543,7 @@ async fn handle_stats_ws(mut socket: WebSocket, state: AppState) {
     loop {
         let uptime = state.start_time.elapsed().as_secs();
         let stats = json!({
-            "memory": {"free_kb": null, "used_kb": null, "total_kb": null},
+            "memory": memory_json(),
             "temperature_c": null,
             "wifi": null,
             "storage": {"total_kb": null, "free_kb": null},
