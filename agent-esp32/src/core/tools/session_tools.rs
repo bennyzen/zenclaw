@@ -88,6 +88,14 @@ fn do_list(ctx: &ToolContext) -> ToolResult {
     }
 }
 
+/// Per-entry content cap when serving session history. Without this,
+/// a single 491 KB web_fetch tool result inside the recent window would
+/// be returned verbatim, feeding the model its own bloat (the 612 KB
+/// self-DoS observed on the baseline 50-turn synthetic test, turn 42).
+/// Tuned to fit typical chat messages and short tool results while
+/// clipping outlier payloads.
+const HISTORY_PER_ENTRY_CAP: usize = 4096;
+
 fn do_history(ctx: &ToolContext, limit: usize) -> ToolResult {
     let path = format!("{}/sessions/{}.jsonl", ctx.data_dir, ctx.chat_id);
     let content = match std::fs::read_to_string(&path) {
@@ -102,6 +110,35 @@ fn do_history(ctx: &ToolContext, limit: usize) -> ToolResult {
         0
     };
 
-    let recent: Vec<&str> = lines[start..].to_vec();
-    ToolResult::Text(recent.join("\n"))
+    let mut out: Vec<String> = Vec::with_capacity(limit);
+    for line in &lines[start..] {
+        out.push(clip_history_line(line));
+    }
+    ToolResult::Text(out.join("\n"))
+}
+
+/// If the line is a JSON entry whose `content` field is longer than the
+/// per-entry cap, replace `content` with a short marker. Non-JSON or
+/// small lines pass through unchanged.
+fn clip_history_line(line: &str) -> String {
+    if line.len() <= HISTORY_PER_ENTRY_CAP {
+        return line.to_string();
+    }
+    let mut value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return line.to_string(),
+    };
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(content) = obj.get_mut("content") {
+            if let Some(s) = content.as_str() {
+                if s.len() > HISTORY_PER_ENTRY_CAP {
+                    *content = json!(format!(
+                        "[content omitted: {} bytes — exceeds session.history per-entry cap]",
+                        s.len()
+                    ));
+                }
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
 }
