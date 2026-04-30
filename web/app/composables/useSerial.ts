@@ -238,23 +238,30 @@ export function useSerial() {
           onProgress({ stage: 'flashing', percent: pct, message: `${written}/${total} bytes` })
         },
       })
-      // Watchdog reset for ESP32-S3 native USB (no DTR/RTS hardware reset line).
-      // Ported from Python esptool: esptool/targets/esp32s3.py watchdog_reset()
-      // Arms the RTC watchdog to fire a full system reset after ~100ms.
-      log('Resetting device via watchdog...')
+      // Reset path is chip-specific:
+      // - ESP32-S3 native USB has no DTR/RTS line → use the RTC watchdog
+      //   (ported from Python esptool: esptool/targets/esp32s3.py watchdog_reset).
+      // - ESP32-P4 (and others reached over USB-UART) → DTR/RTS pulse via
+      //   esptool-js's hard_reset.
+      log('Resetting device...')
       try {
-        const WDT_WPROTECT = 0x600080B0
-        const WDT_CONFIG0  = 0x60008098
-        const WDT_CONFIG1  = 0x6000809C
-        const WDT_WKEY     = 0x50D83AA1
-        await loader.writeReg(WDT_WPROTECT, WDT_WKEY)                          // unlock
-        await loader.writeReg(WDT_CONFIG1, 2000)                                // timeout ms
-        await loader.writeReg(WDT_CONFIG0, (1 << 31) | (5 << 28) | (1 << 8) | 2)  // enable + sys reset
-        await loader.writeReg(WDT_WPROTECT, 0)                                 // re-lock
-        await new Promise(r => setTimeout(r, 500))
-        log('Watchdog reset triggered — device is rebooting.')
-      } catch {
-        log('Watchdog reset failed — press RST button on the device.')
+        if (detectedChip === 'ESP32-S3') {
+          const WDT_WPROTECT = 0x600080B0
+          const WDT_CONFIG0  = 0x60008098
+          const WDT_CONFIG1  = 0x6000809C
+          const WDT_WKEY     = 0x50D83AA1
+          await loader.writeReg(WDT_WPROTECT, WDT_WKEY)
+          await loader.writeReg(WDT_CONFIG1, 2000)
+          await loader.writeReg(WDT_CONFIG0, (1 << 31) | (5 << 28) | (1 << 8) | 2)
+          await loader.writeReg(WDT_WPROTECT, 0)
+          await new Promise(r => setTimeout(r, 500))
+          log('Watchdog reset triggered — device is rebooting.')
+        } else {
+          await loader.after('hard_reset', false)
+          log('Hardware reset triggered — device is rebooting.')
+        }
+      } catch (e: any) {
+        log(`Reset failed (${e?.message ?? e}) — press RST button on the device.`)
       }
 
       onProgress({ stage: 'done', percent: 100, message: 'Flash complete! Device is rebooting.' })
