@@ -78,47 +78,62 @@ pub struct Runner {
 }
 
 #[cfg(feature = "desktop")]
+fn lookup_provider<'a>(
+    config: &'a Config,
+    model: &genai::ModelIden,
+) -> Option<&'a crate::config::ProviderEntry> {
+    let key = model.adapter_kind.as_str().to_lowercase();
+    config
+        .providers
+        .entries
+        .get(&key)
+        .or_else(|| config.providers.entries.get(&config.providers.default))
+}
+
+#[cfg(feature = "desktop")]
 impl Runner {
     pub fn new(config: Arc<Config>) -> Self {
-        // Build genai client with auth resolver that reads API keys from our config
+        // Resolver lookup: try the genai adapter's lowercase name as a config
+        // key; otherwise fall back to the configured default provider. No
+        // adapter→config-key translation table — provider keys in config are
+        // expected to match the genai adapter name (e.g. "zai", "gemini",
+        // "openai"). Existing devices using legacy keys ("z-ai", "google")
+        // still work via the default-provider fallback.
         let config_for_auth = config.clone();
         let auth_resolver = genai::resolver::AuthResolver::from_resolver_fn(
             move |model_iden: genai::ModelIden| -> genai::resolver::Result<Option<genai::resolver::AuthData>> {
-                // Find the API key from our config based on the adapter kind
-                let providers = &config_for_auth.providers;
-                let adapter = model_iden.adapter_kind.as_str().to_lowercase();
+                let entry = lookup_provider(&config_for_auth, &model_iden);
+                Ok(entry.and_then(|e| e.api_key.clone()).map(genai::resolver::AuthData::Key))
+            },
+        );
 
-                // Map genai adapter names to our provider keys
-                let provider_key = match adapter.as_str() {
-                    "gemini" => "google",
-                    "openai" => "openai",
-                    "anthropic" => "anthropic",
-                    "xai" => "xai",
-                    "deepseek" => "deepseek",
-                    "groq" => "groq",
-                    "cohere" => "cohere",
-                    other => other,
-                };
-
-                if let Some(entry) = providers.entries.get(provider_key) {
-                    if let Some(ref key) = entry.api_key {
-                        return Ok(Some(genai::resolver::AuthData::Key(key.clone())));
-                    }
+        // ServiceTargetResolver: override the per-adapter default endpoint when
+        // config supplies a `base_url`. Useful for private OpenAI-compatible
+        // deployments (Ollama, Fireworks, etc.).
+        //
+        // NOTE: a few built-in adapters route by model-name namespace and will
+        // overwrite this from inside `to_web_request_data`. For z.ai, the
+        // convention is `model: "zai::glm-5.1"` (coding plan) vs `glm-5.1`
+        // (standard plan) — the model name carries the endpoint, not base_url.
+        let config_for_target = config.clone();
+        let service_target_resolver = genai::resolver::ServiceTargetResolver::from_resolver_fn(
+            move |service_target: genai::ServiceTarget| -> Result<genai::ServiceTarget, genai::resolver::Error> {
+                let base_url = lookup_provider(&config_for_target, &service_target.model)
+                    .and_then(|e| e.base_url.clone());
+                if let Some(url) = base_url {
+                    return Ok(genai::ServiceTarget {
+                        endpoint: genai::resolver::Endpoint::from_owned(url),
+                        auth: service_target.auth,
+                        model: service_target.model,
+                    });
                 }
-
-                // Fallback: try default provider
-                if let Some(entry) = providers.entries.get(&providers.default) {
-                    if let Some(ref key) = entry.api_key {
-                        return Ok(Some(genai::resolver::AuthData::Key(key.clone())));
-                    }
-                }
-
-                Ok(None) // Let genai fall back to env vars
+                Ok(service_target)
             },
         );
 
         let client = genai::Client::builder()
             .with_auth_resolver(auth_resolver)
+            .with_service_target_resolver(service_target_resolver)
             .build();
 
         Self { config, client }

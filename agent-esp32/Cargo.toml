@@ -40,7 +40,7 @@ tokio-util = { version = "0.7", optional = true }
 
 # Desktop-only: reqwest + genai (TLS backends don't support Xtensa)
 reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
-genai = { version = "0.6.0-beta", optional = true }
+genai = { version = "=0.6.0-beta.18", optional = true }
 
 # ESP32
 esp-idf-svc = { version = "0.52", optional = true }
