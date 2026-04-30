@@ -9,6 +9,10 @@ fn esp_http_get(url: &str, max_length: usize) -> Result<(u16, String), String> {
     esp_http_get_with_headers(url, &[], max_length)
 }
 
+/// Returns the response body if it fits in `max_length` bytes, otherwise
+/// returns an actionable refusal as the body (with the original HTTP status
+/// preserved). Never truncates: the caller and the LLM both prefer "too
+/// big, narrow your scope" over "here's an arbitrary prefix".
 #[cfg(feature = "esp32")]
 fn esp_http_get_with_headers(url: &str, headers: &[(&str, &str)], max_length: usize) -> Result<(u16, String), String> {
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
@@ -26,21 +30,34 @@ fn esp_http_get_with_headers(url: &str, headers: &[(&str, &str)], max_length: us
     conn.initiate_request(Method::Get, url, headers).map_err(|e| format!("req: {}", e))?;
     conn.initiate_response().map_err(|e| format!("resp: {}", e))?;
     let status = conn.status();
+
     let mut buf = [0u8; 4096];
-    let mut body = Vec::new();
+    let mut body: Vec<u8> = Vec::with_capacity(8192);
+    let mut overflowed = false;
     loop {
         let n = conn.read(&mut buf).map_err(|e| format!("read: {}", e))?;
         if n == 0 { break; }
+        // Memory bound: stop reading once max_length would be exceeded so
+        // we don't fill heap with bytes we're going to refuse anyway.
+        if body.len() + n > max_length {
+            overflowed = true;
+            break;
+        }
         body.extend_from_slice(&buf[..n]);
-        if body.len() >= max_length { break; }
     }
-    let text = String::from_utf8_lossy(&body);
-    let truncated = if text.len() > max_length {
-        format!("{}\n\n[truncated at {} of {}+ chars]", &text[..max_length], max_length, text.len())
-    } else {
-        text.into_owned()
-    };
-    Ok((status, truncated))
+
+    if overflowed {
+        return Ok((status, refusal_message(max_length)));
+    }
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+}
+
+fn refusal_message(cap: usize) -> String {
+    format!(
+        "Response body exceeded the {}-byte fetch cap. Re-run with a larger \
+         max_length, target a more specific URL, or fetch a sub-range.",
+        cap,
+    )
 }
 
 /// Fetches content from a URL.
@@ -51,7 +68,7 @@ impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_fetch".to_string(),
-            description: "Fetch content from a URL.".to_string(),
+            description: "Fetch content from a URL. Oversized bodies are refused with an actionable error rather than truncated.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -61,7 +78,7 @@ impl Tool for WebFetchTool {
                     },
                     "max_length": {
                         "type": "integer",
-                        "description": "Max response length in chars (default 8000)"
+                        "description": "Maximum response body bytes. If the response exceeds this, the fetch returns an actionable error instead of a truncated body. Default suits typical pages on the current platform."
                     }
                 },
                 "required": ["url"]
@@ -74,26 +91,33 @@ impl Tool for WebFetchTool {
             Some(u) => u,
             None => return ToolResult::Error("Missing 'url'".to_string()),
         };
-        let max_length = args["max_length"].as_u64().unwrap_or(8000) as usize;
+        // Defaults: desktop is generous (real pages flow through unchanged),
+        // ESP32 caps at 32KB which fits comfortably in PSRAM heap and covers
+        // most useful HTML/text resources.
+        #[cfg(feature = "desktop")]
+        let default_max = 10 * 1024 * 1024;
+        #[cfg(feature = "esp32")]
+        let default_max = 32 * 1024;
+        #[cfg(not(any(feature = "desktop", feature = "esp32")))]
+        let default_max = 8 * 1024;
+        let max_length = args["max_length"].as_u64().unwrap_or(default_max as u64) as usize;
 
         #[cfg(feature = "desktop")]
         {
             match reqwest::get(url).await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    match resp.text().await {
-                        Ok(body) => {
-                            let truncated = if body.len() > max_length {
-                                format!(
-                                    "{}\n\n[truncated at {} of {} chars]",
-                                    &body[..max_length],
-                                    max_length,
-                                    body.len()
-                                )
-                            } else {
-                                body
-                            };
-                            ToolResult::Text(format!("HTTP {} — {}", status, truncated))
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            if bytes.len() > max_length {
+                                return ToolResult::Text(format!(
+                                    "HTTP {} — {}",
+                                    status,
+                                    refusal_message_desktop(bytes.len(), max_length),
+                                ));
+                            }
+                            let body = String::from_utf8_lossy(&bytes).into_owned();
+                            ToolResult::Text(format!("HTTP {} — {}", status, body))
                         }
                         Err(e) => ToolResult::Error(format!("Failed to read body: {}", e)),
                     }
@@ -115,6 +139,32 @@ impl Tool for WebFetchTool {
             let _ = (url, max_length);
             ToolResult::Error("web_fetch not available on this platform".to_string())
         }
+    }
+}
+
+/// Reuses the ESP32 refusal phrasing on desktop, with the actual size
+/// included so the LLM can decide how much to ask for next time.
+#[cfg(feature = "desktop")]
+fn refusal_message_desktop(actual: usize, cap: usize) -> String {
+    format!(
+        "Response body was {} bytes, exceeded the {}-byte fetch cap. Re-run \
+         with a larger max_length, target a more specific URL, or fetch a \
+         sub-range.",
+        actual, cap,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(feature = "desktop")]
+    fn desktop_refusal_names_size_and_cap() {
+        let msg = super::refusal_message_desktop(50_000, 8000);
+        assert!(msg.contains("50000 bytes"));
+        assert!(msg.contains("8000-byte fetch cap"));
+        assert!(msg.contains("larger max_length"));
+        // No original bytes leaked.
+        assert!(!msg.contains("xxx"));
     }
 }
 
@@ -265,10 +315,12 @@ impl Tool for WebSearchTool {
                 encoded, count
             );
 
+            // Brave responses are typically 5-30KB; 64KB leaves headroom
+            // for verbose result sets without forcing a refusal.
             match esp_http_get_with_headers(&url, &[
                 ("Accept", "application/json"),
                 ("X-Subscription-Token", &api_key),
-            ], 16000) {
+            ], 64 * 1024) {
                 Ok((_status, body)) => {
                     let data: serde_json::Value = match serde_json::from_str(&body) {
                         Ok(j) => j,
