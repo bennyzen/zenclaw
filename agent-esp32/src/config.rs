@@ -25,8 +25,20 @@ fn default_memory_top_k() -> usize {
     5
 }
 
-fn default_compaction_threshold() -> usize {
-    50
+fn default_compaction_enabled() -> bool {
+    true
+}
+fn default_compaction_token_threshold() -> usize {
+    50_000
+}
+fn default_compaction_byte_threshold() -> usize {
+    200 * 1024
+}
+fn default_compaction_keep_recent() -> usize {
+    6
+}
+fn default_compaction_max_summary_bytes() -> usize {
+    5 * 1024
 }
 
 fn default_heartbeat_secs() -> u64 {
@@ -132,14 +144,26 @@ impl Default for MemoryConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactionConfig {
-    #[serde(default = "default_compaction_threshold")]
-    pub threshold: usize,
+    #[serde(default = "default_compaction_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_compaction_token_threshold")]
+    pub token_threshold: usize,
+    #[serde(default = "default_compaction_byte_threshold")]
+    pub byte_threshold: usize,
+    #[serde(default = "default_compaction_keep_recent")]
+    pub keep_recent: usize,
+    #[serde(default = "default_compaction_max_summary_bytes")]
+    pub max_summary_bytes: usize,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            threshold: default_compaction_threshold(),
+            enabled: default_compaction_enabled(),
+            token_threshold: default_compaction_token_threshold(),
+            byte_threshold: default_compaction_byte_threshold(),
+            keep_recent: default_compaction_keep_recent(),
+            max_summary_bytes: default_compaction_max_summary_bytes(),
         }
     }
 }

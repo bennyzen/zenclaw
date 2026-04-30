@@ -5,6 +5,7 @@ use log::info;
 
 use crate::config::Config;
 use crate::core::agent_loop;
+use crate::core::compaction;
 use crate::core::memory::MemoryStore;
 use crate::core::prompt;
 use crate::core::runner::LlmRunner;
@@ -61,6 +62,20 @@ impl Gateway {
         };
 
         info!("GW chat: id={} ch={}", chat_id, channel);
+
+        // Auto-compaction: before reading session history into the message
+        // vector, summarize older entries if the branch has grown past the
+        // configured token/byte thresholds. Failures here are non-fatal —
+        // the user's turn proceeds with whatever history is on disk.
+        let model_override = self.sessions.get_state(chat_id).model_override;
+        compaction::maybe_compact(
+            self.sessions.as_ref(),
+            self.runner.as_ref(),
+            chat_id,
+            &self.config.compaction,
+            model_override.as_deref(),
+        )
+        .await;
 
         // Build system prompt with all tools and context files
         let context_files = workspace::load_bootstrap_files(&self.data_dir);
@@ -141,9 +156,6 @@ impl Gateway {
             sessions: self.sessions.clone(),
             data_dir: self.data_dir.clone(),
         };
-
-        // Get model override from session state
-        let model_override = self.sessions.get_state(chat_id).model_override;
 
         // Capture the message count before the loop runs so we can persist
         // exactly the new messages it appends — assistant-with-tool-calls,

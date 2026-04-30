@@ -1,5 +1,6 @@
 pub mod agent_loop;
 pub mod cloud;
+pub mod compaction;
 pub mod cron;
 pub mod gateway;
 pub mod memory;
