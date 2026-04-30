@@ -1,6 +1,6 @@
 # ZenClaw
 
-AI agent framework. Two implementations: a **Rust agent** (`agent-esp32/`) targeting ESP32-S3 and ESP32-P4 hardware (active development, primary path), and a **MicroPython agent** (`firmware/`) kept for desktop development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC).
+AI agent framework. Single Rust implementation (`agent-esp32/`) targeting ESP32-S3 and ESP32-P4 hardware, plus a desktop build for development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC). The original MicroPython implementation has been retired and is preserved at the `legacy/micropython-final` git tag.
 
 ## Rust Agent (`agent-esp32/`)
 
@@ -154,7 +154,7 @@ curl -sf "http://$HOST/api/chat/history?chat_id=web" | python3 -m json.tool
 agent-esp32/src/
   main.rs                     ESP32 entry: WiFi, mDNS, SPIFFS, HTTP server, Telegram poller
   lib.rs                      Feature-gated module exports
-  config.rs                   Config structs (serde, mirrors firmware/config.json shape)
+  config.rs                   Config structs (serde, mirrors `/api/config` JSON shape)
   usb_storage.rs              USB Host MSC FFI wrapper (feature: usb_storage)
 
   core/                       Shared agent logic
@@ -242,57 +242,11 @@ storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
 
 ### Deferred / TODO
 
-- **Vector memory**: the `agent-esp32/src/core/memory/` module persists memories as text only. The `embedding: Vec<f32>` field on `MemoryEntry` is never populated, and `BruteForceStore::search()` does substring matching, not cosine similarity. The MicroPython equivalent (`firmware/agent/memory.py` + `embeddings.py`) generates Gemini/OpenAI embeddings on save and blends vector + text scores at query time (default vector weight 0.7). To restore parity: add an `embeddings` provider that calls the same LLM provider's embedding endpoint, populate the vector on `do_save`, and either (a) implement cosine search in `BruteForceStore` or (b) enable the `hnsw` Cargo feature and use usearch. Costs money per embedding call, hence deferred.
-
-## MicroPython Agent (`firmware/`)
-
-The original MicroPython implementation. Still functional for ESP32 + desktop development.
-
-### Quick Start
-
-```bash
-# Desktop (MicroPython unix port)
-cd firmware && micropython -X heapsize=4m run.py
-
-# Programmatic test (LLM-to-LLM)
-cd firmware && micropython -X heapsize=4m chat_test.py --reset "your message"
-
-# Tool smoke tests (no LLM, direct calls)
-cd firmware && micropython -X heapsize=4m test_tools.py
-```
-
-### ESP32-S3 Deployment (MicroPython)
-
-The web UI no longer flashes MicroPython — the wizard now provisions the Rust agent. For MicroPython on hardware, use `mpremote cp` (device must be at REPL, not running main.py) or the legacy `scripts/build-firmware-image.sh` + `esptool write_flash` path. The desktop MicroPython port (`micropython -X heapsize=4m run.py`) remains the primary way to iterate on `firmware/` code.
-
-### Architecture (MicroPython)
-
-```
-firmware/boot.py (ESP32 only)             WiFi from NVS -> connect
-firmware/main.py (ESP32) / firmware/run.py (desktop)
-  -> agent/gateway.py                     (config, lifecycle, chat() entry point)
-    -> agent/agent_loop.py                (LLM <-> tool execution loop)
-      -> agent/runner.py                  (provider dispatch, retry, streaming)
-      -> agent/providers/                 (Gemini/OpenAI/Anthropic API calls)
-      -> agent/tools/                     (action-param tools, lazy-loaded)
-    -> agent/session_manager/             (JSONL conversation tree persistence)
-    -> agent/heartbeat_runner.py          (autonomous background loop)
-```
-
-### MicroPython Coding Conventions
-
-- **Keep it slim**: Every byte counts on a microcontroller
-- **Imports**: Relative within `agent/`, absolute to `lib/`. MicroPython compat: `try: import asyncio` / `except: import uasyncio as asyncio`
-- **No f-strings**: Use `'{}'.format(x)`
-- **Tool pattern**: Action-param pattern with lazy loading (see `firmware/agent/tools/__init__.py`)
-- **Logging**: `from lib.sys.log import log; log('info', 'MESSAGE', source='zenclaw')`
-- **Paths**: All through `zenclaw_paths` — never hardcode `data/` or `/zenclaw/`
+- **Vector memory**: the `agent-esp32/src/core/memory/` module persists memories as text only. The `embedding: Vec<f32>` field on `MemoryEntry` is never populated, and `BruteForceStore::search()` does substring matching, not cosine similarity. To add vector search: introduce an `embeddings` provider that calls the LLM provider's embedding endpoint, populate the vector on `do_save`, then either (a) implement cosine search in `BruteForceStore` or (b) enable the `hnsw` Cargo feature and use usearch. Costs money per embedding call, hence deferred.
 
 ## Shared Concepts
 
 ### Config Format
-
-Same JSON format for both Rust and MicroPython agents:
 
 ```json
 {
@@ -354,14 +308,6 @@ zenclaw/
     src/                      Rust source (see Architecture above)
 
   agent-esp32-smoke/        Minimal reference crate for porting to new chips
-
-  firmware/                 MicroPython agent (ESP32 + desktop)
-    boot.py                   ESP32 boot (WiFi from NVS)
-    main.py                   ESP32 entry point
-    run.py                    Desktop entry point (interactive REPL)
-    agent/                    Agent core (gateway, tools, sessions, telegram)
-    lib/                      Platform libraries (WiFi, HTTP, logging)
-    data/                     Runtime data (SOUL.md, sessions, memory)
 
   web/                      Nuxt web UI (PWA dashboard, config editor, file manager, provisioning)
 ```

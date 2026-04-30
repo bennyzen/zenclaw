@@ -1,120 +1,78 @@
 <p align="center">
-  <img src="zenclaw.webp" alt="ZenClaw running on an ESP32-S3 board">
+  <img src="zenclaw.webp" alt="ZenClaw running on an ESP32 board">
 </p>
 
 # ZenClaw
 
-A fully autonomous AI agent that fits on a $3 ESP32-S3 microcontroller — 512KB of SRAM, cloud-backed persistence (S3-compatible), consolidated action-param tools, vector memory, cron scheduling, and a Telegram bot. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Built for MicroPython and deployable straight from the browser via Web Serial. Runs on ESP32-S3 with or without PSRAM.
+A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) protects your data from flash wear and reflashes. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
 
 ## Features
 
 - **Multi-provider LLM support**: Google Gemini (native API), any OpenAI-compatible provider (OpenAI, DeepSeek, Groq, local models via Ollama, etc.)
 - **Tool-use agent loop**: Call LLM, execute tools, persist context, repeat
-- **Consolidated tool system**: ~20 tools using action-param pattern (file I/O, code exec, vector memory, cron, web, sub-agents, MCP client, cloud storage, skills). Lazy-loaded to save RAM — modules import on first use, not at boot
+- **Consolidated tool system**: ~20 tools using an action-param pattern (file I/O, code exec, memory, cron, web, sub-agents, MCP client, cloud storage, skills)
 - **Circuit breaker**: Detects stuck loops, no-progress polling, ping-pong patterns
-- **Vector memory**: Keyword + embedding hybrid search with persistent markdown storage
+- **Persistent memory**: Markdown-backed memory store with keyword search (vector embeddings deferred — see [`CLAUDE.md`](CLAUDE.md))
 - **Session management**: JSONL-persisted branching conversation trees
 - **Sub-agents**: Spawn isolated background agent sessions with depth limits
 - **Heartbeat**: Autonomous loop with cron scheduling and reflection turns
-- **Multi-channel**: CLI and Telegram (voice, photos, typing indicator)
-- **Cloud persistence**: Write-through S3-compatible sync — the device is brittle (flash wear, filesystem corruption, firmware reflashes), so sessions, memory, cron jobs, and user files are automatically backed up to cloud storage (Cloudflare R2 free tier, Backblaze B2, AWS S3) and restored on boot
-- **Web UI**: Nuxt PWA — dashboard, config editor, file manager, ESP32 provisioning via Web Serial
-- **ESP32-S3 ready**: WiFi via NVS, headless boot, hardware detection, SD card support
+- **Multi-channel**: Web UI, Telegram (voice, photos, typing indicator), HTTP API
+- **Cloud persistence**: Write-through S3-compatible sync — sessions, memory, cron jobs, and user files automatically backed up to cloud storage (Cloudflare R2 free tier, Backblaze B2, AWS S3) and restored on boot
+- **Web UI**: Nuxt PWA — dashboard, config editor, file manager, browser-based device provisioning via Web Serial
+- **Multi-board**: ESP32-S3 (DevKitC, T-Dongle-S3) and ESP32-P4 (Guition); WiFi or Ethernet; multiple devices coexist on one network via mDNS
 
 ## Quick Start
 
-### ESP32-S3 (browser provisioning)
+Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome or Edge (Web Serial required). Plug your ESP32 board in via USB and go to the Provision page. The wizard handles everything:
 
-Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome or Edge (Web Serial required). Plug your ESP32-S3 via USB and go to the Provision page. The wizard handles everything:
+1. **Configure** — Pick a board (DevKitC, T-Dongle-S3, or Guition P4), enter a device name (or roll one), supply WiFi credentials (skipped for Ethernet boards), pick an LLM provider, paste your API key
+2. **Flash** — The browser flashes the firmware image and an NVS partition (device hostname + WiFi creds) in one shot via Web Serial. No CLI tools, no manual file copying
+3. **Connect** — The device boots, joins the network (WiFi for S3, Ethernet for P4), and appears at `<devicename>.local`. The wizard pushes the LLM provider config automatically
 
-1. **Configure** — Enter WiFi credentials, pick an LLM provider, enter your API key, choose a device name
-2. **Flash** — The browser flashes MicroPython + LittleFS filesystem + NVS (WiFi creds) in one shot via Web Serial. No CLI tools, no manual file copying
-3. **Connect** — The device boots, joins your WiFi, and appears at `devicename.local`. The wizard pushes the API key config automatically
+Done. The device is running at `http://<devicename>.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
 
-Done. The device is running at `http://devicename.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
-
-### Desktop (MicroPython unix port)
-
-```bash
-cp firmware/config.example.json firmware/config.json
-# Edit firmware/config.json with your provider API key, then:
-cd firmware && micropython -X heapsize=4m run.py
-```
-
-### Testing
-
-```bash
-# Smoke test all tools (no LLM needed)
-cd firmware && micropython -X heapsize=4m test_tools.py
-
-# Send a single message through the full LLM pipeline
-cd firmware && micropython -X heapsize=4m chat_test.py "What time is it?"
-
-# Fresh session, quiet output
-cd firmware && micropython -X heapsize=4m chat_test.py --reset --quiet "List my files"
-```
+For developers building from source, see [`agent-esp32/`](agent-esp32/) and [`CLAUDE.md`](CLAUDE.md) for board manifests, build commands, and Rust architecture.
 
 ## Architecture
 
 ```
-firmware/boot.py (ESP32)                   WiFi from NVS -> connect
-firmware/main.py (ESP32) / firmware/run.py (desktop)
-  gateway.py                    — Core orchestrator, config, lifecycle
-    prompt.py                   — System prompt from SOUL.md + tools + skills
-    agent_loop.py               — LLM -> tool execution -> repeat
-      runner.py                 — Provider dispatch, retry, streaming
-      providers/                — Gemini native API + OpenAI-compatible format
-      tools/                    — Consolidated tools (lazy-loaded, action-param pattern)
-      tool_loop.py              — Circuit breaker for stuck loops
-    session_manager/            — JSONL branching conversation trees
-    heartbeat_runner.py         — Autonomous background loop + cron
-    telegram/                   — Polling, sending, media, typing indicator
-    channels/                   — CLI and Telegram delivery
+agent-esp32/src/
+  main.rs          ESP32 entry: NIC bring-up, mDNS, SPIFFS, HTTP server, Telegram poller
+  core/            Shared agent logic
+    gateway.rs     Core orchestrator, chat() entry point
+    agent_loop.rs  LLM <-> tool execution loop
+    runner.rs      Provider dispatch trait
+    tools/         Tool implementations (action-param pattern)
+    sessions/      JSONL conversation persistence
+    channels/      Channel abstraction (Telegram, API)
+    memory/        Persistent memory store
+    telegram.rs    Telegram bot (long-poll + send)
+    cron.rs        Scheduled tasks
+  net/             NIC abstraction (WiFi for S3, Ethernet for P4)
+  esp32/           ESP32 HTTP runner (esp-idf-svc)
+  desktop/         Desktop HTTP server + client (axum + reqwest)
 ```
+
+See [`CLAUDE.md`](CLAUDE.md) for the full architecture, board profiles, and build workflow.
 
 ## Project Structure
 
 ```
 zenclaw/
-  firmware/                 ESP32 firmware (MicroPython agent)
-    boot.py                 ESP32 boot (WiFi from NVS)
-    main.py                 ESP32 entry (headless, Telegram)
-    run.py                  Desktop entry (interactive REPL)
-    provision_wifi.py       WiFi credential provisioning
-    chat_test.py            Programmatic LLM test harness
-    test_tools.py           Tool smoke tests
-    config.example.json     Config template (copy to config.json with your keys)
-    zenclaw_paths.py        Data directory path definitions
-
-    agent/                  Main agent package
-      gateway.py            Orchestrator + ZenClawGateway class
-      agent_loop.py         Core LLM <-> tool loop
-      runner.py             Provider dispatch + retry
-      prompt.py             System prompt builder
-      providers/            LLM API implementations
-      tools/                Consolidated tool modules (action-param pattern)
-      session_manager/      Conversation persistence
-      telegram/             Bot polling, sending, media
-      channels/             Channel abstraction (cli, telegram)
-      cron/                 Scheduled task execution
-      subagents/            Background agent spawning
-
-    lib/                    MicroPython support libraries
-      wifi.py               WiFi + NVS credential management
-      httpclient.py         HTTP client (get, post, stream)
-      sys/                  Logging, background tasks, board detection
-
-    stubs/                  Desktop compatibility stubs
-    data/                   Runtime data (sessions, memory, cron)
-
-  web/                      Nuxt web UI (PWA dashboard, config, files, provisioning)
+  agent-esp32/              Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
+    boards/                 Per-board TOML manifests (devkitc, sdcard, guition-p4)
+    bootloaders/            Vendored ESP-IDF bootloaders
+    src/                    Rust source (see CLAUDE.md)
+    justfile                Multi-board build commands
+  agent-esp32-smoke/        Minimal reference crate for porting to new chips
+  web/                      Nuxt web UI (PWA dashboard, config editor, file manager, provisioning)
+  scripts/                  Build helpers (build-rust-firmware.sh)
+  docs/                     Specs, plans, design documents
 ```
 
 ## Configuration
 
-For ESP32, configuration is handled through the hosted web UI — the Config page edits `config.json` on the device directly over your local network. The provisioning wizard sets up the initial provider and API key.
-
-For desktop, copy `firmware/config.example.json` to `firmware/config.json` and edit it. Example:
+Configuration is handled through the web UI — the Config page edits the device's stored config directly over your local network. The provisioning wizard sets up the initial provider and API key. Example shape:
 
 ```json
 {
@@ -138,23 +96,23 @@ For desktop, copy `firmware/config.example.json` to `firmware/config.json` and e
 }
 ```
 
-Multiple providers can be configured. The `default` key selects which one to use. Provider `base_url` determines the wire format: Gemini URLs use Gemini native format, everything else uses OpenAI-compatible format (`POST /chat/completions` with Bearer auth). This means any OpenAI-compatible API (DeepSeek, Groq, Ollama, etc.) works out of the box.
+Multiple providers can be configured. The `default` key selects which one to use. Provider `base_url` determines the wire format: Gemini URLs use Gemini's native format, everything else uses OpenAI-compatible format (`POST /chat/completions` with Bearer auth). Any OpenAI-compatible API (DeepSeek, Groq, Ollama, etc.) works out of the box.
 
 ## Cloud Persistence
 
-The ESP32 is a $3 microcontroller with limited, wear-prone flash storage. Filesystem corruption from power loss, firmware reflashes, or flash wear is a real risk. ZenClaw mitigates this with automatic write-through replication to S3-compatible cloud storage.
+The ESP32 has limited, wear-prone flash storage. Filesystem corruption from power loss, firmware reflashes, or flash wear is a real risk. ZenClaw mitigates this with automatic write-through replication to S3-compatible cloud storage.
 
 **How it works:**
 
-1. **Boot restore**: On startup, `pull_from_cloud()` downloads any local files missing from `data/` — sessions, memory, cron jobs, user files
-2. **Background sync**: A worker uploads dirty files every 30 seconds. Local writes happen at full speed; replication is asynchronous
-3. **Initial backup**: On first boot with sync configured, all existing local files are uploaded to the cloud bucket
+1. **Boot restore**: On startup, missing local files are downloaded from the bucket — sessions, memory, cron jobs, user files
+2. **Background sync**: Dirty files replicate to the bucket asynchronously. Local writes happen at full speed
+3. **Initial backup**: On first boot with sync configured, all existing local files are uploaded
 
-**Supported providers**: Any S3-compatible service — Cloudflare R2 (10 GB free tier), Backblaze B2, AWS S3, MinIO, etc.
+**Supported providers**: any S3-compatible service — Cloudflare R2 (10 GB free tier), Backblaze B2, AWS S3, MinIO, etc.
 
-**What gets synced**: Sessions (`data/sessions/`), vector memory (`data/memory/`), cron jobs (`data/cron/`), and user files. Binary files (`.bin`, `.pyc`) and generated images are excluded. Files over 512 KB are skipped to conserve memory.
+**What gets synced**: sessions, memory, cron jobs, and user files. Generated binaries and images are excluded.
 
-**Config** (add to `config.json`):
+Configure storage via the web UI's Config page or POST to `/api/config`:
 
 ```json
 {
@@ -168,11 +126,11 @@ The ESP32 is a $3 microcontroller with limited, wear-prone flash storage. Filesy
 }
 ```
 
-Agent system data is stored under a `sys/` prefix in the bucket (stripped transparently). User files uploaded via the file manager or `storage(action="write")` tool go to the bucket root. The web UI provides a cloud file browser with presigned URLs for direct browser-to-bucket uploads and downloads.
+Agent system data is stored under a `sys/` prefix in the bucket (stripped transparently). User files uploaded via the file manager go to the bucket root. The web UI provides a cloud file browser with presigned URLs for direct browser-to-bucket uploads and downloads.
 
 ## Agent Identity
 
-The agent's personality and instructions live in `firmware/data/SOUL.md`. Edit this file to customize how ZenClaw behaves.
+The agent's personality and instructions live in `SOUL.md` on the device's filesystem. Edit it via the web UI's File Manager to customize how ZenClaw behaves.
 
 ## License
 

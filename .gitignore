@@ -1,16 +1,6 @@
-__pycache__/
-*.pyc
 .venv/
-*.dis
-*.mpy
 
-# Config (contains secrets — copy from config.example.json)
-/firmware/config.json
-
-# Runtime data (keep bootstrap files)
-/firmware/data/*
-!/firmware/data/SOUL.md
-!/firmware/data/AGENTS.md
+# Desktop runtime data
 /data/
 
 # Web app
