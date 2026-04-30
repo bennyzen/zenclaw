@@ -9,9 +9,10 @@
       <div>
         <h4 class="font-medium">Step 1 — Configure</h4>
         <p class="text-muted">
-          Enter your WiFi credentials and LLM API key. These are written
-          directly to the device's non-volatile storage (NVS) and persist
-          across reboots.
+          Enter your device name, LLM API key, and (for WiFi boards) your
+          network credentials. These are written directly to the device's
+          non-volatile storage (NVS) and persist across reboots. Ethernet
+          boards like the Guition P4 skip the WiFi fields — just plug in.
         </p>
       </div>
 
@@ -27,16 +28,19 @@
       <div>
         <h4 class="font-medium">Step 3 — Connect</h4>
         <p class="text-muted">
-          After flashing, the device boots, connects to WiFi, and becomes
-          reachable at <code>devicename.local</code>. Return to the dashboard
-          and enter the hostname to connect.
+          After flashing, the device boots, joins the network (WiFi for S3,
+          Ethernet for P4), and becomes reachable at
+          <code>devicename.local</code>. Return to the dashboard and enter
+          the hostname to connect.
         </p>
       </div>
     </div>
 
     <UCallout icon="i-lucide-cpu" title="Hardware">
-      ZenClaw targets the ESP32-S3 with native USB support. These boards cost
-      $3–8 and are widely available. Look for "ESP32-S3" with USB-OTG support.
+      ZenClaw runs on ESP32-S3 (WiFi, native USB, $3–8 — look for USB-OTG
+      support) or ESP32-P4 (wired Ethernet, more horsepower — e.g.&nbsp;the
+      Guition JC-ESP32P4-M3-DEV). Pick your board in the wizard; it verifies
+      the connected chip matches before flashing.
     </UCallout>
 
     <UCallout icon="i-lucide-alert-triangle" color="warning" title="Troubleshooting">

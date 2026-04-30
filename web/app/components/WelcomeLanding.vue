@@ -30,12 +30,13 @@ async function connect() {
 <template>
   <div class="max-w-2xl mx-auto space-y-8">
     <div class="text-center space-y-3">
-      <img :src="`${$config.app.baseURL}zenclaw.webp`" alt="ZenClaw on ESP32-S3" class="mx-auto rounded-lg w-full" />
+      <img :src="`${$config.app.baseURL}zenclaw.webp`" alt="ZenClaw on ESP32" class="mx-auto rounded-lg w-full" />
       <h1 class="text-4xl font-bold">ZenClaw</h1>
       <p class="text-xl text-muted">AI agent on a $3 microcontroller</p>
       <p class="text-sm text-dimmed max-w-lg mx-auto">
         ZenClaw runs a full AI agent loop with tool use, memory, and multi-channel
-        messaging on an ESP32-S3. Chat via Telegram, web, or serial — the agent
+        messaging on ESP32-S3 (WiFi, from $3) or ESP32-P4 (Ethernet, more
+        horsepower). Chat via Telegram or the built-in web UI — the agent
         handles the rest.
       </p>
     </div>
@@ -48,8 +49,8 @@ async function connect() {
             <h3 class="font-semibold">Provision a new device</h3>
           </div>
           <p class="text-sm text-muted">
-            Flash firmware and configure a new ESP32-S3 from your browser using
-            Web Serial.
+            Flash firmware and configure a new ESP32-S3 or ESP32-P4 from your
+            browser using Web Serial.
           </p>
           <UButton to="/provision" label="Get Started" icon="i-lucide-arrow-right" trailing />
         </div>
@@ -98,15 +99,15 @@ async function connect() {
         <div class="flex items-start gap-2 p-3 rounded-lg bg-elevated/50">
           <UIcon name="i-lucide-cpu" class="text-primary mt-0.5 shrink-0" />
           <div>
-            <p class="text-sm font-medium">ESP32-S3 board</p>
-            <p class="text-xs text-dimmed">$3-8 on AliExpress</p>
+            <p class="text-sm font-medium">ESP32-S3 or P4 board</p>
+            <p class="text-xs text-dimmed">S3 from $3, or P4 with Ethernet</p>
           </div>
         </div>
         <div class="flex items-start gap-2 p-3 rounded-lg bg-elevated/50">
           <UIcon name="i-lucide-wifi" class="text-primary mt-0.5 shrink-0" />
           <div>
-            <p class="text-sm font-medium">WiFi network</p>
-            <p class="text-xs text-dimmed">2.4 GHz, same network as this browser</p>
+            <p class="text-sm font-medium">Network</p>
+            <p class="text-xs text-dimmed">2.4 GHz WiFi (S3) or wired Ethernet (P4)</p>
           </div>
         </div>
         <div class="flex items-start gap-2 p-3 rounded-lg bg-elevated/50">
