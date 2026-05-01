@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use async_trait::async_trait;
 
@@ -150,11 +150,29 @@ impl Runner {
         info!(model = %model, provider = %self.config.providers.default, "LLM call");
 
         let chat_req = build_chat_request(messages, tools);
+
+        // TEMP DIAGNOSTIC: dump first request body to disk so we can diff
+        // against a known-working raw HTTP probe.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DUMPED: AtomicBool = AtomicBool::new(false);
+            if !DUMPED.swap(true, Ordering::SeqCst) {
+                if let Ok(json) = serde_json::to_string_pretty(&chat_req) {
+                    let _ = std::fs::write("/tmp/zai_actual_request.json", json);
+                    info!("dumped chat_req to /tmp/zai_actual_request.json");
+                }
+            }
+        }
+
+        // TEMP DIAGNOSTIC: enable raw response body capture so parse_chat_response
+        // can dump it on the failure signature (text non-empty, 0 tool_calls).
+        let chat_options = genai::chat::ChatOptions::default().with_capture_raw_body(true);
+
         let mut last_error = None;
         let mut backoff_ms = INITIAL_BACKOFF_MS;
 
         for attempt in 1..=MAX_RETRIES {
-            match self.client.exec_chat(&model, chat_req.clone(), None).await {
+            match self.client.exec_chat(&model, chat_req.clone(), Some(&chat_options)).await {
                 Ok(response) => {
                     if attempt > 1 {
                         info!(attempt, "LLM call succeeded after retry");
@@ -238,6 +256,29 @@ impl Runner {
         } else {
             None
         };
+
+        info!(
+            shape = "stream",
+            text_len = acc_text.len(),
+            tool_calls = our_tcs.len(),
+            "LLM response shape"
+        );
+        probe_tool_call_leak(&acc_text, "stream");
+
+        // GLM-5.1 leak recovery (see recover_glm_tool_calls() doc).
+        if our_tcs.is_empty() && acc_text.contains(GLM_OPEN) {
+            if let Some(recovered) = recover_glm_tool_calls(&acc_text) {
+                warn!(
+                    count = recovered.len(),
+                    "recovered GLM-leaked tool calls from streamed content"
+                );
+                return Ok(LlmResponse::ToolCalls {
+                    tool_calls: recovered,
+                    provider_data: None,
+                });
+            }
+            warn!("GLM markup detected in stream but recovery failed");
+        }
 
         if our_tcs.is_empty() {
             Ok(LlmResponse::Text(acc_text))
@@ -344,10 +385,36 @@ fn build_chat_request(
     req
 }
 
+// --- Diagnostic: detect GLM XML tool-call markup leaking into Text content ---
+//
+// genai's `zai` adapter is a thin pass-through over the OpenAI adapter; it
+// expects z.ai's server-side parser to have already converted GLM's native
+// `<tool_call>...</tool_call>` XML into OpenAI-shape structured tool_calls.
+// If the marker shows up in Text content we know the parser leaked.
+// Background: memory/project_compound_turn_handoff.md (Step 0).
+#[cfg(feature = "desktop")]
+fn probe_tool_call_leak(text: &str, source: &str) {
+    if let Some(idx) = text.find("<tool_call") {
+        let start = idx.saturating_sub(60);
+        let end = (idx + 200).min(text.len());
+        let excerpt = &text[start..end];
+        warn!(
+            source,
+            marker_offset = idx,
+            text_len = text.len(),
+            excerpt = %excerpt,
+            "glm_leak_probe: <tool_call> markup in Text content (server parser bypass)"
+        );
+    }
+}
+
 // --- Convert genai response to our types ---
 
 #[cfg(feature = "desktop")]
 fn parse_chat_response(response: genai::chat::ChatResponse) -> Result<LlmResponse, RunnerError> {
+    // Pull captured raw body off before consuming the response.
+    let raw_body = response.captured_raw_body.clone();
+
     let text = response.first_text().map(|s| s.to_string());
     let tool_calls_raw = response.into_tool_calls();
     let our_tcs = convert_tool_calls(&tool_calls_raw);
@@ -356,6 +423,53 @@ fn parse_chat_response(response: genai::chat::ChatResponse) -> Result<LlmRespons
     } else {
         None
     };
+
+    let text_len = text.as_ref().map(|t| t.len()).unwrap_or(0);
+    let tc_count = our_tcs.len();
+    info!(
+        shape = "non_stream",
+        text_len,
+        tool_calls = tc_count,
+        "LLM response shape"
+    );
+    if let Some(ref t) = text {
+        probe_tool_call_leak(t, "non_stream");
+    }
+
+    // GLM-5.1 leak recovery: when z.ai's coding-plan endpoint fails to convert
+    // GLM-native tool-call markup to OpenAI tool_calls, parse the leaked
+    // markup ourselves. See recover_glm_tool_calls() doc.
+    if tc_count == 0 {
+        if let Some(ref t) = text {
+            if t.contains(GLM_OPEN) {
+                match recover_glm_tool_calls(t) {
+                    Some(recovered) => {
+                        warn!(
+                            count = recovered.len(),
+                            "recovered GLM-leaked tool calls from content"
+                        );
+                        return Ok(LlmResponse::ToolCalls {
+                            tool_calls: recovered,
+                            provider_data: None,
+                        });
+                    }
+                    None => {
+                        if let Some(body) = raw_body.as_ref() {
+                            if let Ok(s) = serde_json::to_string_pretty(body) {
+                                use std::sync::atomic::{AtomicUsize, Ordering};
+                                static SEQ: AtomicUsize = AtomicUsize::new(0);
+                                let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+                                let path =
+                                    format!("/tmp/zai_unrecovered_glm_leak_{:03}.json", seq);
+                                let _ = std::fs::write(&path, s);
+                                warn!(path, "GLM markup detected but recovery failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     match (text, our_tcs.is_empty()) {
         (Some(t), true) if !t.is_empty() => Ok(LlmResponse::Text(t)),
@@ -386,6 +500,167 @@ fn convert_tool_calls(tool_calls: &[genai::chat::ToolCall]) -> Vec<ToolCall> {
             },
         })
         .collect()
+}
+
+// --- GLM-5.1 native tool-call markup recovery ---
+//
+// z.ai's coding-plan endpoint sometimes fails to convert GLM's native
+// tool-call markup to OpenAI tool_calls and leaks the raw markup into the
+// `content` field. Format observed:
+//   <tool_call家政>裳FUNC(KWARGS)裳FUNC(KWARGS)...</tool_call家政>
+// The closing tag is sometimes truncated. KWARGS uses Python-like kwargs
+// syntax with JSON-encoded string values: key="value", key2="value2".
+//
+// `家政` (housekeeping) and `裳` (garment) are deliberately rare CJK
+// ideographs chosen by GLM as delimiters that won't collide with text.
+
+#[cfg(feature = "desktop")]
+const GLM_OPEN: &str = "<tool_call家政>";
+#[cfg(feature = "desktop")]
+const GLM_CLOSE: &str = "</tool_call家政>";
+#[cfg(feature = "desktop")]
+const GLM_PREFIX: &str = "裳";
+
+#[cfg(feature = "desktop")]
+fn recover_glm_tool_calls(content: &str) -> Option<Vec<ToolCall>> {
+    let open_idx = content.find(GLM_OPEN)?;
+    let mut body = &content[open_idx + GLM_OPEN.len()..];
+    if let Some(close_idx) = body.rfind(GLM_CLOSE) {
+        body = &body[..close_idx];
+    }
+
+    let mut calls = Vec::new();
+    for chunk in body.split(GLM_PREFIX) {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let parsed = parse_glm_call(chunk, calls.len())?;
+        calls.push(parsed);
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn parse_glm_call(chunk: &str, idx: usize) -> Option<ToolCall> {
+    let lparen = chunk.find('(')?;
+    let name = chunk[..lparen].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let after_lparen = &chunk[lparen + 1..];
+    let close_offset = find_top_level_close_paren(after_lparen)?;
+    let kwargs_str = &after_lparen[..close_offset];
+
+    let args_json = parse_glm_kwargs(kwargs_str)?;
+    let arguments = serde_json::to_string(&args_json).ok()?;
+    Some(ToolCall {
+        id: format!("call_glm_{}", idx),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments,
+        },
+    })
+}
+
+/// Find the offset of the first `)` that is not inside a JSON string literal.
+#[cfg(feature = "desktop")]
+fn find_top_level_close_paren(s: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b')' => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Parse `key1="value1", key2="value2"` into a JSON object. Values are
+/// JSON-decoded (so escaped quotes and unicode escapes work). Unquoted
+/// values are best-effort: try as JSON literal (number/bool/null), fall
+/// back to string.
+#[cfg(feature = "desktop")]
+fn parse_glm_kwargs(s: &str) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    for seg in split_top_level_commas(s) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let eq = seg.find('=')?;
+        let key = seg[..eq].trim();
+        if key.is_empty() {
+            return None;
+        }
+        let val = seg[eq + 1..].trim();
+        let parsed: serde_json::Value = if val.starts_with('"') {
+            serde_json::from_str(val).ok()?
+        } else {
+            serde_json::from_str(val)
+                .unwrap_or_else(|_| serde_json::Value::String(val.to_string()))
+        };
+        obj.insert(key.to_string(), parsed);
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
+}
+
+/// Split on commas that are not inside JSON string literals.
+#[cfg(feature = "desktop")]
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b',' => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    if start <= s.len() {
+        out.push(&s[start..]);
+    }
+    out
 }
 
 #[cfg(feature = "desktop")]
@@ -454,5 +729,73 @@ mod tests {
     fn test_message_content_as_text() {
         let text = MessageContent::Text("hello".to_string());
         assert_eq!(text.as_text(), "hello");
+    }
+
+    // --- GLM-5.1 tool-call recovery parser ---
+    //
+    // z.ai's coding-plan endpoint sometimes fails to convert the model's
+    // native tool-call markup to OpenAI tool_calls and leaks the raw
+    // markup into the `content` field. recover_glm_tool_calls() parses
+    // that markup back into structured ToolCalls.
+    //
+    // Format observed in captured leaks:
+    //   <tool_call家政>裳FUNC(KWARGS)裳FUNC(KWARGS)...</tool_call家政>
+    // The closing token is sometimes truncated. KWARGS uses Python kwargs
+    // syntax with JSON-encoded string values: key="value", key2="value2".
+
+    #[test]
+    fn test_recover_glm_three_parallel_file_reads() {
+        let content = "The root directory has three `.md` files: `AGENTS.md`, `MEMORY.md`, and `SOUL.md`. Let me read all of them now. <tool_call家政>裳file(action=\"read\", path=\"AGENTS.md\")裳file(action=\"read\", path=\"MEMORY.md\")裳file(action=\"read\", path=\"SOUL.md\")";
+        let calls = recover_glm_tool_calls(content).expect("expected recovered calls");
+        assert_eq!(calls.len(), 3);
+        for (i, fname) in ["AGENTS.md", "MEMORY.md", "SOUL.md"].iter().enumerate() {
+            assert_eq!(calls[i].function.name, "file");
+            let args: serde_json::Value =
+                serde_json::from_str(&calls[i].function.arguments).expect("args parse");
+            assert_eq!(args["action"], "read");
+            assert_eq!(args["path"], *fname);
+        }
+    }
+
+    #[test]
+    fn test_recover_glm_with_closing_tag_and_apostrophes() {
+        // Sample 011 — three memory.save calls with comma-rich content that
+        // includes an apostrophe ("agent's"); also has the closing tag.
+        let content = "Now I have all three files. <tool_call家政>裳memory(action=\"save\", tags=\"summary,SOUL.md,project_root\", content=\"SOUL.md summary: Defines the agent's identity as ZenClaw.\")</tool_call家政>";
+        let calls = recover_glm_tool_calls(content).expect("expected recovered calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "memory");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args parse");
+        assert_eq!(args["action"], "save");
+        assert_eq!(args["tags"], "summary,SOUL.md,project_root");
+        assert_eq!(
+            args["content"],
+            "SOUL.md summary: Defines the agent's identity as ZenClaw."
+        );
+    }
+
+    #[test]
+    fn test_recover_glm_no_markup_returns_none() {
+        assert!(recover_glm_tool_calls("plain text reply, no markup").is_none());
+        assert!(recover_glm_tool_calls("").is_none());
+    }
+
+    #[test]
+    fn test_recover_glm_handles_escaped_quotes_in_value() {
+        let content = "<tool_call家政>裳memory(action=\"save\", content=\"He said \\\"hello\\\" loudly\")</tool_call家政>";
+        let calls = recover_glm_tool_calls(content).expect("expected recovered calls");
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("args parse");
+        assert_eq!(args["content"], "He said \"hello\" loudly");
+    }
+
+    #[test]
+    fn test_recover_glm_malformed_returns_none() {
+        // No closing paren on first call — parser should give up rather than
+        // emit garbage.
+        let content = "<tool_call家政>裳file(action=\"read\", path=\"AGENTS.md\"";
+        assert!(recover_glm_tool_calls(content).is_none());
     }
 }
