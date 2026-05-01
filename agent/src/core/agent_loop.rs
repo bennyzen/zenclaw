@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use log::{info, error};
 
+use crate::core::chat_events::{try_send, ChatEvent, Sender as EventSender};
 use crate::core::runner::{LlmRunner, RunnerError};
 use crate::core::tool_loop::{LoopDetector, LoopLevel};
 use crate::core::tools::{ToolContext, ToolRegistry};
@@ -32,6 +33,7 @@ pub async fn run_loop(
     ctx: &ToolContext,
     cancel: Option<&AtomicBool>,
     model_override: Option<&str>,
+    events: Option<&EventSender>,
 ) -> Result<String, AgentLoopError> {
     let tool_defs = tools.definitions();
     let mut consecutive_errors: usize = 0;
@@ -46,7 +48,15 @@ pub async fn run_loop(
         if let Some(flag) = cancel {
             if flag.load(Ordering::Relaxed) {
                 info!("Agent loop cancelled before LLM call");
-                return Ok("Operation cancelled.".to_string());
+                let cancelled = "Operation cancelled.".to_string();
+                try_send(
+                    events,
+                    ChatEvent::AssistantText {
+                        text: cancelled.clone(),
+                        is_final: true,
+                    },
+                );
+                return Ok(cancelled);
             }
         }
 
@@ -58,7 +68,10 @@ pub async fn run_loop(
         let effective_tools: &[_] = if in_tool_loop { &[] } else { &tool_defs };
 
         // Call LLM
-        let response = match runner.call(messages, effective_tools, model_override).await {
+        try_send(events, ChatEvent::ThinkingStarted);
+        let call_result = runner.call(messages, effective_tools, model_override).await;
+        try_send(events, ChatEvent::ThinkingEnded);
+        let response = match call_result {
             Ok(r) => {
                 consecutive_errors = 0;
                 r
@@ -121,6 +134,15 @@ pub async fn run_loop(
                     continue;
                 }
 
+                if !text.is_empty() {
+                    try_send(
+                        events,
+                        ChatEvent::AssistantText {
+                            text: text.clone(),
+                            is_final: true,
+                        },
+                    );
+                }
                 return Ok(text);
             }
             LlmResponse::ToolCalls { tool_calls, provider_data } => {
@@ -137,6 +159,7 @@ pub async fn run_loop(
                     ctx,
                     cancel,
                     &mut loop_detector,
+                    events,
                 )
                 .await?;
                 in_tool_loop = true;
@@ -155,6 +178,7 @@ pub async fn run_loop(
                     ctx,
                     cancel,
                     &mut loop_detector,
+                    events,
                 )
                 .await?;
                 in_tool_loop = true;
@@ -315,6 +339,7 @@ async fn execute_tool_calls(
     ctx: &ToolContext,
     cancel: Option<&AtomicBool>,
     loop_detector: &mut LoopDetector,
+    events: Option<&EventSender>,
 ) -> Result<(), AgentLoopError> {
     // provider_data carries thought_signatures from Gemini; attach to first tool call's message
     let mut remaining_provider_data = provider_data;
@@ -324,16 +349,35 @@ async fn execute_tool_calls(
         let args: serde_json::Value =
             serde_json::from_str(&tc.function.arguments).unwrap_or_default();
 
+        try_send(
+            events,
+            ChatEvent::ToolCallStarted {
+                id: tc.id.clone(),
+                name: name.clone(),
+                args: args.clone(),
+            },
+        );
+
         // Check loop detector
         if let Some(check) = loop_detector.check(name, &args) {
             if check.level == LoopLevel::Critical {
                 // Block execution — add error result
+                let msg = check.message.clone();
                 push_tool_exchange(
                     messages,
                     tc,
                     assistant_text,
-                    &check.message,
+                    &msg,
                     remaining_provider_data.take(),
+                );
+                try_send(
+                    events,
+                    ChatEvent::ToolCallFinished {
+                        id: tc.id.clone(),
+                        ok: false,
+                        result: None,
+                        error: Some(msg),
+                    },
                 );
                 info!("Loop detector blocked tool call: {} ({})", name, check.detector);
                 continue;
@@ -351,7 +395,17 @@ async fn execute_tool_calls(
         // Check cancellation
         if let Some(flag) = cancel {
             if flag.load(Ordering::Relaxed) {
-                push_tool_exchange(messages, tc, assistant_text, "Skipped: operation cancelled.", remaining_provider_data.take());
+                let msg = "Skipped: operation cancelled.";
+                push_tool_exchange(messages, tc, assistant_text, msg, remaining_provider_data.take());
+                try_send(
+                    events,
+                    ChatEvent::ToolCallFinished {
+                        id: tc.id.clone(),
+                        ok: false,
+                        result: None,
+                        error: Some(msg.to_string()),
+                    },
+                );
                 info!("Tool skipped — cancelled: {}", name);
                 continue;
             }
@@ -372,9 +426,32 @@ async fn execute_tool_calls(
         // that garbage back hallucinated. The new rule: if the result is too
         // big, the LLM gets a clear error it can act on (narrow scope,
         // paginate, etc.) instead of corrupted bytes.
+        let was_capped = result_str.len() > MAX_TOOL_RESULT_BYTES;
         let payload = cap_or_refuse(result_str, MAX_TOOL_RESULT_BYTES);
 
         push_tool_exchange(messages, tc, assistant_text, &payload, remaining_provider_data.take());
+
+        if was_capped {
+            try_send(
+                events,
+                ChatEvent::ToolCallFinished {
+                    id: tc.id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(payload.clone()),
+                },
+            );
+        } else {
+            try_send(
+                events,
+                ChatEvent::ToolCallFinished {
+                    id: tc.id.clone(),
+                    ok: true,
+                    result: Some(payload.clone()),
+                    error: None,
+                },
+            );
+        }
 
         info!(
             "Tool executed: {} (raw={}B, sent={}B)",

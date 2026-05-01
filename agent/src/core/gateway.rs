@@ -5,6 +5,7 @@ use log::info;
 
 use crate::config::Config;
 use crate::core::agent_loop;
+use crate::core::chat_events::{try_send, ChatEvent, Sender as EventSender};
 use crate::core::compaction;
 use crate::core::prompt;
 use crate::core::runner::LlmRunner;
@@ -47,6 +48,20 @@ impl Gateway {
         chat_id: &str,
         message: &str,
         channel: &str,
+    ) -> Result<String, GatewayError> {
+        self.chat_with_events(chat_id, message, channel, None).await
+    }
+
+    /// Variant of `chat` that streams typed events to a caller-supplied
+    /// channel. The REST entry point passes `None`; the WS handler passes a
+    /// sender whose receiver runs on a forwarder thread that converts each
+    /// event into a JSON WebSocket frame.
+    pub async fn chat_with_events(
+        &self,
+        chat_id: &str,
+        message: &str,
+        channel: &str,
+        events: Option<&EventSender>,
     ) -> Result<String, GatewayError> {
         // Cancel any running turn on this chat
         let cancel = {
@@ -164,16 +179,31 @@ impl Gateway {
         info!("GW: agent_loop msgs={}", messages.len());
 
         // Run agent loop
-        let result = agent_loop::run_loop(
+        let loop_result = agent_loop::run_loop(
             &mut messages,
             &self.tools,
             self.runner.as_ref(),
             &ctx,
             Some(cancel.as_ref()),
             model_override.as_deref(),
+            events,
         )
-        .await
-        .map_err(|e| GatewayError::AgentLoop(e.to_string()))?;
+        .await;
+
+        let result = match loop_result {
+            Ok(r) => r,
+            Err(e) => {
+                let err_str = e.to_string();
+                try_send(
+                    events,
+                    ChatEvent::Error {
+                        error: err_str.clone(),
+                    },
+                );
+                self.active_chats.lock().unwrap().remove(chat_id);
+                return Err(GatewayError::AgentLoop(err_str));
+            }
+        };
 
         info!("GW: reply {}B", result.len());
 
@@ -208,6 +238,8 @@ impl Gateway {
 
         // Remove from active chats
         self.active_chats.lock().unwrap().remove(chat_id);
+
+        try_send(events, ChatEvent::Done);
 
         Ok(result)
     }
