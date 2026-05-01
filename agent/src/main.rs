@@ -723,7 +723,10 @@ a{{color:#60a5fa;text-decoration:none}}
     // --- /api/chat/history (GET) ---
     let gw = gateway.clone();
     server.fn_handler::<anyhow::Error, _>("/api/chat/history", Method::Get, move |req| {
-        // Simple: return empty for now, sessions work via JSONL on flash
+        use zenclaw_agent::core::chat_events::ChatEvent;
+        use zenclaw_agent::core::sessions::SessionEntry;
+        use zenclaw_agent::core::types::Role;
+
         let uri = req.uri();
         let chat_id = uri.split("chat_id=")
             .nth(1)
@@ -731,23 +734,67 @@ a{{color:#60a5fa;text-decoration:none}}
             .unwrap_or("web");
 
         let branch = gw.sessions.get_branch(chat_id).unwrap_or_default();
-        let mut messages: Vec<serde_json::Value> = Vec::new();
+
+        // Synthesize the same `ChatEvent` stream a live turn would produce.
+        // Lossy on tool ok/err (the JSONL doesn't record an explicit success
+        // flag — historical tool finishes always emit `ok: true`).
+        let mut events: Vec<ChatEvent> = Vec::new();
         for entry in &branch {
-            if let zenclaw_agent::core::sessions::SessionEntry::Message { role, content, .. } = entry {
-                let role_str = match role {
-                    zenclaw_agent::core::types::Role::User => "user",
-                    zenclaw_agent::core::types::Role::Assistant => "assistant",
-                    _ => continue,
-                };
-                if content.is_empty() { continue; }
-                messages.push(serde_json::json!({"role": role_str, "content": content}));
+            let SessionEntry::Message { role, content, tool_calls, tool_call_id, .. } = entry else {
+                continue;
+            };
+            match role {
+                Role::User => {
+                    if !content.is_empty() {
+                        events.push(ChatEvent::UserMessage {
+                            chat_id: chat_id.to_string(),
+                            text: content.clone(),
+                        });
+                    }
+                }
+                Role::Assistant => {
+                    if let Some(calls) = tool_calls {
+                        for tc in calls {
+                            let args: serde_json::Value =
+                                serde_json::from_str(&tc.function.arguments)
+                                    .unwrap_or(serde_json::Value::Null);
+                            events.push(ChatEvent::ToolCallStarted {
+                                id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                args,
+                            });
+                        }
+                    } else if !content.is_empty() {
+                        events.push(ChatEvent::AssistantText {
+                            text: content.clone(),
+                            is_final: true,
+                        });
+                    }
+                }
+                Role::Tool => {
+                    if let Some(id) = tool_call_id {
+                        events.push(ChatEvent::ToolCallFinished {
+                            id: id.clone(),
+                            ok: true,
+                            result: Some(content.clone()),
+                            error: None,
+                        });
+                    }
+                }
+                Role::System => {}
             }
         }
-        // Keep last 50
-        if messages.len() > 50 {
-            messages = messages.split_off(messages.len() - 50);
+
+        // Cap to last N events. 200 is generous (≈ 40 user turns with
+        // mid-single-digit tool calls each); the wire format is JSON so
+        // the cap is mostly about response size, not memory.
+        const MAX_EVENTS: usize = 200;
+        if events.len() > MAX_EVENTS {
+            let start = events.len() - MAX_EVENTS;
+            events = events.into_iter().skip(start).collect();
         }
-        let body = serde_json::json!({"messages": messages}).to_string();
+
+        let body = serde_json::json!({"events": events}).to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(body.as_bytes())?;
         Ok(())
@@ -1190,8 +1237,19 @@ a{{color:#60a5fa;text-decoration:none}}
     }
 
     // --- WS /ws/chat (streaming chat) ---
+    //
+    // Inbound frames are typed `ChatEvent`s from the browser:
+    //   - `user_message` — start a turn, stream typed events back.
+    //   - `cancel`       — abort the active turn for this chat_id.
+    //
+    // For a `user_message`: spawn a forwarder thread that owns the detached
+    // WS sender, plus a worker thread that runs `gateway.chat_with_events`
+    // and emits to a `mpsc::Sender<ChatEvent>`. Forwarder drains the receiver
+    // and writes each event as a JSON text frame; exits when the worker drops
+    // its sender (turn finished).
     {
         use embedded_svc::ws::FrameType;
+        use zenclaw_agent::core::chat_events::ChatEvent;
         let gw_ws = gateway.clone();
         server.ws_handler::<_, anyhow::Error>("/ws/chat", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() { return Ok(()); }
@@ -1204,35 +1262,90 @@ a{{color:#60a5fa;text-decoration:none}}
             let (_ft, len) = ws.recv(&mut buf)?;
             if len == 0 { return Ok(()); }
             buf.truncate(len);
-            let sender = ws.create_detached_sender()?;
-            let gw = gw_ws.clone();
-            std::thread::Builder::new()
-                .name("ws-chat".into())
-                .stack_size(32768)
-                .spawn(move || {
-                    let mut sender = sender;
-                    let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
-                    let message = parsed.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                    let chat_id = parsed.get("chat_id").and_then(|c| c.as_str()).unwrap_or("web");
-                    if message.is_empty() {
-                        let _ = sender.send(FrameType::Text(false), br#"{"type":"error","error":"no message"}"#);
-                        return;
-                    }
-                    log::info!("WS chat: chat_id={} msg_len={}", chat_id, message.len());
-                    led_status::set(Led::Thinking);
-                    match esp_idf_svc::hal::task::block_on(gw.chat(chat_id, message, "api")) {
-                        Ok(reply) => {
-                            let msg = serde_json::json!({"type": "done", "text": reply});
-                            let _ = sender.send(FrameType::Text(false), msg.to_string().as_bytes());
+
+            let evt: ChatEvent = match serde_json::from_slice(&buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("WS chat: invalid frame ({}B): {}", buf.len(), e);
+                    return Ok(());
+                }
+            };
+
+            match evt {
+                ChatEvent::UserMessage { chat_id, text } => {
+                    if text.is_empty() {
+                        let mut sender = ws.create_detached_sender()?;
+                        let err = ChatEvent::Error { error: "Empty message".to_string() };
+                        if let Ok(json) = serde_json::to_string(&err) {
+                            let _ = sender.send(FrameType::Text(false), json.as_bytes());
                         }
-                        Err(e) => {
-                            log::error!("WS chat error: {}", e);
-                            let msg = serde_json::json!({"type": "error", "error": e.to_string()});
-                            let _ = sender.send(FrameType::Text(false), msg.to_string().as_bytes());
-                        }
+                        return Ok(());
                     }
-                    led_status::set(Led::Idle);
-                }).ok();
+                    log::info!("WS chat: chat_id={} msg_len={}", chat_id, text.len());
+
+                    let sender = ws.create_detached_sender()?;
+                    let gw = gw_ws.clone();
+
+                    // Forwarder owns the WS sender and drains events.
+                    std::thread::Builder::new()
+                        .name("ws-chat-fwd".into())
+                        .stack_size(16384)
+                        .spawn(move || {
+                            let mut sender = sender;
+                            let (tx, rx) = std::sync::mpsc::channel::<ChatEvent>();
+
+                            let gw_worker = gw.clone();
+                            let chat_id_w = chat_id.clone();
+                            let text_w = text.clone();
+                            let worker = std::thread::Builder::new()
+                                .name("ws-chat-worker".into())
+                                .stack_size(32768)
+                                .spawn(move || {
+                                    led_status::set(Led::Thinking);
+                                    let _ = esp_idf_svc::hal::task::block_on(
+                                        gw_worker.chat_with_events(
+                                            &chat_id_w, &text_w, "api", Some(&tx),
+                                        ),
+                                    );
+                                    led_status::set(Led::Idle);
+                                });
+                            if let Err(e) = worker {
+                                log::error!("WS chat: spawn worker: {}", e);
+                                return;
+                            }
+
+                            while let Ok(evt) = rx.recv() {
+                                let json = match serde_json::to_string(&evt) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        log::warn!("WS chat: serialize event: {}", e);
+                                        continue;
+                                    }
+                                };
+                                if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
+                                    // Browser disconnected — leave worker running so the
+                                    // turn still lands in session JSONL; just stop forwarding.
+                                    break;
+                                }
+                            }
+                        })
+                        .ok();
+                }
+                ChatEvent::Cancel { chat_id } => {
+                    log::info!("WS chat: cancel chat_id={}", chat_id);
+                    let gw = gw_ws.clone();
+                    std::thread::Builder::new()
+                        .name("ws-chat-cancel".into())
+                        .stack_size(8192)
+                        .spawn(move || {
+                            esp_idf_svc::hal::task::block_on(gw.cancel_chat(&chat_id));
+                        })
+                        .ok();
+                }
+                _ => {
+                    log::warn!("WS chat: unexpected inbound event type");
+                }
+            }
             Ok(())
         }).unwrap();
     }
