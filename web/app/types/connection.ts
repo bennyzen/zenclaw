@@ -4,6 +4,8 @@ export interface DeviceStatus {
   agentName: string
   version: string
   built: string
+  board: string | null
+  platform: string | null
   memory: { freeKb: number; usedKb: number; totalKb: number } | null
   temperatureC: number | null
   wifi: { connected: boolean; ip: string | null; rssi: number | null } | null

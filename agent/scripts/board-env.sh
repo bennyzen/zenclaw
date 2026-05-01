@@ -23,12 +23,14 @@ get() {
     ' "$manifest"
 }
 
+name=$(get name)
 target=$(get target)
 sdkconfig=$(get sdkconfig)
 bootloader=$(get bootloader)
 features=$(get features ,)
 baud=$(get default_baud)
 
+echo "export BOARD_NAME=\"${name:-$board}\""
 echo "export TARGET=\"$target\""
 echo "export SDKCONFIG=\"$sdkconfig\""
 echo "export BOOTLOADER=\"$bootloader\""

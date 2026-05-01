@@ -53,6 +53,8 @@ const tooltipUi = {
             <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-cpu" class="size-4" /> Device
             </div>
+            <div v-if="state.lastStatus?.board" class="flex justify-between gap-4"><span class="text-dimmed">Board</span><span>{{ state.lastStatus.board }}</span></div>
+            <div v-if="state.lastStatus?.platform" class="flex justify-between gap-4"><span class="text-dimmed">Chip</span><span>{{ state.lastStatus.platform }}</span></div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">IP</span><span>{{ state.deviceIp }}</span></div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">Protocol</span><span>{{ state.useTls ? 'HTTPS' : 'HTTP' }}</span></div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">Mode</span><span>{{ state.mode === 'both' ? 'USB + Network' : state.mode === 'serial' ? 'USB' : 'Network' }}</span></div>

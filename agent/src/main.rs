@@ -582,6 +582,7 @@ a{{color:#60a5fa;text-decoration:none}}
             "agent_name": gw.config.agent_name,
             "version": env!("CARGO_PKG_VERSION"),
             "platform": chip_label(),
+            "board": env!("ZENCLAW_BOARD"),
             "memory": {
                 "free_kb": heap_free / 1024,
                 "total_kb": heap_total / 1024,

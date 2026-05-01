@@ -60,6 +60,8 @@ function mapStatus(raw: Record<string, any>): DeviceStatus {
     agentName: raw.agent_name ?? 'Unknown',
     version: raw.version ?? 'unknown',
     built: raw.built ?? '',
+    board: raw.board && raw.board !== 'unknown' ? raw.board : null,
+    platform: raw.platform ?? null,
     memory: raw.memory
       ? {
           freeKb: raw.memory.free_kb,

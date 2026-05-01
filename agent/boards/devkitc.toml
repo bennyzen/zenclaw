@@ -1,3 +1,4 @@
+name = "DevKitC"
 chip = "esp32s3"
 target = "xtensa-esp32s3-espidf"
 sdkconfig = ["sdkconfig.defaults", "sdkconfig.board.devkitc"]

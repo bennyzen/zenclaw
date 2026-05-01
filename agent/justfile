@@ -24,6 +24,7 @@ build board *args="--release":
     fi
     CARGO_BUILD_TARGET="$TARGET" \
     ESP_IDF_SDKCONFIG_DEFAULTS="$SDKCONFIG" \
+    ZENCLAW_BOARD="$BOARD_NAME" \
         cargo build $extra_features {{args}}
 
 # Flash: just flash <board> [/dev/ttyACM0]

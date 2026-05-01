@@ -1,3 +1,4 @@
+name = "Guition P4"
 chip = "esp32p4"
 target = "riscv32imafc-esp-espidf"
 sdkconfig = ["sdkconfig.defaults", "sdkconfig.board.guition-p4"]
