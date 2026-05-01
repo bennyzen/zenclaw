@@ -34,3 +34,18 @@ export interface ConnectionState {
   lastStatus: DeviceStatus | null
   error: string | null
 }
+
+// ---------------------------------------------------------------------------
+// Chat events (mirror of agent/src/core/chat_events.rs)
+// ---------------------------------------------------------------------------
+
+export type ChatEvent =
+  | { type: 'user_message'; chat_id: string; text: string }
+  | { type: 'thinking_started' }
+  | { type: 'thinking_ended' }
+  | { type: 'tool_call_started'; id: string; name: string; args: unknown }
+  | { type: 'tool_call_finished'; id: string; ok: boolean; result?: string; error?: string }
+  | { type: 'assistant_text'; text: string; final: boolean }
+  | { type: 'done' }
+  | { type: 'error'; error: string }
+  | { type: 'cancel'; chat_id: string }

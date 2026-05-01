@@ -1,4 +1,5 @@
 import type {
+  ChatEvent,
   ConnectionState,
   DeviceStatus,
   FileEntry,
@@ -401,31 +402,64 @@ export function useConnection() {
     })
   }
 
-  function sendChatStream(
-    message: string,
-    onDelta: (text: string) => void,
-    onDone: (fullText: string) => void,
-    onError: (error: string) => void,
+  /// Open a streaming chat session over WS. Returns a handle the caller uses
+  /// to send messages, cancel turns, and close. `onEvent` fires for every
+  /// typed `ChatEvent` from the server (thinking, tool_call_*, assistant_text,
+  /// done, error). The browser-originated `user_message` and `cancel` events
+  /// are sent via `send`/`cancel`; the server never echoes them back.
+  function openChatStream(
+    onEvent: (evt: ChatEvent) => void,
     chatId = 'web',
-  ) {
+  ): {
+    send: (text: string) => void
+    cancel: () => void
+    close: () => void
+    isOpen: () => boolean
+  } {
     const url = `${wsUrl()}/ws/chat`
-    const ws = new WebSocket(url)
+    let ws: WebSocket | null = new WebSocket(url)
+    const queue: string[] = []
+    let opened = false
+
     ws.onopen = () => {
-      ws.send(JSON.stringify({ message, chat_id: chatId }))
+      opened = true
+      while (queue.length) {
+        ws?.send(queue.shift()!)
+      }
     }
     ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data)
-        if (msg.type === 'delta') onDelta(msg.text)
-        else if (msg.type === 'done') { onDone(msg.text); ws.close() }
-        else if (msg.type === 'error') { onError(msg.error); ws.close() }
-      } catch { /* ignore */ }
+        const evt = JSON.parse(event.data) as ChatEvent
+        onEvent(evt)
+      } catch { /* ignore non-JSON frames */ }
     }
-    ws.onerror = () => { onError('WebSocket connection failed'); ws.close() }
-    return ws
+    ws.onerror = () => {
+      onEvent({ type: 'error', error: 'WebSocket connection failed' })
+    }
+    ws.onclose = () => { ws = null }
+
+    function transmit(payload: string) {
+      if (!ws) return
+      if (opened) ws.send(payload)
+      else queue.push(payload)
+    }
+
+    return {
+      send: (text: string) => {
+        transmit(JSON.stringify({ type: 'user_message', chat_id: chatId, text }))
+      },
+      cancel: () => {
+        transmit(JSON.stringify({ type: 'cancel', chat_id: chatId }))
+      },
+      close: () => {
+        ws?.close()
+        ws = null
+      },
+      isOpen: () => ws !== null,
+    }
   }
 
-  async function getChatHistory(chatId = 'web', limit = 50): Promise<{ messages: { role: string; content: string }[] }> {
+  async function getChatHistory(chatId = 'web', limit = 200): Promise<{ events: ChatEvent[] }> {
     return apiFetch(`/api/chat/history?chat_id=${encodeURIComponent(chatId)}&limit=${limit}`)
   }
 
@@ -454,7 +488,7 @@ export function useConnection() {
     getWifi,
     setWifi,
     sendChat,
-    sendChatStream,
+    openChatStream,
     getChatHistory,
     restartDevice,
     wsUrl,
