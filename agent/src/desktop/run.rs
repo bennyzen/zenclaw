@@ -5,10 +5,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::core::channels::telegram::{IncomingMessage, Poller, TelegramChannel};
+use crate::core::channels::Channel;
 use crate::core::gateway::Gateway;
 use crate::core::runner::{LlmRunner, Runner};
 use crate::desktop::background::BackgroundRunner;
-use crate::desktop::telegram::{IncomingMessage, TelegramPoller};
+use crate::desktop::http_client::ReqwestHttpClient;
+use crate::platform::http_client::HttpClient;
 
 use super::{start_api_server, AppState};
 
@@ -44,14 +47,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(format!("{}/memory", data_dir))?;
     crate::core::workspace::seed_defaults(data_dir);
 
-    // Gateway: tools auto-registered via register_defaults() inside Gateway::new.
-    // Same set as ESP32 — preserves parity so optimization signals transfer.
     let config_arc = Arc::new(config.clone());
     let runner: Box<dyn LlmRunner> = Box::new(Runner::new(config_arc));
     let gateway = Gateway::new(config.clone(), data_dir, runner);
     info!("Tools registered: {}", gateway.tools.len());
 
     let gateway = Arc::new(gateway);
+    let http: Arc<dyn HttpClient> = Arc::new(ReqwestHttpClient::new());
     let start_time = Instant::now();
 
     let bg_cancel = CancellationToken::new();
@@ -71,6 +73,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if tg.enabled && !tg.bot_token.is_empty() {
             spawn_telegram_loop(
                 gateway.clone(),
+                http.clone(),
                 tg.bot_token.clone(),
                 tg.allowed_chat_ids.clone(),
             );
@@ -110,21 +113,38 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn spawn_telegram_loop(
     gateway: Arc<Gateway>,
+    http: Arc<dyn HttpClient>,
     bot_token: String,
     allowed: Option<Vec<String>>,
 ) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(32);
 
-        let poller_token = bot_token.clone();
+        // Producer: poll_once in a loop, forward messages to the consumer.
+        let producer_http = http.clone();
+        let producer_token = bot_token.clone();
         tokio::spawn(async move {
-            let mut poller = TelegramPoller::new(poller_token);
-            if let Err(e) = poller.poll_loop(tx).await {
-                error!(error = %e, "Telegram poller stopped");
+            let mut poller = Poller::new(producer_token);
+            loop {
+                match poller.poll_once(&*producer_http, 10).await {
+                    Ok(msgs) => {
+                        for msg in msgs {
+                            if tx.send(msg).await.is_err() {
+                                tracing::info!("Poller channel closed, stopping");
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Telegram poll error, retrying in 5s");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
             }
         });
 
-        let deliver_client = reqwest::Client::new();
+        // Consumer: spawn a task per inbound message so the next poll can
+        // start while a turn is still running through the gateway.
         while let Some(msg) = rx.recv().await {
             if let Some(ref ids) = allowed {
                 if !ids.contains(&msg.chat_id) {
@@ -134,41 +154,28 @@ fn spawn_telegram_loop(
             }
 
             let gw = gateway.clone();
-            let client = deliver_client.clone();
-            let token = bot_token.clone();
+            let http_for_task = http.clone();
+            let token_for_task = bot_token.clone();
             let chat_id = msg.chat_id.clone();
+            let text = msg.text.clone();
 
             tokio::spawn(async move {
-                let _ = client
-                    .post(format!(
-                        "https://api.telegram.org/bot{}/sendChatAction",
-                        token
-                    ))
-                    .json(&serde_json::json!({
-                        "chat_id": &chat_id,
-                        "action": "typing"
-                    }))
-                    .send()
-                    .await;
+                let channel = TelegramChannel::new(token_for_task, http_for_task);
 
-                match gw.chat(&chat_id, &msg.text, "telegram").await {
-                    Ok(reply) => {
-                        if let Err(e) = client
-                            .post(format!(
-                                "https://api.telegram.org/bot{}/sendMessage",
-                                token
-                            ))
-                            .json(&serde_json::json!({
-                                "chat_id": &chat_id,
-                                "text": &reply
-                            }))
-                            .send()
-                            .await
-                        {
-                            error!(error = %e, chat_id = %chat_id, "Telegram sendMessage failed");
-                        }
+                if let Err(e) = channel.send_typing(&chat_id).await {
+                    warn!(error = %e, chat_id = %chat_id, "send_typing failed");
+                }
+
+                let reply = match gw.chat(&chat_id, &text, "telegram").await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!(error = %e, chat_id = %chat_id, "Telegram chat error");
+                        format!("Error: {}", e)
                     }
-                    Err(e) => error!(error = %e, chat_id = %chat_id, "Telegram chat error"),
+                };
+
+                if let Err(e) = channel.deliver(&chat_id, &reply).await {
+                    error!(error = %e, chat_id = %chat_id, "Telegram deliver failed");
                 }
             });
         }

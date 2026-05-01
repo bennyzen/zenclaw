@@ -211,17 +211,35 @@ fn main() {
     start_http_server(gateway.clone(), nic.clone(), &ip_str, &hostname, nvs, chat_tx);
     zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
 
+    // --- Construct shared HTTP client + optional Telegram resources ---
+    let http: std::sync::Arc<dyn zenclaw_agent::platform::http_client::HttpClient> =
+        std::sync::Arc::new(zenclaw_agent::esp32::http_client::EspHttpClient::new());
+
+    let tg_resources = config_for_tg
+        .channels
+        .telegram
+        .as_ref()
+        .filter(|t| t.enabled && !t.bot_token.is_empty())
+        .map(|t| {
+            (
+                zenclaw_agent::core::channels::telegram::Poller::new(t.bot_token.clone()),
+                zenclaw_agent::core::channels::telegram::TelegramChannel::new(
+                    t.bot_token.clone(),
+                    http.clone(),
+                ),
+                t.allowed_chat_ids.clone(),
+            )
+        });
+
     // --- Start agent thread (handles both Telegram + HTTP chat) ---
     // Single 32KB thread — no extra thread needed, saves heap.
     {
         let gw = gateway.clone();
-        let bot_token = config_for_tg.channels.telegram.as_ref()
-            .filter(|t| t.enabled && !t.bot_token.is_empty())
-            .map(|t| t.bot_token.clone());
+        let http_for_thread = http.clone();
         std::thread::Builder::new()
             .name("agent".into())
             .stack_size(32768)
-            .spawn(move || agent_thread(bot_token.as_deref(), chat_rx, gw))
+            .spawn(move || agent_thread(chat_rx, gw, http_for_thread, tg_resources))
             .expect("Failed to spawn agent thread");
         log::info!("Agent thread started");
     }
@@ -1257,78 +1275,6 @@ a{{color:#60a5fa;text-decoration:none}}
     std::mem::forget(server);
 }
 
-// ---------------------------------------------------------------------------
-// Telegram poller (ESP32 — blocking HTTP via esp-idf-svc)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "esp32")]
-fn tg_api(token: &str, method: &str) -> String {
-    format!("https://api.telegram.org/bot{}/{}", token, method)
-}
-
-#[cfg(feature = "esp32")]
-fn tg_http_get(url: &str) -> Result<String, String> {
-    use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
-    use esp_idf_svc::http::Method;
-
-    // Serialize TLS access — device can only sustain one TLS context at a time
-    let _tls_guard = zenclaw_agent::TLS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-    let config = HttpConfig {
-        buffer_size: Some(1024),
-        buffer_size_tx: Some(1024),
-        timeout: Some(std::time::Duration::from_secs(30)),
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        ..Default::default()
-    };
-    let mut conn = EspHttpConnection::new(&config).map_err(|e| format!("HTTP: {}", e))?;
-    conn.initiate_request(Method::Get, url, &[]).map_err(|e| format!("req: {}", e))?;
-    conn.initiate_response().map_err(|e| format!("resp: {}", e))?;
-    let mut buf = [0u8; 2048];
-    let mut body = Vec::new();
-    loop {
-        let n = conn.read(&mut buf).map_err(|e| format!("read: {}", e))?;
-        if n == 0 { break; }
-        body.extend_from_slice(&buf[..n]);
-    }
-    drop(conn);
-    String::from_utf8(body).map_err(|e| format!("utf8: {}", e))
-}
-
-#[cfg(feature = "esp32")]
-fn tg_http_post(url: &str, json_body: &str) -> Result<String, String> {
-    use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
-    use esp_idf_svc::http::Method;
-
-    // Serialize TLS access — device can only sustain one TLS context at a time
-    let _tls_guard = zenclaw_agent::TLS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
-    let config = HttpConfig {
-        buffer_size: Some(1024),
-        buffer_size_tx: Some(1024),
-        timeout: Some(std::time::Duration::from_secs(15)),
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        ..Default::default()
-    };
-    let mut conn = EspHttpConnection::new(&config).map_err(|e| format!("HTTP: {}", e))?;
-    let len = json_body.len().to_string();
-    conn.initiate_request(Method::Post, url, &[
-        ("Content-Type", "application/json"),
-        ("Content-Length", &len),
-    ]).map_err(|e| format!("req: {}", e))?;
-    conn.write_all(json_body.as_bytes()).map_err(|e| format!("write: {}", e))?;
-    conn.initiate_response().map_err(|e| format!("resp: {}", e))?;
-    let mut buf = [0u8; 2048];
-    let mut body = Vec::new();
-    loop {
-        let n = conn.read(&mut buf).map_err(|e| format!("read: {}", e))?;
-        if n == 0 { break; }
-        body.extend_from_slice(&buf[..n]);
-    }
-    drop(conn);
-    String::from_utf8(body).map_err(|e| format!("utf8: {}", e))
-}
-
 /// A chat request sent from the httpd handler to the agent thread.
 #[cfg(feature = "esp32")]
 struct ChatRequest {
@@ -1341,13 +1287,18 @@ struct ChatRequest {
 /// Single 32KB stack thread avoids the OOM from spawning a third thread.
 #[cfg(feature = "esp32")]
 fn agent_thread(
-    bot_token: Option<&str>,
     chat_rx: std::sync::mpsc::Receiver<ChatRequest>,
     gateway: std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
+    http: std::sync::Arc<dyn zenclaw_agent::platform::http_client::HttpClient>,
+    mut tg: Option<(
+        zenclaw_agent::core::channels::telegram::Poller,
+        zenclaw_agent::core::channels::telegram::TelegramChannel,
+        Option<Vec<String>>,
+    )>,
 ) {
-    let mut tg_offset: i64 = 0;
-    let tg_enabled = bot_token.is_some();
-    if tg_enabled {
+    use zenclaw_agent::core::channels::Channel;
+
+    if tg.is_some() {
         log::info!("Agent thread: Telegram + HTTP chat");
     } else {
         log::info!("Agent thread: HTTP chat only");
@@ -1356,7 +1307,11 @@ fn agent_thread(
     loop {
         // --- Process any pending HTTP chat requests (non-blocking) ---
         while let Ok(req) = chat_rx.try_recv() {
-            log::info!("HTTP chat: chat_id={} msg_len={}", req.chat_id, req.message.len());
+            log::info!(
+                "HTTP chat: chat_id={} msg_len={}",
+                req.chat_id,
+                req.message.len()
+            );
             zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
             let result = esp_idf_svc::hal::task::block_on(
                 gateway.chat(&req.chat_id, &req.message, "api"),
@@ -1366,79 +1321,64 @@ fn agent_thread(
         }
 
         // --- Telegram poll (if enabled) ---
-        if let Some(token) = bot_token {
-            let url = format!("{}?offset={}&timeout=5", tg_api(token, "getUpdates"), tg_offset);
-            let incoming = {
-                let body = match tg_http_get(&url) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log::error!("Telegram poll: {}", e);
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                let data: serde_json::Value = match serde_json::from_str(&body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("Telegram parse: {}", e);
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                drop(body);
-
-                let mut msgs: Vec<(String, String)> = Vec::new();
-                if let Some(updates) = data.get("result").and_then(|r| r.as_array()) {
-                    for update in updates {
-                        if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
-                            if uid >= tg_offset { tg_offset = uid + 1; }
-                        }
-                        if let Some(msg) = update.get("message") {
-                            let chat_id = msg.get("chat").and_then(|c| c.get("id"))
-                                .and_then(|id| id.as_i64()).map(|id| id.to_string());
-                            let text = msg.get("text").and_then(|t| t.as_str()).map(String::from);
-                            if let (Some(cid), Some(txt)) = (chat_id, text) {
-                                msgs.push((cid, txt));
-                            }
-                        }
-                    }
+        if let Some((poller, channel, allowed)) = tg.as_mut() {
+            let messages = match esp_idf_svc::hal::task::block_on(poller.poll_once(&*http, 10)) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("Telegram poll: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
                 }
-                msgs
             };
 
-            for (chat_id, text) in incoming {
-                log::info!("Telegram msg from {}: {}B", chat_id, text.len());
-                let typing = format!(r#"{{"chat_id":"{}","action":"typing"}}"#, chat_id);
-                let _ = tg_http_post(&tg_api(token, "sendChatAction"), &typing);
-                drop(typing);
+            for msg in messages {
+                if let Some(ids) = allowed.as_ref() {
+                    if !ids.contains(&msg.chat_id) {
+                        log::warn!(
+                            "Telegram message from disallowed chat: {}",
+                            msg.chat_id
+                        );
+                        continue;
+                    }
+                }
+
+                log::info!(
+                    "Telegram msg from {}: {}B",
+                    msg.chat_id,
+                    msg.text.len()
+                );
+
+                if let Err(e) =
+                    esp_idf_svc::hal::task::block_on(channel.send_typing(&msg.chat_id))
+                {
+                    log::warn!("Telegram send_typing: {}", e);
+                }
 
                 zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
-                let reply = esp_idf_svc::hal::task::block_on(
-                    gateway.chat(&chat_id, &text, "telegram")
-                );
-                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
-                drop(text);
-
-                let reply_text = match reply {
+                let reply = match esp_idf_svc::hal::task::block_on(
+                    gateway.chat(&msg.chat_id, &msg.text, "telegram"),
+                ) {
                     Ok(r) => r,
                     Err(e) => format!("Error: {}", e),
                 };
+                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
 
-                let send = format!(
-                    r#"{{"chat_id":"{}","text":"{}","parse_mode":"Markdown"}}"#,
-                    chat_id,
-                    reply_text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
-                );
-                drop(reply_text);
-                match tg_http_post(&tg_api(token, "sendMessage"), &send) {
-                    Ok(_) => log::info!("Telegram reply sent to {}", chat_id),
-                    Err(e) => log::error!("Telegram send: {}", e),
+                if let Err(e) =
+                    esp_idf_svc::hal::task::block_on(channel.deliver(&msg.chat_id, &reply))
+                {
+                    log::error!("Telegram deliver: {}", e);
+                } else {
+                    log::info!("Telegram reply sent to {}", msg.chat_id);
                 }
             }
         } else {
-            // No Telegram — just block-wait for HTTP chat requests
+            // No Telegram — block-wait for HTTP chat requests so we don't busy-loop.
             if let Ok(req) = chat_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                log::info!("HTTP chat: chat_id={} msg_len={}", req.chat_id, req.message.len());
+                log::info!(
+                    "HTTP chat: chat_id={} msg_len={}",
+                    req.chat_id,
+                    req.message.len()
+                );
                 zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
                 let result = esp_idf_svc::hal::task::block_on(
                     gateway.chat(&req.chat_id, &req.message, "api"),

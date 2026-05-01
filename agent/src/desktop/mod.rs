@@ -11,8 +11,6 @@ mod server;
 pub mod background;
 #[cfg(feature = "desktop")]
 pub mod subagents;
-#[cfg(feature = "desktop")]
-pub mod telegram;
 
 #[cfg(feature = "desktop")]
 pub use http_client::ReqwestHttpClient;
