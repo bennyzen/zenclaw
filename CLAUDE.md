@@ -1,15 +1,15 @@
 # ZenClaw
 
-AI agent framework. Single Rust implementation (`agent-esp32/`) targeting ESP32-S3 and ESP32-P4 hardware, plus a desktop build for development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC). The original MicroPython implementation has been retired and is preserved at the `legacy/micropython-final` git tag.
+AI agent framework. Single Rust implementation (`agent/`) targeting ESP32-S3 and ESP32-P4 hardware, plus a desktop build for development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC). The original MicroPython implementation has been retired and is preserved at the `legacy/micropython-final` git tag.
 
-## Rust Agent (`agent-esp32/`)
+## Rust Agent (`agent/`)
 
 The Rust agent targets ESP32-S3 and ESP32-P4 boards. Built with `esp-idf-svc` (ESP-IDF v5.4), no tokio — uses `block_on` for async and `std::thread` for concurrency.
 
 ### Quick Start
 
 ```bash
-cd agent-esp32
+cd agent
 
 # Build for DevKitC (ESP32-S3)
 just build devkitc
@@ -64,7 +64,7 @@ description = "ESP32-S3-DevKitC (PSRAM, USB Host capable)"
 - `just flash <board> [port]` — flashes with the correct bootloader
 - `just clean <board>` — wipes the esp-idf-sys cache for that target
 - `bootloaders/<chip>.bin` are vendored from clean `esp-idf-sys` builds for each chip
-- `agent-esp32-smoke/` is the minimal reference template for porting to new chips
+- `agent-smoke/` is the minimal reference template for porting to new chips
 
 ### ESP32-P4 (Guition JC-ESP32P4-M3-DEV)
 
@@ -150,7 +150,7 @@ curl -sf "http://$HOST/api/chat/history?chat_id=web" | python3 -m json.tool
 ### Architecture
 
 ```
-agent-esp32/src/
+agent/src/
   main.rs                     ESP32 entry: WiFi, mDNS, SPIFFS, HTTP server, Telegram poller
   lib.rs                      Feature-gated module exports
   config.rs                   Config structs (serde, mirrors `/api/config` JSON shape)
@@ -241,7 +241,7 @@ storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
 
 ### Deferred / TODO
 
-- **Vector memory**: the `agent-esp32/src/core/memory/` module persists memories as text only. The `embedding: Vec<f32>` field on `MemoryEntry` is never populated, and `BruteForceStore::search()` does substring matching, not cosine similarity. To add vector search: introduce an `embeddings` provider that calls the LLM provider's embedding endpoint, populate the vector on `do_save`, then either (a) implement cosine search in `BruteForceStore` or (b) enable the `hnsw` Cargo feature and use usearch. Costs money per embedding call, hence deferred.
+- **Vector memory**: the `agent/src/core/memory/` module persists memories as text only. The `embedding: Vec<f32>` field on `MemoryEntry` is never populated, and `BruteForceStore::search()` does substring matching, not cosine similarity. To add vector search: introduce an `embeddings` provider that calls the LLM provider's embedding endpoint, populate the vector on `do_save`, then either (a) implement cosine search in `BruteForceStore` or (b) enable the `hnsw` Cargo feature and use usearch. Costs money per embedding call, hence deferred.
 
 ## Shared Concepts
 
@@ -291,7 +291,7 @@ All supported boards ship PSRAM: DevKitC has 8MB, Guition P4 has 32MB. The inter
 
 ```
 zenclaw/
-  agent-esp32/              Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
+  agent/                    Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
     justfile                  Multi-board build system (just build/flash/clean/list)
     boards/                   Per-board TOML manifests (devkitc, guition-p4)
     bootloaders/              Vendored bootloaders (esp32s3.bin, esp32p4.bin)
@@ -305,7 +305,7 @@ zenclaw/
     bindings_led_strip.h      Bindgen header for LED strip component
     src/                      Rust source (see Architecture above)
 
-  agent-esp32-smoke/        Minimal reference crate for porting to new chips
+  agent-smoke/              Minimal reference crate for porting to new chips
 
   web/                      Nuxt web UI (PWA dashboard, config editor, file manager, provisioning)
 ```

@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-AGENT_DIR="$REPO_ROOT/agent-esp32"
+AGENT_DIR="$REPO_ROOT/agent"
 OUTPUT_DIR="$REPO_ROOT/web/public/firmware"
 
 cd "$AGENT_DIR"

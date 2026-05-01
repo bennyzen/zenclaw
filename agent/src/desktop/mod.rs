@@ -8,6 +8,15 @@ mod run;
 mod server;
 
 #[cfg(feature = "desktop")]
+pub mod background;
+#[cfg(feature = "desktop")]
+pub mod channels;
+#[cfg(feature = "desktop")]
+pub mod subagents;
+#[cfg(feature = "desktop")]
+pub mod telegram;
+
+#[cfg(feature = "desktop")]
 pub use http_client::ReqwestHttpClient;
 #[cfg(feature = "desktop")]
 pub use memstat::MemStats;

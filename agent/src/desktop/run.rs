@@ -5,10 +5,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::core::background::BackgroundRunner;
 use crate::core::gateway::Gateway;
 use crate::core::runner::{LlmRunner, Runner};
-use crate::core::telegram::{IncomingMessage, TelegramPoller};
+use crate::desktop::background::BackgroundRunner;
+use crate::desktop::telegram::{IncomingMessage, TelegramPoller};
 
 use super::{start_api_server, AppState};
 

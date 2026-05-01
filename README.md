@@ -31,12 +31,12 @@ Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome
 
 Done. The device is running at `http://<devicename>.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
 
-For developers building from source, see [`agent-esp32/`](agent-esp32/) and [`CLAUDE.md`](CLAUDE.md) for board manifests, build commands, and Rust architecture.
+For developers building from source, see [`agent/`](agent/) and [`CLAUDE.md`](CLAUDE.md) for board manifests, build commands, and Rust architecture.
 
 ## Architecture
 
 ```
-agent-esp32/src/
+agent/src/
   main.rs          ESP32 entry: NIC bring-up, mDNS, SPIFFS, HTTP server, Telegram poller
   core/            Shared agent logic
     gateway.rs     Core orchestrator, chat() entry point
@@ -59,12 +59,12 @@ See [`CLAUDE.md`](CLAUDE.md) for the full architecture, board profiles, and buil
 
 ```
 zenclaw/
-  agent-esp32/              Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
+  agent/                    Rust agent (ESP32-S3 + ESP32-P4 + desktop targets)
     boards/                 Per-board TOML manifests (devkitc, guition-p4)
     bootloaders/            Vendored ESP-IDF bootloaders
     src/                    Rust source (see CLAUDE.md)
     justfile                Multi-board build commands
-  agent-esp32-smoke/        Minimal reference crate for porting to new chips
+  agent-smoke/              Minimal reference crate for porting to new chips
   web/                      Nuxt web UI (PWA dashboard, config editor, file manager, provisioning)
   scripts/                  Build helpers (build-rust-firmware.sh)
   docs/                     Specs, plans, design documents
