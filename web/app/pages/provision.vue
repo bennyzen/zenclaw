@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { StepperItem } from '@nuxt/ui'
-import type { FlashProgress } from '~/composables/useSerial'
+import type { FlashMode, FlashProgress } from '~/composables/useSerial'
 import { loadBoardManifest, FALLBACK_BOARDS, type BoardManifest } from '~/types/firmware'
 
 const serial = useSerial()
@@ -16,6 +16,7 @@ function randomName(): string {
 const STORAGE_KEY = 'zenclaw_provision'
 
 const active = ref(0)
+const mode = ref<FlashMode>('fresh')
 const progress = ref<FlashProgress>({ stage: 'connecting', percent: 0, message: '' })
 const wifiSsid = ref('')
 const wifiPassword = ref('')
@@ -159,17 +160,32 @@ const serialSupported = computed(() =>
 )
 
 const configValid = computed(() => {
+  // Update mode only needs the hostname so we can poll mDNS post-reboot.
+  // Fresh mode needs WiFi (when on a wifi-only board) and an API key.
+  if (mode.value === 'update') {
+    return deviceName.value.length > 0
+  }
   if (!apiKey.value) return false
   if (selectedBoard.value.network === 'wifi' && !wifiSsid.value) return false
   return true
 })
 
-const items: StepperItem[] = [
-  { title: 'Configure', description: 'WiFi and API keys', icon: 'i-lucide-settings' },
+const items = computed<StepperItem[]>(() => [
+  { title: 'Mode', description: 'Fresh install or update', icon: 'i-lucide-list-checks' },
+  {
+    title: 'Configure',
+    description: mode.value === 'update' ? 'Board and hostname' : 'WiFi and API keys',
+    icon: 'i-lucide-settings',
+  },
   { title: 'Flash', description: 'Flash firmware via USB', icon: 'i-lucide-zap' },
   { title: 'Connect', description: 'Waiting for device', icon: 'i-lucide-wifi' },
   { title: 'Done', description: 'Ready to use', icon: 'i-lucide-check' },
-]
+])
+
+function selectMode(next: FlashMode) {
+  mode.value = next
+  active.value = 1
+}
 
 // Save to localStorage on change
 watch([wifiSsid, wifiPassword, apiKey, apiProvider, apiModel, baseUrl, deviceName, boardId], () => {
@@ -196,7 +212,7 @@ watch(() => serial.logs.value.length, () => {
 
 function nextStep() {
   if (!configValid.value) return
-  active.value = 1
+  active.value = 2
 }
 
 async function flash() {
@@ -207,6 +223,7 @@ async function flash() {
     {
       hostname: deviceName.value,
       board: selectedBoard.value,
+      mode: mode.value,
       ssid: wifiSsid.value || undefined,
       password: wifiPassword.value || undefined,
     },
@@ -214,7 +231,7 @@ async function flash() {
   )
 
   if (ok) {
-    active.value = 2
+    active.value = 3
     pollForDevice()
   } else {
     error.value = progress.value.message
@@ -225,7 +242,9 @@ async function flash() {
 async function pollForDevice() {
   polling.value = true
   error.value = null
-  pollStatus.value = 'Waiting for device to boot and connect to WiFi...'
+  pollStatus.value = mode.value === 'update'
+    ? 'Waiting for device to reboot...'
+    : 'Waiting for device to boot and connect to WiFi...'
 
   const conn = useConnection()
   const maxAttempts = 30
@@ -235,19 +254,22 @@ async function pollForDevice() {
       await conn.connectNetwork(deviceName.value + '.local')
       pollStatus.value = `Device online at ${deviceIp.value}!`
       await serial.stopMonitor()
-      // Merge provider settings into existing config (preserves telegram, heartbeat, etc.)
-      pollStatus.value = 'Pushing API configuration...'
-      const existing = await conn.getConfig()
-      const providers = existing.providers || {}
-      providers.default = apiProvider.value
-      providers[apiProvider.value] = {
-        ...(providers[apiProvider.value] || {}),
-        api_key: apiKey.value,
-        model: apiModel.value,
-        base_url: baseUrl.value,
+      if (mode.value === 'fresh') {
+        // Merge provider settings into existing config (preserves telegram, heartbeat, etc.)
+        pollStatus.value = 'Pushing API configuration...'
+        const existing = await conn.getConfig()
+        const providers = existing.providers || {}
+        providers.default = apiProvider.value
+        providers[apiProvider.value] = {
+          ...(providers[apiProvider.value] || {}),
+          api_key: apiKey.value,
+          model: apiModel.value,
+          base_url: baseUrl.value,
+        }
+        await conn.saveConfig({ ...existing, providers })
       }
-      await conn.saveConfig({ ...existing, providers })
-      active.value = 3
+      // Update mode preserves existing config — do not POST /api/config.
+      active.value = 4
       polling.value = false
       return
     } catch {
@@ -265,9 +287,9 @@ async function pollForDevice() {
   <div class="space-y-6 max-w-3xl">
     <h2 class="text-2xl font-bold text-white">Provision Device</h2>
     <p class="text-sm text-muted">
-      Set up a new ZenClaw device in three steps: enter your WiFi and API credentials,
-      flash the firmware over USB, and wait for the device to come online.
-      Everything is flashed in one go — no serial configuration needed after.
+      Flash a ZenClaw device over USB. Pick <strong>Fresh install</strong> for a brand-new
+      board, or <strong>Update firmware</strong> to deploy newer agent code while keeping
+      your saved configuration and data.
     </p>
 
     <p v-if="!serialSupported" class="text-red-400">
@@ -276,8 +298,79 @@ async function pollForDevice() {
 
     <UStepper v-model="active" :items="items" class="w-full">
       <template #content="{ item }">
+        <!-- Mode -->
+        <div v-if="item.title === 'Mode'" class="space-y-4 pt-10">
+          <p class="text-sm text-muted">
+            What kind of flash is this? Pick "Update firmware" if the device is already
+            provisioned and you only want to deploy newer agent code.
+          </p>
+          <div class="grid gap-4 md:grid-cols-2">
+            <button
+              type="button"
+              class="text-left rounded-lg border p-5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              :class="mode === 'fresh'
+                ? 'border-primary bg-primary/5 ring-1 ring-primary'
+                : 'border-default bg-elevated hover:border-accented'"
+              @click="selectMode('fresh')"
+            >
+              <div class="flex items-center gap-2 mb-2">
+                <UIcon name="i-lucide-sparkles" class="size-5 text-primary" />
+                <h3 class="text-base font-semibold text-toned">Fresh install</h3>
+              </div>
+              <p class="text-sm text-muted mb-3">
+                Brand-new device, or you want to start from a clean slate.
+              </p>
+              <ul class="space-y-1.5 text-xs text-dimmed">
+                <li class="flex items-start gap-1.5">
+                  <UIcon name="i-lucide-check" class="size-3.5 mt-0.5 text-green-400 shrink-0" />
+                  Writes bootloader, partition table, app, and NVS
+                </li>
+                <li class="flex items-start gap-1.5">
+                  <UIcon name="i-lucide-check" class="size-3.5 mt-0.5 text-green-400 shrink-0" />
+                  Configures WiFi and the LLM provider
+                </li>
+                <li class="flex items-start gap-1.5">
+                  <UIcon name="i-lucide-alert-triangle" class="size-3.5 mt-0.5 text-amber-400 shrink-0" />
+                  <span><strong>Erases the entire flash</strong> — sessions, memories, and uploaded files are lost</span>
+                </li>
+              </ul>
+            </button>
+
+            <button
+              type="button"
+              class="text-left rounded-lg border p-5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              :class="mode === 'update'
+                ? 'border-primary bg-primary/5 ring-1 ring-primary'
+                : 'border-default bg-elevated hover:border-accented'"
+              @click="selectMode('update')"
+            >
+              <div class="flex items-center gap-2 mb-2">
+                <UIcon name="i-lucide-refresh-cw" class="size-5 text-primary" />
+                <h3 class="text-base font-semibold text-toned">Update firmware</h3>
+              </div>
+              <p class="text-sm text-muted mb-3">
+                Device is already provisioned — just deploy newer agent code.
+              </p>
+              <ul class="space-y-1.5 text-xs text-dimmed">
+                <li class="flex items-start gap-1.5">
+                  <UIcon name="i-lucide-check" class="size-3.5 mt-0.5 text-green-400 shrink-0" />
+                  Writes only the application partition
+                </li>
+                <li class="flex items-start gap-1.5">
+                  <UIcon name="i-lucide-check" class="size-3.5 mt-0.5 text-green-400 shrink-0" />
+                  Preserves WiFi credentials, LLM config, sessions, and memories
+                </li>
+                <li class="flex items-start gap-1.5">
+                  <UIcon name="i-lucide-info" class="size-3.5 mt-0.5 text-blue-400 shrink-0" />
+                  Use Fresh install if the partition layout changed in this release
+                </li>
+              </ul>
+            </button>
+          </div>
+        </div>
+
         <!-- Configure -->
-        <div v-if="item.title === 'Configure'" class="space-y-4 pt-10">
+        <div v-else-if="item.title === 'Configure'" class="space-y-4 pt-10">
           <UFormField label="Board" class="w-full">
             <USelectMenu
               v-model="boardId"
@@ -291,52 +384,54 @@ async function pollForDevice() {
             {{ selectedBoard.description }}
           </p>
 
-          <USeparator />
+          <template v-if="mode === 'fresh'">
+            <USeparator />
 
-          <div v-if="selectedBoard.network === 'ethernet'" class="rounded border border-default bg-elevated p-3 text-sm text-muted">
-            <p class="font-semibold text-toned mb-1">Ethernet device</p>
-            <p>Plug an Ethernet cable into the device before flashing — the agent gets its address via DHCP. WiFi credentials below are optional and written to NVS for future dual-mode use.</p>
-          </div>
+            <div v-if="selectedBoard.network === 'ethernet'" class="rounded border border-default bg-elevated p-3 text-sm text-muted">
+              <p class="font-semibold text-toned mb-1">Ethernet device</p>
+              <p>Plug an Ethernet cable into the device before flashing — the agent gets its address via DHCP. WiFi credentials below are optional and written to NVS for future dual-mode use.</p>
+            </div>
 
-          <UFormField :label="wifiLabel('SSID')" class="w-full">
-            <UInput v-model="wifiSsid" placeholder="Your WiFi network" class="w-full" size="xl" />
-          </UFormField>
-          <UFormField :label="wifiLabel('Password')" class="w-full">
-            <UInput v-model="wifiPassword" class="w-full" size="xl" />
-          </UFormField>
+            <UFormField :label="wifiLabel('SSID')" class="w-full">
+              <UInput v-model="wifiSsid" placeholder="Your WiFi network" class="w-full" size="xl" />
+            </UFormField>
+            <UFormField :label="wifiLabel('Password')" class="w-full">
+              <UInput v-model="wifiPassword" class="w-full" size="xl" />
+            </UFormField>
 
-          <USeparator />
+            <USeparator />
 
-          <UFormField label="LLM Provider" class="w-full">
-            <USelectMenu
-              v-model="apiProvider"
-              class="w-full"
-              size="xl"
-              :items="providerItems"
-              value-key="value"
-              :loading="!providerItems.length"
-              placeholder="Select provider..."
-            />
-          </UFormField>
-          <UFormField v-if="isCustomProvider" label="Base URL" class="w-full">
-            <UInput v-model="baseUrl" placeholder="https://api.example.com/v1" class="w-full" size="xl" />
-          </UFormField>
-          <UFormField label="API Key" class="w-full">
-            <UInput v-model="apiKey" placeholder="Your API key" class="w-full" size="xl" />
-          </UFormField>
-          <UFormField label="Model" class="w-full">
-            <USelectMenu
-              v-if="filteredModels.length"
-              v-model="apiModel"
-              class="w-full"
-              size="xl"
-              :items="filteredModels"
-              value-key="value"
-              placeholder="Select a model"
-              searchable
-            />
-            <UInput v-else v-model="apiModel" placeholder="e.g. gpt-4o-mini" class="w-full" size="xl" />
-          </UFormField>
+            <UFormField label="LLM Provider" class="w-full">
+              <USelectMenu
+                v-model="apiProvider"
+                class="w-full"
+                size="xl"
+                :items="providerItems"
+                value-key="value"
+                :loading="!providerItems.length"
+                placeholder="Select provider..."
+              />
+            </UFormField>
+            <UFormField v-if="isCustomProvider" label="Base URL" class="w-full">
+              <UInput v-model="baseUrl" placeholder="https://api.example.com/v1" class="w-full" size="xl" />
+            </UFormField>
+            <UFormField label="API Key" class="w-full">
+              <UInput v-model="apiKey" placeholder="Your API key" class="w-full" size="xl" />
+            </UFormField>
+            <UFormField label="Model" class="w-full">
+              <USelectMenu
+                v-if="filteredModels.length"
+                v-model="apiModel"
+                class="w-full"
+                size="xl"
+                :items="filteredModels"
+                value-key="value"
+                placeholder="Select a model"
+                searchable
+              />
+              <UInput v-else v-model="apiModel" placeholder="e.g. gpt-4o-mini" class="w-full" size="xl" />
+            </UFormField>
+          </template>
 
           <USeparator />
 
@@ -344,6 +439,7 @@ async function pollForDevice() {
             <div class="flex gap-2 items-stretch">
               <UInput v-model="deviceName" class="flex-1" size="xl" />
               <UButton
+                v-if="mode === 'fresh'"
                 size="xl"
                 color="neutral"
                 variant="outline"
@@ -354,7 +450,12 @@ async function pollForDevice() {
             </div>
           </UFormField>
           <p class="text-xs text-dimmed">
-            Reachable at <strong class="text-muted">{{ deviceName }}.local</strong> on your network
+            <template v-if="mode === 'update'">
+              Hostname currently provisioned on the device — used to poll mDNS once it reboots.
+            </template>
+            <template v-else>
+              Reachable at <strong class="text-muted">{{ deviceName }}.local</strong> on your network
+            </template>
           </p>
 
           <div class="flex justify-end">
@@ -370,12 +471,16 @@ async function pollForDevice() {
             Plug your <strong>{{ selectedBoard.name }}</strong> ({{ selectedBoard.chip }}) into this
             computer via USB and click Flash.
           </p>
+          <p v-if="mode === 'update'" class="text-sm text-muted">
+            Update mode preserves NVS (WiFi + LLM config) and SPIFFS (sessions, memories) — only
+            the application partition is rewritten.
+          </p>
           <p v-if="selectedBoard.network === 'ethernet'" class="text-sm text-muted">
             Make sure the Ethernet cable is connected before the device boots — the agent gets its
             network address via DHCP.
           </p>
 
-          <div class="rounded border border-default bg-elevated p-3 text-xs text-muted">
+          <div v-if="mode === 'fresh'" class="rounded border border-default bg-elevated p-3 text-xs text-muted">
             <p class="font-semibold text-toned mb-1">First-time / blank device:</p>
             <p>If the device has no firmware yet, enter bootloader mode manually:</p>
             <ol class="list-decimal list-inside space-y-0.5 mt-1">
@@ -436,7 +541,10 @@ async function pollForDevice() {
 
         <!-- Done -->
         <div v-else class="space-y-4 pt-10">
-          <p class="text-sm text-muted">
+          <p v-if="mode === 'update'" class="text-sm text-muted">
+            Firmware updated. <a :href="'http://' + deviceIp" target="_blank" class="text-blue-400 underline">{{ deviceIp }}</a> is back online with your existing WiFi credentials, LLM config, and saved data intact.
+          </p>
+          <p v-else class="text-sm text-muted">
             Your ZenClaw device is running at <a :href="'http://' + deviceIp" target="_blank" class="text-blue-400 underline">{{ deviceIp }}</a> and configured.
           </p>
           <div class="flex justify-end">

@@ -7,12 +7,17 @@ export interface FlashProgress {
   message: string
 }
 
+export type FlashMode = 'fresh' | 'update'
+
 export interface DeviceConfig {
   hostname: string
   board: BoardManifest
-  ssid?: string      // optional; written to NVS when non-empty
-  password?: string  // optional; paired with ssid
+  mode: FlashMode
+  ssid?: string      // fresh-install only; written to NVS when non-empty
+  password?: string  // fresh-install only; paired with ssid
 }
+
+const APP_PARTITION_OFFSET = 0x10000
 
 export function useSerial() {
   const port = ref<SerialPort | null>(null)
@@ -192,46 +197,59 @@ export function useSerial() {
         )
       }
 
-      // --- Download merged firmware image ---
-      onProgress({ stage: 'flashing', percent: 15, message: 'Downloading firmware...' })
+      // --- Download firmware image (merged for fresh, app-only for update) ---
       const base = useRuntimeConfig().app.baseURL
-      const fwResponse = await fetch(base + 'firmware/' + config.board.image)
+      const imageName = config.mode === 'update'
+        ? config.board.app_image
+        : config.board.image
+      if (!imageName) {
+        throw new Error(
+          `Update mode requires an app-only image but board "${config.board.id}" has no app_image — `
+          + `rebuild firmware via scripts/build-rust-firmware.sh`,
+        )
+      }
+      onProgress({ stage: 'flashing', percent: 15, message: `Downloading ${imageName}...` })
+      const fwResponse = await fetch(base + 'firmware/' + imageName)
       if (!fwResponse.ok) {
         throw new Error(
-          `Firmware ${config.board.image} missing (HTTP ${fwResponse.status}) — `
+          `Firmware ${imageName} missing (HTTP ${fwResponse.status}) — `
           + `rebuild via scripts/build-rust-firmware.sh`,
         )
       }
       const fwData = new Uint8Array(await fwResponse.arrayBuffer())
-      log(`Firmware: ${fwData.length} bytes`)
+      log(`Firmware: ${fwData.length} bytes (${config.mode})`)
 
-      // --- Build NVS partition ---
-      const nvsEntries: NvsBlob[] = [
-        { namespace: 'device', key: 'hostname', value: config.hostname },
-      ]
-      if (config.ssid) {
-        nvsEntries.push(
-          { namespace: 'wifi', key: 'ssid', value: config.ssid },
-          { namespace: 'wifi', key: 'password', value: config.password ?? '' },
-        )
-        log(`Building NVS: hostname=${config.hostname}, WiFi=${config.ssid}`)
+      // --- Assemble flash plan based on mode ---
+      // fresh: merged image at 0x0 + freshly-written NVS at 0x9000, eraseAll
+      // update: app-only image at 0x10000, NVS + SPIFFS untouched
+      const fileArray: { data: Uint8Array; address: number }[] = []
+      if (config.mode === 'fresh') {
+        fileArray.push({ data: fwData, address: 0x0 })
+        const nvsEntries: NvsBlob[] = [
+          { namespace: 'device', key: 'hostname', value: config.hostname },
+        ]
+        if (config.ssid) {
+          nvsEntries.push(
+            { namespace: 'wifi', key: 'ssid', value: config.ssid },
+            { namespace: 'wifi', key: 'password', value: config.password ?? '' },
+          )
+          log(`Building NVS: hostname=${config.hostname}, WiFi=${config.ssid}`)
+        } else {
+          log(`Building NVS: hostname=${config.hostname} (no WiFi creds)`)
+        }
+        fileArray.push({ data: buildNvsPartition(nvsEntries), address: 0x9000 })
+        log('Flashing firmware + NVS (full erase)...')
       } else {
-        log(`Building NVS: hostname=${config.hostname} (no WiFi creds)`)
+        fileArray.push({ data: fwData, address: APP_PARTITION_OFFSET })
+        log('Flashing app partition only (NVS + SPIFFS preserved)...')
       }
-      const nvsData = buildNvsPartition(nvsEntries)
-
-      // --- Flash merged image + NVS ---
-      log('Flashing firmware + NVS...')
       onProgress({ stage: 'flashing', percent: 25, message: 'Flashing...' })
       await loader.writeFlash({
-        fileArray: [
-          { data: fwData,  address: 0x0 },     // bootloader + partition table + app (chip-correct internal layout)
-          { data: nvsData, address: 0x9000 },  // NVS partition (hostname + WiFi creds if applicable)
-        ],
+        fileArray,
         flashSize: 'keep',
         flashMode: 'keep',
         flashFreq: 'keep',
-        eraseAll: true,
+        eraseAll: config.mode === 'fresh',
         compress: true,
         reportProgress: (_fileIndex: number, written: number, total: number) => {
           const pct = 25 + Math.round((written / total) * 70)

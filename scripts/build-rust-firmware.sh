@@ -92,6 +92,7 @@ for board in "${BOARDS[@]}"; do
 
     elf="target/$target/release/zenclaw-agent"
     out="$OUTPUT_DIR/zenclaw-$board.bin"
+    app_out="$OUTPUT_DIR/zenclaw-$board-app.bin"
 
     echo "==> Building $board ($chip / $target)"
     just build "$board" --release
@@ -106,8 +107,20 @@ for board in "${BOARDS[@]}"; do
         --skip-padding \
         "$elf" "$out"
 
+    # App-only image used by the wizard's "Update firmware" mode.
+    # Same artifact that `espflash flash <bin>` writes to the factory
+    # partition at 0x10000 — bootloader, partition table, NVS, and SPIFFS
+    # all stay intact during an update flash.
+    echo "==> Saving app-only image -> $app_out"
+    espflash save-image \
+        --chip "$chip" \
+        --flash-size 16mb \
+        "$elf" "$app_out"
+
     size=$(wc -c < "$out" | tr -d ' ')
+    app_size=$(wc -c < "$app_out" | tr -d ' ')
     echo "    $(basename "$out"): ${size} bytes"
+    echo "    $(basename "$app_out"): ${app_size} bytes"
 
     MANIFEST_ENTRIES+=("$(cat <<JSON
     {
@@ -115,6 +128,7 @@ for board in "${BOARDS[@]}"; do
       "name": "$(board_display_name "$board")",
       "chip": "$(board_chip_label "$board")",
       "image": "zenclaw-$board.bin",
+      "app_image": "zenclaw-$board-app.bin",
       "network": "$(board_network "$board")",
       "default": $(board_default "$board"),
       "description": "$(board_description "$board")"
