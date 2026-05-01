@@ -701,7 +701,12 @@ a{{color:#60a5fa;text-decoration:none}}
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         {
             let tx = chat_tx_clone.lock().unwrap();
-            tx.send(ChatRequest { chat_id, message, reply_tx })
+            tx.send(ChatRequest {
+                chat_id,
+                message,
+                reply_tx: Some(reply_tx),
+                events_tx: None,
+            })
                 .map_err(|e| anyhow::anyhow!("send to agent worker: {}", e))?;
         }
         let result = reply_rx.recv()
@@ -1242,15 +1247,16 @@ a{{color:#60a5fa;text-decoration:none}}
     //   - `user_message` — start a turn, stream typed events back.
     //   - `cancel`       — abort the active turn for this chat_id.
     //
-    // For a `user_message`: spawn a forwarder thread that owns the detached
-    // WS sender, plus a worker thread that runs `gateway.chat_with_events`
-    // and emits to a `mpsc::Sender<ChatEvent>`. Forwarder drains the receiver
-    // and writes each event as a JSON text frame; exits when the worker drops
-    // its sender (turn finished).
+    // The chat itself runs on the long-lived `agent_thread` (already 32KB
+    // stack). The WS handler only spawns a small forwarder that owns the
+    // detached WS sender and drains a `mpsc::Receiver<ChatEvent>`, writing
+    // each event as a JSON text frame. This avoids spawning a fresh 32KB
+    // worker stack per turn — internal SRAM is tight on ESP32-S3.
     {
         use embedded_svc::ws::FrameType;
         use zenclaw_agent::core::chat_events::ChatEvent;
         let gw_ws = gateway.clone();
+        let chat_tx_ws = chat_tx.clone();
         server.ws_handler::<_, anyhow::Error>("/ws/chat", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() { return Ok(()); }
             if ws.is_closed() { return Ok(()); }
@@ -1262,6 +1268,14 @@ a{{color:#60a5fa;text-decoration:none}}
             let (_ft, len) = ws.recv(&mut buf)?;
             if len == 0 { return Ok(()); }
             buf.truncate(len);
+            // esp-idf v5.4's httpd_ws_recv_frame can report a length that
+            // overshoots the actual payload by a handful of bytes; the tail
+            // of `buf` is zero-padding from the initial allocation. A strict
+            // typed deserialize rejects those trailing nulls ("trailing
+            // characters at line 1 column N"). Trim them before parsing.
+            while buf.last() == Some(&0) {
+                buf.pop();
+            }
 
             let evt: ChatEvent = match serde_json::from_slice(&buf) {
                 Ok(v) => v,
@@ -1283,38 +1297,33 @@ a{{color:#60a5fa;text-decoration:none}}
                     }
                     log::info!("WS chat: chat_id={} msg_len={}", chat_id, text.len());
 
+                    // Internal SRAM is too tight to spawn a 32KB worker on
+                    // top of a forwarder thread (ENOMEM). Route the chat
+                    // through the long-lived agent_thread (already 32KB) and
+                    // only spawn a small forwarder that owns the WS sender
+                    // and drains the event channel until the chat completes.
                     let sender = ws.create_detached_sender()?;
-                    let gw = gw_ws.clone();
+                    let (events_tx, events_rx) =
+                        std::sync::mpsc::channel::<ChatEvent>();
+                    {
+                        let tx = chat_tx_ws.lock().unwrap();
+                        if let Err(e) = tx.send(ChatRequest {
+                            chat_id,
+                            message: text,
+                            reply_tx: None,
+                            events_tx: Some(events_tx),
+                        }) {
+                            log::error!("WS chat: enqueue: {}", e);
+                            return Ok(());
+                        }
+                    }
 
-                    // Forwarder owns the WS sender and drains events.
                     std::thread::Builder::new()
                         .name("ws-chat-fwd".into())
-                        .stack_size(16384)
+                        .stack_size(8192)
                         .spawn(move || {
                             let mut sender = sender;
-                            let (tx, rx) = std::sync::mpsc::channel::<ChatEvent>();
-
-                            let gw_worker = gw.clone();
-                            let chat_id_w = chat_id.clone();
-                            let text_w = text.clone();
-                            let worker = std::thread::Builder::new()
-                                .name("ws-chat-worker".into())
-                                .stack_size(32768)
-                                .spawn(move || {
-                                    led_status::set(Led::Thinking);
-                                    let _ = esp_idf_svc::hal::task::block_on(
-                                        gw_worker.chat_with_events(
-                                            &chat_id_w, &text_w, "api", Some(&tx),
-                                        ),
-                                    );
-                                    led_status::set(Led::Idle);
-                                });
-                            if let Err(e) = worker {
-                                log::error!("WS chat: spawn worker: {}", e);
-                                return;
-                            }
-
-                            while let Ok(evt) = rx.recv() {
+                            while let Ok(evt) = events_rx.recv() {
                                 let json = match serde_json::to_string(&evt) {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -1322,9 +1331,13 @@ a{{color:#60a5fa;text-decoration:none}}
                                         continue;
                                     }
                                 };
-                                if sender.send(FrameType::Text(false), json.as_bytes()).is_err() {
-                                    // Browser disconnected — leave worker running so the
-                                    // turn still lands in session JSONL; just stop forwarding.
+                                if sender
+                                    .send(FrameType::Text(false), json.as_bytes())
+                                    .is_err()
+                                {
+                                    // Browser disconnected — agent thread keeps
+                                    // running so the turn still lands in session
+                                    // JSONL; just stop forwarding.
                                     break;
                                 }
                             }
@@ -1393,7 +1406,12 @@ a{{color:#60a5fa;text-decoration:none}}
 struct ChatRequest {
     chat_id: String,
     message: String,
-    reply_tx: std::sync::mpsc::Sender<Result<String, String>>,
+    /// REST callers set this to receive the final reply string. WS callers
+    /// pass `None` and rely on `events_tx` for the full event stream.
+    reply_tx: Option<std::sync::mpsc::Sender<Result<String, String>>>,
+    /// WS callers attach a sender to receive each typed event (thinking,
+    /// tool_call_*, assistant_text, done, error). REST callers pass `None`.
+    events_tx: Option<std::sync::mpsc::Sender<zenclaw_agent::core::chat_events::ChatEvent>>,
 }
 
 /// Unified agent thread — handles both Telegram polling and HTTP chat requests.
@@ -1420,17 +1438,7 @@ fn agent_thread(
     loop {
         // --- Process any pending HTTP chat requests (non-blocking) ---
         while let Ok(req) = chat_rx.try_recv() {
-            log::info!(
-                "HTTP chat: chat_id={} msg_len={}",
-                req.chat_id,
-                req.message.len()
-            );
-            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
-            let result = esp_idf_svc::hal::task::block_on(
-                gateway.chat(&req.chat_id, &req.message, "api"),
-            );
-            zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
-            let _ = req.reply_tx.send(result.map_err(|e| e.to_string()));
+            run_chat_request(gateway.as_ref(), req);
         }
 
         // --- Telegram poll (if enabled) ---
@@ -1487,20 +1495,39 @@ fn agent_thread(
         } else {
             // No Telegram — block-wait for HTTP chat requests so we don't busy-loop.
             if let Ok(req) = chat_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                log::info!(
-                    "HTTP chat: chat_id={} msg_len={}",
-                    req.chat_id,
-                    req.message.len()
-                );
-                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
-                let result = esp_idf_svc::hal::task::block_on(
-                    gateway.chat(&req.chat_id, &req.message, "api"),
-                );
-                zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
-                let _ = req.reply_tx.send(result.map_err(|e| e.to_string()));
+                run_chat_request(gateway.as_ref(), req);
             }
         }
     }
+}
+
+/// Runs one chat request on the agent thread, dispatching whichever signals
+/// the caller asked for. REST callers populate `reply_tx` and read the
+/// final string back; WS callers populate `events_tx` and the event stream
+/// arrives in real time as the agent loop runs.
+#[cfg(feature = "esp32")]
+fn run_chat_request(
+    gateway: &zenclaw_agent::core::gateway::Gateway,
+    req: ChatRequest,
+) {
+    log::info!(
+        "HTTP chat: chat_id={} msg_len={} streaming={}",
+        req.chat_id,
+        req.message.len(),
+        req.events_tx.is_some(),
+    );
+    zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Thinking);
+    let result = esp_idf_svc::hal::task::block_on(gateway.chat_with_events(
+        &req.chat_id,
+        &req.message,
+        "api",
+        req.events_tx.as_ref(),
+    ));
+    zenclaw_agent::led_status::set(zenclaw_agent::led_status::State::Idle);
+    if let Some(reply_tx) = req.reply_tx {
+        let _ = reply_tx.send(result.map_err(|e| e.to_string()));
+    }
+    // events_tx drops here; the WS forwarder's recv() will return Err next.
 }
 
 #[cfg(feature = "desktop")]
