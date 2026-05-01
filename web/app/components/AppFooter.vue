@@ -28,7 +28,7 @@ const uptime = computed(() => {
 })
 
 const tooltipUi = {
-  content: 'bg-elevated text-default shadow-lg rounded-md ring ring-default px-3 py-2 text-xs w-56 h-auto',
+  content: 'flex-col items-stretch bg-elevated text-default shadow-lg rounded-md ring ring-default px-3 py-2 text-xs w-56 h-auto',
 }
 </script>
 
@@ -49,8 +49,8 @@ const tooltipUi = {
           {{ state.deviceIp }}
         </a>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-cpu" class="size-4" /> Device
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">IP</span><span>{{ state.deviceIp }}</span></div>
@@ -66,8 +66,8 @@ const tooltipUi = {
           {{ ramPercent }}%
         </span>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-memory-stick" class="size-4" /> RAM
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">Used</span><span>{{ state.lastStatus?.memory?.usedKb }} KB</span></div>
@@ -83,8 +83,8 @@ const tooltipUi = {
           {{ prettyBytes(state.lastStatus.storage.freeKb * 1024) }}
         </span>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-hard-drive" class="size-4" /> Storage
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">Free</span><span>{{ prettyBytes(state.lastStatus!.storage!.freeKb * 1024) }}</span></div>
@@ -99,8 +99,8 @@ const tooltipUi = {
           {{ state.lastStatus.cloudStorage.objects }} obj {{ prettyBytes(state.lastStatus.cloudStorage.totalBytes ?? 0) }}
         </span>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-cloud" class="size-4 text-green-400" /> Cloud
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">Provider</span><span>{{ state.lastStatus!.cloudStorage!.provider === 'r2' ? 'Cloudflare R2' : 'S3' }}</span></div>
@@ -122,8 +122,8 @@ const tooltipUi = {
           {{ state.lastStatus.temperatureC }}&deg;
         </span>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-thermometer" class="size-4" /> Temperature
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">MCU</span><span>{{ state.lastStatus!.temperatureC }}&deg;C</span></div>
@@ -137,8 +137,8 @@ const tooltipUi = {
           {{ uptime }}
         </span>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-clock" class="size-4" /> Uptime
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">Since boot</span><span>{{ uptime }}</span></div>
@@ -152,8 +152,8 @@ const tooltipUi = {
           {{ state.lastStatus.wifi.rssi }} dBm
         </span>
         <template #content>
-          <div class="space-y-1.5">
-            <div class="flex items-center gap-1.5 font-semibold text-[13px] pb-1.5 border-b border-default">
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
               <UIcon name="i-lucide-wifi" class="size-4" /> WiFi
             </div>
             <div class="flex justify-between gap-4"><span class="text-dimmed">RSSI</span><span>{{ state.lastStatus!.wifi!.rssi }} dBm</span></div>
@@ -191,5 +191,21 @@ const tooltipUi = {
 }
 .statusbar .cell:first-child {
   padding-left: 0;
+}
+.tooltip-rows {
+  display: flex;
+  flex-direction: column;
+}
+.tooltip-rows > div {
+  padding: 0.375rem 0;
+}
+.tooltip-rows > div:first-child {
+  padding-top: 0;
+}
+.tooltip-rows > div:last-child {
+  padding-bottom: 0;
+}
+.tooltip-rows > div + div {
+  border-top: 1px solid var(--ui-border-muted);
 }
 </style>
