@@ -69,7 +69,12 @@ impl ToolRegistry {
     /// Register all built-in tools (schemas only — no persistent instances).
     pub fn register_defaults(&mut self) {
         self.register_lazy(|| Box::new(file_tools::FileTool));
-        self.register_lazy(|| Box::new(memory_tools::MemoryTool));
+        self.register_lazy(|| Box::new(memory_tools::MemorySaveTool));
+        self.register_lazy(|| Box::new(memory_tools::MemorySearchTool));
+        self.register_lazy(|| Box::new(memory_tools::MemoryListTool));
+        self.register_lazy(|| Box::new(memory_tools::MemoryGetTool));
+        self.register_lazy(|| Box::new(memory_tools::MemoryEditTool));
+        self.register_lazy(|| Box::new(memory_tools::MemoryDeleteTool));
         self.register_lazy(|| Box::new(session_tools::SessionTool));
         self.register_lazy(|| Box::new(gateway_tool::GatewayTool));
         self.register_lazy(|| Box::new(storage_tools::StorageTool));

@@ -21,10 +21,6 @@ fn default_search_provider() -> String {
     "google".to_string()
 }
 
-fn default_memory_top_k() -> usize {
-    5
-}
-
 fn default_compaction_enabled() -> bool {
     true
 }
@@ -62,8 +58,6 @@ pub struct Config {
     pub channels: ChannelsConfig,
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
-    #[serde(default)]
-    pub memory: MemoryConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -127,20 +121,6 @@ impl Default for HeartbeatConfig {
         Self {
             enabled: false,
             every_secs: default_heartbeat_secs(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MemoryConfig {
-    #[serde(default = "default_memory_top_k")]
-    pub top_k: usize,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            top_k: default_memory_top_k(),
         }
     }
 }

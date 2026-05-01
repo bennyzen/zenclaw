@@ -171,7 +171,6 @@ agent/src/
     sessions/                 JSONL conversation persistence
     channels/                 Channel abstraction
     background/               Background task management
-    memory/                   Vector memory store
 
   net/                        NIC abstraction (trait + per-driver modules)
     mod.rs                    Nic trait, IpInfo, bring_up_primary dispatch
@@ -239,9 +238,9 @@ storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
 - **Main thread must not block**: The main thread parks in `loop { sleep(60s) }` after spawning HTTP server and Telegram poller threads. HTTP server runs in esp-idf's httpd thread pool.
 - **S3 Xtensa LLVM bug (1.94.0.0–1.95.0.0)**: `xtensa-esp32s3-espidf` builds fail with `XtensaISD::PCREL_WRAPPER` LLVM ICE in `serde_json::Vec` deserialization on every `esp-rs/rust` release from 1.94.0.0 through 1.95.0.0 (tracked at [esp-rs/rust#277](https://github.com/esp-rs/rust/issues/277), regression introduced by the LLVM 20→21 bump). Workaround — pin the toolchain to 1.93.0.0: `espup install --toolchain-version 1.93.0.0`. P4 (RISC-V) is unaffected and uses the standard toolchain.
 
-### Deferred / TODO
+### Memory subsystem
 
-- **Vector memory**: the `agent/src/core/memory/` module persists memories as text only. The `embedding: Vec<f32>` field on `MemoryEntry` is never populated, and `BruteForceStore::search()` does substring matching, not cosine similarity. To add vector search: introduce an `embeddings` provider that calls the LLM provider's embedding endpoint, populate the vector on `do_save`, then either (a) implement cosine search in `BruteForceStore` or (b) enable the `hnsw` Cargo feature and use usearch. Costs money per embedding call, hence deferred.
+Memory is a single text file at `data/MEMORY.md` with `## [id] timestamp (tags: ...)` blocks, edited via six flat tools (`memory_save`, `memory_search`, `memory_list`, `memory_get`, `memory_edit`, `memory_delete`) implemented in `agent/src/core/tools/memory_tools.rs`. Caps: 64 KB total, 200 entries — enforced loudly (errors propagate to the LLM). Nothing is auto-injected into the system prompt; the agent fetches on demand. Each save/edit/delete returns a capacity footer; at >=70% the agent surfaces this to the user and proposes a compaction plan rather than grooming silently. Vectors / embeddings are intentionally not used — see commit history if revisiting.
 
 ## Shared Concepts
 

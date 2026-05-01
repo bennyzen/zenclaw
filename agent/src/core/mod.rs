@@ -3,7 +3,6 @@ pub mod cloud;
 pub mod compaction;
 pub mod cron;
 pub mod gateway;
-pub mod memory;
 pub mod prompt;
 pub mod sessions;
 pub mod tool_loop;

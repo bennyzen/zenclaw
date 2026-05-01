@@ -21,18 +21,15 @@ const SOUL_FILENAMES: &[&str] = &[
     "BOOTSTRAP.md",
 ];
 
-/// Optional files — included only if present and non-empty.
-const OPTIONAL_FILENAMES: &[&str] = &["MEMORY.md"];
-
-/// Maximum number of recent memory files to include in context.
-const MAX_MEMORIES: usize = 3;
-
-/// Load all workspace context files from the data directory.
+/// Load workspace context files from the data directory.
 ///
 /// 1. Flash files (AGENTS.md, TOOLS.md) — startup behavior guidance
 /// 2. Soul files (SOUL.md, etc.) — agent identity
-/// 3. Optional files (MEMORY.md) — only if present and non-empty
-/// 4. Recent memory files from `{data_dir}/memory/` (newest first, up to 3)
+///
+/// MEMORY.md is intentionally NOT loaded here. It used to be dumped verbatim
+/// into the system prompt on every turn — a token-cost and attention-pollution
+/// disaster. Memory is retrievable on demand via memory_search / memory_list /
+/// memory_get tools.
 pub fn load_bootstrap_files(data_dir: &str) -> Vec<ContextFile> {
     let mut results = Vec::new();
 
@@ -45,42 +42,6 @@ pub fn load_bootstrap_files(data_dir: &str) -> Vec<ContextFile> {
     for filename in SOUL_FILENAMES {
         if let Some(cf) = resolve_file(data_dir, filename) {
             results.push(cf);
-        }
-    }
-
-    // Optional files — only if non-empty
-    for filename in OPTIONAL_FILENAMES {
-        if let Some(cf) = resolve_file(data_dir, filename) {
-            if !cf.content.is_empty() {
-                results.push(cf);
-            }
-        }
-    }
-
-    // Recent memory files — newest first (filenames starting with digits)
-    let memory_dir = format!("{}/memory", data_dir);
-    if let Ok(mut entries) = fs::read_dir(&memory_dir) {
-        let mut memory_files: Vec<String> = entries
-            .by_ref()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|name| name.ends_with(".md") && name.starts_with(|c: char| c.is_ascii_digit()))
-            .collect();
-
-        memory_files.sort_by(|a, b| b.cmp(a)); // newest first
-        memory_files.truncate(MAX_MEMORIES);
-
-        for mem_filename in memory_files {
-            let mem_path = format!("{}/{}", memory_dir, mem_filename);
-            if let Some(content) = read_file_trimmed(&mem_path) {
-                if !content.is_empty() {
-                    results.push(ContextFile {
-                        name: format!("memory/{}", mem_filename),
-                        path: mem_path,
-                        content,
-                    });
-                }
-            }
         }
     }
 
@@ -219,20 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn load_bootstrap_loads_memory_files() {
-        let tmp = std::env::temp_dir().join(format!("zenclaw_ws_mem_{}", std::process::id()));
-        let mem_dir = format!("{}/memory", tmp.display());
-        fs::create_dir_all(&mem_dir).unwrap();
+    fn load_bootstrap_does_not_inject_memory_md() {
+        let tmp = std::env::temp_dir().join(format!("zenclaw_ws_no_mem_{}", std::process::id()));
+        let data_dir = tmp.to_str().unwrap();
+        fs::create_dir_all(data_dir).unwrap();
+        fs::write(format!("{}/MEMORY.md", data_dir), "huge memory dump").unwrap();
+        fs::write(format!("{}/SOUL.md", data_dir), "I am ZenClaw.").unwrap();
 
-        fs::write(format!("{}/001_first.md", mem_dir), "memory one").unwrap();
-        fs::write(format!("{}/002_second.md", mem_dir), "memory two").unwrap();
-        fs::write(format!("{}/not_a_memory.md", mem_dir), "ignored").unwrap();
-
-        let files = load_bootstrap_files(tmp.to_str().unwrap());
-        let mem_files: Vec<_> = files.iter().filter(|f| f.name.starts_with("memory/")).collect();
-        assert_eq!(mem_files.len(), 2);
-        // Newest first
-        assert!(mem_files[0].name.contains("002"));
+        let files = load_bootstrap_files(data_dir);
+        assert!(files.iter().all(|f| f.name != "MEMORY.md"),
+            "MEMORY.md must NOT be auto-injected; it bloats the system prompt");
+        // SOUL.md still comes through.
+        assert!(files.iter().any(|f| f.name == "SOUL.md"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

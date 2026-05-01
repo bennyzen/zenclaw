@@ -6,7 +6,6 @@ use log::info;
 use crate::config::Config;
 use crate::core::agent_loop;
 use crate::core::compaction;
-use crate::core::memory::MemoryStore;
 use crate::core::prompt;
 use crate::core::runner::LlmRunner;
 use crate::core::sessions::SessionManager;
@@ -14,12 +13,12 @@ use crate::core::tools::{ToolContext, ToolRegistry};
 use crate::core::types::{ContentPart, Message, MessageContent, Role};
 use crate::core::workspace;
 
-/// Core orchestrator. Holds config, tools, sessions, memory, and provides the chat() entry point.
+/// Core orchestrator. Holds config, tools, sessions, and provides the chat() entry point.
+/// Memory is file-backed (data/MEMORY.md) and accessed via memory_* tools — no in-process state.
 pub struct Gateway {
     pub config: Arc<Config>,
     pub tools: ToolRegistry,
     pub sessions: Arc<SessionManager>,
-    pub memory: Arc<Mutex<MemoryStore>>,
     pub runner: Box<dyn LlmRunner>,
     pub data_dir: String,
     /// Per-chat cancellation flags — new message on a busy chat cancels the running turn.
@@ -37,7 +36,6 @@ impl Gateway {
             config: config.clone(),
             tools,
             sessions: Arc::new(SessionManager::new(&sessions_dir)),
-            memory: Arc::new(Mutex::new(MemoryStore::new(data_dir))),
             data_dir: data_dir.to_string(),
             active_chats: Mutex::new(HashMap::new()),
         }

@@ -8,7 +8,12 @@ const ZENCLAW_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Maps tool name -> human-readable description.
 const TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
     ("file", "File operations: read, write, edit, delete, list_dir"),
-    ("memory", "Long-term memory: save/search/get/reindex"),
+    ("memory_save",   "Persist a fact, preference, or constraint that should outlive this chat"),
+    ("memory_search", "Keyword search over persistent memory (optionally filtered by tag)"),
+    ("memory_list",   "List memory entries (headers only, or full content with a tag filter)"),
+    ("memory_get",    "Retrieve a memory entry by ID"),
+    ("memory_edit",   "Update an existing memory entry's content and/or tags"),
+    ("memory_delete", "Permanently delete a memory entry by ID"),
     ("cron", "Scheduled tasks: add/list/remove/run/update"),
     ("web_fetch", "Fetch and read the content of a specific URL"),
     ("web_search", "Search the web"),
@@ -154,8 +159,12 @@ fn build_tooling_section(tools: &[ToolDefinition]) -> String {
             .to_string(),
     );
     lines.push(
-        "When the user asks you to remember something, ALWAYS call memory(action=\"save\", content=\"...\"). \
-         Never just say \"I'll remember\" — persist it with the tool."
+        "Memory is fetch-on-demand: nothing is auto-loaded. Before responding when the user might \
+         have told you something relevant before (preferences, prior decisions, project context), \
+         call memory_search or memory_list. When the user states a preference, fact about themselves, \
+         or a decision worth remembering, call memory_save — never just say \"I'll remember\". When \
+         a memory_save/edit/delete result reports >=70% capacity, surface this to the user and propose \
+         a specific compaction plan; never groom memory unilaterally — wait for explicit approval."
             .to_string(),
     );
     lines.push(

@@ -14,7 +14,6 @@ nic-wifi-hosted   = ["esp32"]   # WiFi via esp_hosted (C6/C5) — v2
 nic-eth           = ["esp32"]   # Internal EMAC + external PHY (P4)
 
 usb_storage = ["esp32"]
-hnsw = ["dep:usearch"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -50,9 +49,6 @@ embedded-svc = { version = "0.29", optional = true }
 teloxide = { version = "0.17", features = ["macros"], optional = true }
 reqwest-eventsource = { version = "0.6", optional = true }
 hostname = { version = "0.4", optional = true }
-
-# Optional
-usearch = { version = "2", optional = true }
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

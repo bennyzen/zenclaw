@@ -1,160 +1,1155 @@
+//! Persistent memory tools — six flat tools backed by a single
+//! `data/MEMORY.md` text file. No vectors, no embeddings, no hidden
+//! background work. Every save/edit/delete is a visible tool call,
+//! and the capacity signal in tool results nudges the agent to ask
+//! the user before grooming memory unilaterally.
+//!
+//! On-disk format. The current format puts the title on the `##`
+//! markdown heading and pushes id/timestamp/tags to a metadata line
+//! below it:
+//!
+//! ```text
+//! ## Prefers explicit error handling
+//! [mem_a3f2c1d8] 2026-05-01T10:30:00Z (tags: preference, code-style)
+//!
+//! Hates unwrap() outside tests, prefers Result<T, E>.
+//! ```
+//!
+//! The legacy format (no title; metadata fused into the heading) is
+//! still readable and is preserved on round-trip until the entry is
+//! edited:
+//!
+//! ```text
+//! ## [97de55fb-532e-4f3f-82fb-004f5f5eb4b6] 2026-04-15T10:00:00Z (tags: legacy)
+//! Body content.
+//! ```
+//!
+//! Caps: 64 KB total + 200 entries. Hard fail at either; warning footer
+//! at >= 70%. The agent surfaces near-cap conditions to the user and
+//! proposes a compaction plan rather than deleting silently.
+//!
+//! Title cap: 80 chars (commit-subject convention).
+//!
+//! Limitation: a memory body containing a line that looks like the
+//! current header (`## ` followed on the next non-blank line by a
+//! `[<id>] <timestamp>` metadata line) would confuse the parser. This
+//! is unlikely in practice and the model should not produce such
+//! content. If it ever bites, escape on serialize.
+
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::core::tools::{Tool, ToolContext, ToolResult};
 use crate::core::types::ToolDefinition;
 
-pub struct MemoryTool;
+/// Hard byte cap for the entire MEMORY.md file.
+const MAX_BYTES: usize = 64 * 1024;
+/// Hard entry-count cap.
+const MAX_ENTRIES: usize = 200;
+/// Capacity at which the tool result starts nudging the agent to compact.
+const WARN_THRESHOLD_PCT: usize = 70;
+/// Top-K cutoff for memory_search.
+const SEARCH_TOP_K: usize = 10;
+/// Title cap (chars). Commit-subject convention.
+const MAX_TITLE_CHARS: usize = 80;
+/// Fallback "title" length for legacy (titleless) entries in list output.
+const LEGACY_TITLE_PREVIEW_CHARS: usize = 60;
+
+// --- Tool structs ---
+
+pub struct MemorySaveTool;
+pub struct MemorySearchTool;
+pub struct MemoryListTool;
+pub struct MemoryGetTool;
+pub struct MemoryEditTool;
+pub struct MemoryDeleteTool;
+
+// --- memory_save ---
 
 #[async_trait]
-impl Tool for MemoryTool {
+impl Tool for MemorySaveTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "memory".to_string(),
-            description: "Persistent memory. Actions: save, search, get, reindex.".to_string(),
+            name: "memory_save".to_string(),
+            description: "Persist a fact, preference, or constraint that should outlive this chat. \
+                Call this when the user states a preference, a fact about themselves, project context, \
+                or a decision they want remembered. Memory survives reboots. Provide a short, \
+                descriptive title (≤80 chars, like a commit subject) — it's how you'll find this entry \
+                later in memory_list. Returns the new memory ID and a capacity signal: when capacity \
+                reaches 70%, surface this to the user and propose a compaction plan with specific \
+                entries to merge or delete; never groom memory silently.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": {
+                    "title": {
                         "type": "string",
-                        "enum": ["save", "search", "get", "reindex"],
-                        "description": "Operation to perform"
+                        "description": "Short label (≤80 chars). Examples: \"Prefers explicit error handling\", \"Lives in Berlin\", \"ZenClaw runs on ESP32\"."
                     },
                     "content": {
                         "type": "string",
-                        "description": "Content to save (save) or query string (search)"
+                        "description": "Body — fuller detail, context, examples. Optional: a one-liner can have title only."
                     },
                     "tags": {
                         "type": "string",
-                        "description": "Comma-separated tags (save)"
-                    },
-                    "id": {
-                        "type": "string",
-                        "description": "Memory entry ID (get)"
+                        "description": "Optional comma-separated tags for filtering, e.g. \"preference, code-style\"."
                     }
                 },
-                "required": ["action"]
+                "required": ["title"]
             }),
         }
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let action = args["action"].as_str().unwrap_or("");
+        let title = match args["title"].as_str() {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => return ToolResult::Error("memory_save: 'title' is required and must be non-empty".into()),
+        };
+        if title.chars().count() > MAX_TITLE_CHARS {
+            return ToolResult::Error(format!(
+                "memory_save: title must be ≤{} chars (got {}). Shorten it; put detail in 'content'.",
+                MAX_TITLE_CHARS,
+                title.chars().count(),
+            ));
+        }
+        let content = args["content"]
+            .as_str()
+            .map(|c| c.trim().to_string())
+            .unwrap_or_default();
+        let tags = parse_tags(args["tags"].as_str().unwrap_or(""));
 
-        match action {
-            "save" => do_save(&args, ctx),
-            "search" => do_search(&args, ctx),
-            "get" => do_get(&args, ctx),
-            "reindex" => do_reindex(ctx),
-            _ => ToolResult::Error(format!("Unknown action '{}'", action)),
+        let path = memory_path(ctx);
+        let mut blocks = match read_blocks(&path) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
+        };
+
+        if blocks.len() >= MAX_ENTRIES {
+            return ToolResult::Error(format!(
+                "Memory full: {}/{} entries. Tell the user and propose a compaction plan, then call memory_delete or memory_edit before retrying.",
+                blocks.len(),
+                MAX_ENTRIES,
+            ));
+        }
+
+        let id = format!("mem_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        blocks.push(MemoryBlock { id: id.clone(), timestamp, title, tags, content });
+
+        let serialized = serialize_blocks(&blocks);
+        if serialized.len() > MAX_BYTES {
+            return ToolResult::Error(format!(
+                "Memory full: would be {}B (max {}B). Tell the user and propose a compaction plan first.",
+                serialized.len(),
+                MAX_BYTES,
+            ));
+        }
+
+        if let Err(e) = write_file(&path, &serialized) {
+            return ToolResult::Error(format!("Failed to write memory: {}", e));
+        }
+
+        let footer = capacity_footer(serialized.len(), blocks.len());
+        ToolResult::Text(format!("Saved {}.\n{}", id, footer))
+    }
+}
+
+// --- memory_search ---
+
+#[async_trait]
+impl Tool for MemorySearchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_search".to_string(),
+            description: "Search persistent memory by keyword. Use this whenever the user mentions \
+                something they may have told you before (preferences, prior decisions, project context). \
+                Returns up to 10 ranked matches with full content. Optionally filter by tag. \
+                Multi-word queries match if any term is present; entries with more matches rank higher; \
+                tag matches rank highest.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search for."
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Optional: restrict to entries with this tag (case-insensitive)."
+                    }
+                },
+                "required": ["query"]
+            }),
         }
     }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let query = match args["query"].as_str() {
+            Some(q) if !q.trim().is_empty() => q.trim().to_string(),
+            _ => return ToolResult::Error("memory_search: 'query' is required".into()),
+        };
+        let tag_filter = args["tag"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        let blocks = match read_blocks(&memory_path(ctx)) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
+        };
+        if blocks.is_empty() {
+            return ToolResult::Text("No memories saved yet.".into());
+        }
+
+        let ranked = rank_search(&blocks, &query, tag_filter);
+        if ranked.is_empty() {
+            return ToolResult::Text(format!("No matches for '{}'.", query));
+        }
+
+        let rendered: Vec<String> = ranked
+            .into_iter()
+            .take(SEARCH_TOP_K)
+            .map(|(_, b)| format_block(b))
+            .collect();
+        ToolResult::Text(rendered.join("\n\n"))
+    }
+}
+
+// --- memory_list ---
+
+#[async_trait]
+impl Tool for MemoryListTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_list".to_string(),
+            description: "List persistent memory entries. Without a tag, returns one line per entry: \
+                id, date, tags, and a short content preview — enough to decide which entries to \
+                memory_get for full content. With a tag, returns full content of entries matching \
+                that tag.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "Optional: restrict to entries with this tag (case-insensitive) and return full content."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let tag_filter = args["tag"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        let blocks = match read_blocks(&memory_path(ctx)) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
+        };
+        if blocks.is_empty() {
+            return ToolResult::Text("No memories saved yet.".into());
+        }
+
+        let filtered: Vec<&MemoryBlock> = blocks
+            .iter()
+            .filter(|b| match tag_filter {
+                None => true,
+                Some(tag) => b.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)),
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return ToolResult::Text(format!("No memories with tag '{}'.", tag_filter.unwrap_or("")));
+        }
+
+        let lines: Vec<String> = if tag_filter.is_some() {
+            filtered.iter().map(|b| format_block(b)).collect()
+        } else {
+            filtered.iter().map(|b| format_list_entry(b)).collect()
+        };
+
+        ToolResult::Text(format!("{} memories:\n{}", filtered.len(), lines.join("\n")))
+    }
+}
+
+// --- memory_get ---
+
+#[async_trait]
+impl Tool for MemoryGetTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_get".to_string(),
+            description: "Retrieve a specific memory entry by ID.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID, e.g. mem_a3f2c1d8."}
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let id = match args["id"].as_str() {
+            Some(i) if !i.trim().is_empty() => i.trim().to_string(),
+            _ => return ToolResult::Error("memory_get: 'id' is required".into()),
+        };
+
+        let blocks = match read_blocks(&memory_path(ctx)) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
+        };
+
+        match blocks.iter().find(|b| b.id == id) {
+            Some(b) => ToolResult::Text(format_block(b)),
+            None => ToolResult::Error(format!("Memory '{}' not found.", id)),
+        }
+    }
+}
+
+// --- memory_edit ---
+
+#[async_trait]
+impl Tool for MemoryEditTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_edit".to_string(),
+            description: "Update an existing memory entry's title, content, and/or tags. Use to correct \
+                stale facts, merge two memories into one, refine wording, or add a title to a legacy \
+                (untitled) entry. The original id and timestamp are preserved. For agent-initiated edits \
+                during compaction, describe the change to the user and wait for approval before calling.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id":      {"type": "string", "description": "Memory ID to update."},
+                    "title":   {"type": "string", "description": "Optional: new title (≤80 chars, replaces existing)."},
+                    "content": {"type": "string", "description": "Optional: new content (replaces existing). Pass \"\" to clear."},
+                    "tags":    {"type": "string", "description": "Optional: new comma-separated tags (replaces existing). Pass \"\" to clear."}
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let id = match args["id"].as_str() {
+            Some(i) if !i.trim().is_empty() => i.trim().to_string(),
+            _ => return ToolResult::Error("memory_edit: 'id' is required".into()),
+        };
+        let new_title = args["title"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if let Some(t) = &new_title {
+            if t.chars().count() > MAX_TITLE_CHARS {
+                return ToolResult::Error(format!(
+                    "memory_edit: title must be ≤{} chars (got {}).",
+                    MAX_TITLE_CHARS,
+                    t.chars().count(),
+                ));
+            }
+        }
+        // Distinguish "not provided" from "provided as empty string" — empty
+        // string is a valid clear-the-field signal.
+        let new_content = args.get("content").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+        let new_tags = args.get("tags").and_then(|v| v.as_str()).map(parse_tags);
+
+        if new_title.is_none() && new_content.is_none() && new_tags.is_none() {
+            return ToolResult::Error("memory_edit: must provide 'title', 'content', and/or 'tags'".into());
+        }
+
+        let path = memory_path(ctx);
+        let mut blocks = match read_blocks(&path) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
+        };
+
+        let block = match blocks.iter_mut().find(|b| b.id == id) {
+            Some(b) => b,
+            None => return ToolResult::Error(format!("Memory '{}' not found.", id)),
+        };
+
+        if let Some(t) = new_title {
+            block.title = t;
+        }
+        if let Some(c) = new_content {
+            block.content = c;
+        }
+        if let Some(t) = new_tags {
+            block.tags = t;
+        }
+
+        let serialized = serialize_blocks(&blocks);
+        if serialized.len() > MAX_BYTES {
+            return ToolResult::Error(format!(
+                "Edit would exceed memory cap: {}B > {}B. Trim or delete other entries first.",
+                serialized.len(),
+                MAX_BYTES,
+            ));
+        }
+
+        if let Err(e) = write_file(&path, &serialized) {
+            return ToolResult::Error(format!("Failed to write memory: {}", e));
+        }
+
+        let footer = capacity_footer(serialized.len(), blocks.len());
+        ToolResult::Text(format!("Edited {}.\n{}", id, footer))
+    }
+}
+
+// --- memory_delete ---
+
+#[async_trait]
+impl Tool for MemoryDeleteTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_delete".to_string(),
+            description: "Permanently delete a memory entry by ID. User-initiated deletes (\"forget X\") \
+                execute directly. For agent-initiated deletes during compaction, propose to the user and \
+                wait for explicit approval before calling.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Memory ID to delete."}
+                },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let id = match args["id"].as_str() {
+            Some(i) if !i.trim().is_empty() => i.trim().to_string(),
+            _ => return ToolResult::Error("memory_delete: 'id' is required".into()),
+        };
+
+        let path = memory_path(ctx);
+        let mut blocks = match read_blocks(&path) {
+            Ok(b) => b,
+            Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
+        };
+
+        let original_len = blocks.len();
+        blocks.retain(|b| b.id != id);
+        if blocks.len() == original_len {
+            return ToolResult::Error(format!("Memory '{}' not found.", id));
+        }
+
+        let serialized = serialize_blocks(&blocks);
+        if let Err(e) = write_file(&path, &serialized) {
+            return ToolResult::Error(format!("Failed to write memory: {}", e));
+        }
+
+        let footer = capacity_footer(serialized.len(), blocks.len());
+        ToolResult::Text(format!("Deleted {}.\n{}", id, footer))
+    }
+}
+
+// --- shared types & helpers ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryBlock {
+    id: String,
+    timestamp: String,
+    /// Short label, ≤ MAX_TITLE_CHARS. Empty for legacy entries; on display we
+    /// fall back to a derived snippet of `content`.
+    title: String,
+    tags: Vec<String>,
+    content: String,
+}
+
+struct ParsedMetadata {
+    id: String,
+    timestamp: String,
+    tags: Vec<String>,
 }
 
 fn memory_path(ctx: &ToolContext) -> String {
     format!("{}/MEMORY.md", ctx.data_dir)
 }
 
-fn do_save(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {
-    let content = match args["content"].as_str() {
-        Some(c) => c,
-        None => return ToolResult::Error("Missing 'content' for save".to_string()),
-    };
-    let tags = args["tags"].as_str().unwrap_or("");
+fn parse_tags(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
 
-    let path = memory_path(ctx);
+fn read_blocks(path: &str) -> std::io::Result<Vec<MemoryBlock>> {
+    match std::fs::read_to_string(path) {
+        Ok(c) => Ok(parse_blocks(&c)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
 
-    // Ensure directory exists. SPIFFS rejects mkdir with ENOTSUP — that's
-    // fine, paths like "/data/MEMORY.md" are flat filenames there, so
-    // ignore the error and let the open call below create the file.
-    if let Some(parent) = std::path::Path::new(&path).parent() {
+fn write_file(path: &str, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        // SPIFFS rejects mkdir with ENOTSUP on flat filesystems; ignore.
         let _ = std::fs::create_dir_all(parent);
     }
+    std::fs::write(path, content)
+}
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+/// Parse the on-disk MEMORY.md format. Accepts both the current shape
+/// (`## Title\n[id] ts (tags)\n\nbody`) and the legacy shape
+/// (`## [id] ts (tags)\nbody`).
+fn parse_blocks(content: &str) -> Vec<MemoryBlock> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut blocks: Vec<MemoryBlock> = Vec::new();
+    let mut i = 0;
 
-    let entry = if tags.is_empty() {
-        format!("\n## [{}] {}\n{}\n", id, timestamp, content)
-    } else {
-        format!("\n## [{}] {} (tags: {})\n{}\n", id, timestamp, tags, content)
-    };
+    while i < lines.len() {
+        match try_parse_header_at(&lines, i) {
+            Some((block_header, body_start)) => {
+                let body_end = next_block_start(&lines, body_start);
+                let mut block = block_header;
+                block.content = lines[body_start..body_end].join("\n").trim().to_string();
+                blocks.push(block);
+                i = body_end;
+            }
+            None => i += 1,
+        }
+    }
+    blocks
+}
 
-    use std::io::Write;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path);
+/// If `lines[i]` starts a memory header (current or legacy), return the
+/// partially-built block (without `content`) plus the index where its body
+/// begins. Otherwise `None`.
+fn try_parse_header_at(lines: &[&str], i: usize) -> Option<(MemoryBlock, usize)> {
+    let rest = lines[i].trim_start().strip_prefix("## ")?.trim();
 
-    match file {
-        Ok(mut f) => match f.write_all(entry.as_bytes()) {
-            Ok(()) => ToolResult::Text(format!("Saved memory {}", id)),
-            Err(e) => ToolResult::Error(format!("Write failed: {}", e)),
+    // Legacy: heading-line carries the metadata directly.
+    if rest.starts_with('[') {
+        let meta = parse_metadata(rest)?;
+        return Some((
+            MemoryBlock {
+                id: meta.id,
+                timestamp: meta.timestamp,
+                title: String::new(),
+                tags: meta.tags,
+                content: String::new(),
+            },
+            i + 1,
+        ));
+    }
+
+    // Current: heading is the title, metadata follows on the next non-blank line.
+    let mut j = i + 1;
+    while j < lines.len() && lines[j].trim().is_empty() {
+        j += 1;
+    }
+    if j >= lines.len() {
+        return None;
+    }
+    let meta = parse_metadata(lines[j].trim())?;
+    Some((
+        MemoryBlock {
+            id: meta.id,
+            timestamp: meta.timestamp,
+            title: rest.to_string(),
+            tags: meta.tags,
+            content: String::new(),
         },
-        Err(e) => ToolResult::Error(format!("Failed to open memory file: {}", e)),
-    }
+        j + 1,
+    ))
 }
 
-fn do_search(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {
-    let query = match args["content"].as_str() {
-        Some(q) => q.to_lowercase(),
-        None => return ToolResult::Error("Missing 'content' (query) for search".to_string()),
+/// Find the next index `>= start` that begins a new memory header, or `lines.len()`.
+fn next_block_start(lines: &[&str], start: usize) -> usize {
+    let mut i = start;
+    while i < lines.len() {
+        if try_parse_header_at(lines, i).is_some() {
+            return i;
+        }
+        i += 1;
+    }
+    lines.len()
+}
+
+/// Parse a metadata fragment: `[<id>] <timestamp>` or
+/// `[<id>] <timestamp> (tags: <a, b, c>)`.
+fn parse_metadata(s: &str) -> Option<ParsedMetadata> {
+    let s = s.trim().strip_prefix('[')?;
+    let (id, rest) = s.split_once(']')?;
+    let rest = rest.trim_start();
+
+    let (timestamp, tags) = match rest.find(" (tags:") {
+        Some(idx) => {
+            let ts = rest[..idx].trim().to_string();
+            let tags_part = rest[idx + " (tags:".len()..].trim_end_matches(')').trim();
+            let tags = tags_part
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            (ts, tags)
+        }
+        None => (rest.trim().to_string(), Vec::new()),
     };
 
-    let path = memory_path(ctx);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return ToolResult::Text("No memories found.".to_string()),
-    };
+    Some(ParsedMetadata { id: id.trim().to_string(), timestamp, tags })
+}
 
-    let keywords: Vec<&str> = query.split_whitespace().collect();
-    let mut results: Vec<String> = Vec::new();
-
-    // Split into sections by ## headers
-    let sections: Vec<&str> = content.split("\n## ").collect();
-    for section in sections.iter().skip(1) {
-        let lower = section.to_lowercase();
-        if keywords.iter().any(|kw| lower.contains(kw)) {
-            results.push(format!("## {}", section.trim()));
+/// Serialize blocks. Entries with a title use the current format; entries
+/// without one (legacy, never edited) are written back in legacy format so
+/// the on-disk shape doesn't churn for untouched data.
+fn serialize_blocks(blocks: &[MemoryBlock]) -> String {
+    let mut out = String::new();
+    for (i, b) in blocks.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if b.title.is_empty() {
+            out.push_str("## ");
+            out.push_str(&metadata_line(b));
+            out.push('\n');
+            out.push_str(&b.content);
+            out.push('\n');
+        } else {
+            out.push_str("## ");
+            out.push_str(&b.title);
+            out.push('\n');
+            out.push_str(&metadata_line(b));
+            out.push_str("\n\n");
+            out.push_str(&b.content);
+            out.push('\n');
         }
     }
+    out
+}
 
-    if results.is_empty() {
-        ToolResult::Text("No matching memories found.".to_string())
+fn metadata_line(b: &MemoryBlock) -> String {
+    if b.tags.is_empty() {
+        format!("[{}] {}", b.id, b.timestamp)
     } else {
-        ToolResult::Text(results.join("\n\n"))
+        format!("[{}] {} (tags: {})", b.id, b.timestamp, b.tags.join(", "))
     }
 }
 
-fn do_get(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {
-    let id = match args["id"].as_str() {
-        Some(i) => i,
-        None => return ToolResult::Error("Missing 'id' for get".to_string()),
-    };
+/// Full-block render for memory_get / memory_search results. Mirrors the
+/// on-disk layout so the agent sees exactly what's stored.
+fn format_block(b: &MemoryBlock) -> String {
+    if b.title.is_empty() {
+        format!("## {}\n{}", metadata_line(b), b.content)
+    } else {
+        format!("## {}\n{}\n\n{}", b.title, metadata_line(b), b.content)
+    }
+}
 
-    let path = memory_path(ctx);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return ToolResult::Error("No memory file found.".to_string()),
-    };
+/// One-line entry for `memory_list` (no tag filter). The id stays full so
+/// the agent can pass it to memory_get/edit/delete, but the timestamp drops
+/// to its date part. Untitled (legacy) entries fall back to a derived
+/// snippet of content so the list still has signal.
+fn format_list_entry(b: &MemoryBlock) -> String {
+    let date = b.timestamp.split('T').next().unwrap_or(&b.timestamp);
+    let label = display_title(b);
+    if b.tags.is_empty() {
+        format!("[{}] {} — {}", b.id, label, date)
+    } else {
+        format!("[{}] {} — {} (tags: {})", b.id, label, date, b.tags.join(", "))
+    }
+}
 
-    let sections: Vec<&str> = content.split("\n## ").collect();
-    for section in sections.iter().skip(1) {
-        if section.contains(id) {
-            return ToolResult::Text(format!("## {}", section.trim()));
+/// What to show as the title in list views. Prefers the explicit title;
+/// for legacy entries derives a quoted snippet from the first line of
+/// content so the agent (or user) can tell it's not a curated title.
+fn display_title(b: &MemoryBlock) -> String {
+    if !b.title.is_empty() {
+        return b.title.clone();
+    }
+    let first_line = b.content.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return "(empty)".to_string();
+    }
+    let chars: Vec<char> = first_line.chars().collect();
+    let snippet: String = if chars.len() <= LEGACY_TITLE_PREVIEW_CHARS {
+        first_line.to_string()
+    } else {
+        let trimmed: String = chars.iter().take(LEGACY_TITLE_PREVIEW_CHARS).collect();
+        format!("{}…", trimmed.trim_end())
+    };
+    format!("\"{}\"", snippet)
+}
+
+/// Tag bonus + body term frequency. For a corpus of <=200 short entries
+/// this is microseconds; no need for a real BM25 with idf precompute.
+fn rank_search<'a>(
+    blocks: &'a [MemoryBlock],
+    query: &str,
+    tag_filter: Option<&str>,
+) -> Vec<(f32, &'a MemoryBlock)> {
+    let query_lower = query.to_lowercase();
+    let query_terms: Vec<&str> = query_lower
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect();
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(f32, &MemoryBlock)> = blocks
+        .iter()
+        .filter(|b| match tag_filter {
+            None => true,
+            Some(tag) => b.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)),
+        })
+        .filter_map(|b| {
+            let s = score_block(b, &query_terms);
+            if s > 0.0 {
+                Some((s, b))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+fn score_block(b: &MemoryBlock, query_terms: &[&str]) -> f32 {
+    let title_lower = b.title.to_lowercase();
+    let body_lower = b.content.to_lowercase();
+    let body_word_count = b.content.split_whitespace().count().max(1) as f32;
+    let tags_lower: Vec<String> = b.tags.iter().map(|t| t.to_lowercase()).collect();
+
+    let mut score = 0.0;
+    for term in query_terms {
+        // Title hit: highest signal — the user-curated label IS the gist.
+        if !title_lower.is_empty() && title_lower.contains(term) {
+            score += 5.0;
+        }
+        // Tag exact match: strong signal.
+        if tags_lower.iter().any(|t| t == term) {
+            score += 3.0;
+        }
+        // Body term frequency, normalized by body length so a one-line
+        // memory matching once beats a paragraph matching once.
+        let count = body_lower.matches(term).count() as f32;
+        if count > 0.0 {
+            score += 1.0 + count / body_word_count;
+        }
+    }
+    score
+}
+
+fn capacity_footer(bytes: usize, count: usize) -> String {
+    let bytes_pct = (bytes * 100 / MAX_BYTES).min(100);
+    let count_pct = (count * 100 / MAX_ENTRIES).min(100);
+    let pct = bytes_pct.max(count_pct);
+    let base = format!(
+        "(memory: {}% — {}/{} entries, {:.1}KB/{}KB)",
+        pct,
+        count,
+        MAX_ENTRIES,
+        bytes as f32 / 1024.0,
+        MAX_BYTES / 1024,
+    );
+    if pct >= WARN_THRESHOLD_PCT {
+        format!(
+            "{}\nMemory near capacity — surface this to the user and propose a compaction plan (entries to merge or delete) before saving more. Wait for approval before calling memory_delete or memory_edit on agent-initiated changes.",
+            base
+        )
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(id: &str, ts: &str, title: &str, tags: &[&str], content: &str) -> MemoryBlock {
+        MemoryBlock {
+            id: id.into(),
+            timestamp: ts.into(),
+            title: title.into(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            content: content.into(),
         }
     }
 
-    ToolResult::Error(format!("Memory '{}' not found.", id))
-}
+    #[test]
+    fn parse_serialize_roundtrip_titled_and_legacy() {
+        let blocks = vec![
+            block("mem_aaa", "2026-05-01T10:00:00Z", "Prefers explicit errors",
+                  &["preference", "rust"], "Hates unwrap() outside tests."),
+            block("mem_bbb", "2026-05-01T11:00:00Z", "", &[], "Lives in Berlin."),
+        ];
+        let serialized = serialize_blocks(&blocks);
+        let parsed = parse_blocks(&serialized);
+        assert_eq!(parsed, blocks);
+    }
 
-fn do_reindex(ctx: &ToolContext) -> ToolResult {
-    let path = memory_path(ctx);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return ToolResult::Text("Reindex complete. 0 entries.".to_string()),
-    };
+    #[test]
+    fn parse_handles_preamble() {
+        let content = "preamble line\nmore preamble\n\n## [mem_x] 2026-05-01T00:00:00Z\nbody";
+        let blocks = parse_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id, "mem_x");
+        assert_eq!(blocks[0].title, "");
+        assert_eq!(blocks[0].content, "body");
+    }
 
-    let count = content.matches("\n## ").count();
-    ToolResult::Text(format!("Reindex complete. {} entries.", count))
+    #[test]
+    fn parse_multiline_body() {
+        let content = "## [mem_x] 2026-05-01T00:00:00Z\nline 1\nline 2\nline 3";
+        let blocks = parse_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content, "line 1\nline 2\nline 3");
+    }
+
+    #[test]
+    fn parse_handles_tags() {
+        let content = "## [mem_x] 2026-05-01T00:00:00Z (tags: a, b, c)\nbody";
+        let blocks = parse_blocks(content);
+        assert_eq!(blocks[0].tags, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_titled_format() {
+        let content = "## My title\n[mem_x] 2026-05-01T00:00:00Z (tags: foo)\n\nbody line\nsecond line";
+        let blocks = parse_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id, "mem_x");
+        assert_eq!(blocks[0].title, "My title");
+        assert_eq!(blocks[0].tags, vec!["foo"]);
+        assert_eq!(blocks[0].content, "body line\nsecond line");
+    }
+
+    #[test]
+    fn parse_mixed_titled_and_legacy() {
+        let content = "\
+## Titled one
+[mem_a] 2026-05-01T00:00:00Z
+
+body a
+
+## [mem_b] 2026-05-01T01:00:00Z (tags: legacy)
+body b
+";
+        let blocks = parse_blocks(content);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].title, "Titled one");
+        assert_eq!(blocks[0].content, "body a");
+        assert_eq!(blocks[1].title, "");
+        assert_eq!(blocks[1].id, "mem_b");
+        assert_eq!(blocks[1].content, "body b");
+    }
+
+    #[test]
+    fn parse_does_not_split_on_body_hash_headers() {
+        // A `## ` line in the body, *not* followed by a metadata line, must
+        // be treated as body content, not a memory boundary.
+        let content = "\
+## Real title
+[mem_x] 2026-05-01T00:00:00Z
+
+intro line
+## Looks like a header but is body
+trailing body
+";
+        let blocks = parse_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].content.contains("Looks like a header but is body"));
+    }
+
+    #[test]
+    fn parse_tags_helper_trims_and_drops_empty() {
+        assert_eq!(parse_tags(""), Vec::<String>::new());
+        assert_eq!(parse_tags("a"), vec!["a"]);
+        assert_eq!(parse_tags(" a ,  b ,, c "), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn ranks_title_match_above_tag_above_body() {
+        let blocks = vec![
+            block("mem_t", "t", "Loves rust",   &[],         "favorite language"),
+            block("mem_g", "t", "",             &["rust"],   "favorite language"),
+            block("mem_b", "t", "",             &[],         "i talk about rust often"),
+        ];
+        let ranked = rank_search(&blocks, "rust", None);
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].1.id, "mem_t");
+        assert_eq!(ranked[1].1.id, "mem_g");
+        assert_eq!(ranked[2].1.id, "mem_b");
+    }
+
+    #[test]
+    fn search_filters_by_tag() {
+        let blocks = vec![
+            block("mem_a", "t", "", &["rust"], "favorite"),
+            block("mem_b", "t", "", &["python"], "favorite"),
+        ];
+        let ranked = rank_search(&blocks, "favorite", Some("python"));
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].1.id, "mem_b");
+    }
+
+    #[test]
+    fn display_title_uses_title_when_set() {
+        let b = block("mem_x", "t", "Real title", &[], "body");
+        assert_eq!(display_title(&b), "Real title");
+    }
+
+    #[test]
+    fn display_title_quotes_first_line_when_legacy() {
+        let b = block("mem_x", "t", "", &[], "first line content\nmore body");
+        assert_eq!(display_title(&b), "\"first line content\"");
+    }
+
+    #[test]
+    fn display_title_truncates_long_legacy_first_line() {
+        let long = "a".repeat(200);
+        let b = block("mem_x", "t", "", &[], &long);
+        let dt = display_title(&b);
+        assert!(dt.starts_with('"') && dt.ends_with("…\""));
+        assert!(dt.chars().count() <= LEGACY_TITLE_PREVIEW_CHARS + 4); // quotes + ellipsis
+    }
+
+    #[test]
+    fn capacity_footer_warns_at_70_percent() {
+        let footer = capacity_footer(50 * 1024, 100);
+        assert!(footer.contains("78%"), "expected 78% in: {}", footer);
+        assert!(footer.contains("near capacity"));
+    }
+
+    #[test]
+    fn capacity_footer_picks_max_dimension() {
+        // 10KB but 180 entries — count dominates
+        let footer = capacity_footer(10 * 1024, 180);
+        assert!(footer.contains("90%"), "expected 90% (count-driven) in: {}", footer);
+    }
+
+    #[test]
+    fn capacity_footer_silent_below_threshold() {
+        let footer = capacity_footer(5 * 1024, 10);
+        assert!(!footer.contains("near capacity"));
+    }
+
+    #[cfg(feature = "desktop")]
+    mod tool_tests {
+        use super::*;
+        use crate::config::Config;
+        use crate::core::sessions::SessionManager;
+        use std::sync::Arc;
+
+        fn ctx(tmp: &tempfile::TempDir) -> ToolContext {
+            let config: Config = serde_json::from_str("{}").expect("default config");
+            ToolContext {
+                chat_id: "test".into(),
+                prompt_source: None,
+                config: Arc::new(config),
+                sessions: Arc::new(SessionManager::new(&format!("{}/sessions", tmp.path().display()))),
+                data_dir: tmp.path().display().to_string(),
+            }
+        }
+
+        fn unwrap_text(r: ToolResult) -> String {
+            match r {
+                ToolResult::Text(s) => s,
+                ToolResult::Error(e) => panic!("expected Text, got Error: {}", e),
+                ToolResult::Json(v) => panic!("expected Text, got Json: {}", v),
+            }
+        }
+
+        fn unwrap_error(r: ToolResult) -> String {
+            match r {
+                ToolResult::Error(s) => s,
+                other => panic!("expected Error, got {:?}", other),
+            }
+        }
+
+        fn id_from_save(saved: &str) -> &str {
+            saved.lines().next().unwrap().trim_start_matches("Saved ").trim_end_matches('.')
+        }
+
+        #[tokio::test]
+        async fn save_then_get_roundtrip() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+
+            let saved = unwrap_text(MemorySaveTool.execute(json!({
+                "title":   "Loves Rust",
+                "content": "Especially the borrow checker.",
+                "tags":    "preference"
+            }), &c).await);
+            let id = id_from_save(&saved);
+
+            let got = unwrap_text(MemoryGetTool.execute(json!({"id": id}), &c).await);
+            assert!(got.contains("Loves Rust"), "expected title in get: {}", got);
+            assert!(got.contains("borrow checker"));
+            assert!(got.contains("preference"));
+        }
+
+        #[tokio::test]
+        async fn save_requires_title() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+
+            let err = unwrap_error(MemorySaveTool.execute(json!({"content": "fact only"}), &c).await);
+            assert!(err.contains("title"), "expected title-required error: {}", err);
+        }
+
+        #[tokio::test]
+        async fn save_rejects_overlong_title() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            let long_title = "x".repeat(MAX_TITLE_CHARS + 1);
+            let err = unwrap_error(MemorySaveTool.execute(json!({"title": long_title}), &c).await);
+            assert!(err.contains("≤80"), "expected length error: {}", err);
+        }
+
+        #[tokio::test]
+        async fn save_allows_title_only() {
+            // One-liner: title only, no body.
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            let saved = unwrap_text(MemorySaveTool.execute(json!({"title": "A bare fact"}), &c).await);
+            let id = id_from_save(&saved);
+            let got = unwrap_text(MemoryGetTool.execute(json!({"id": id}), &c).await);
+            assert!(got.contains("A bare fact"));
+        }
+
+        #[tokio::test]
+        async fn search_finds_by_title_and_tag_and_body() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+
+            MemorySaveTool.execute(json!({"title": "Lives in Berlin",     "tags": "profile"}), &c).await;
+            MemorySaveTool.execute(json!({"title": "Drinks black coffee", "tags": "preference"}), &c).await;
+
+            let by_title = unwrap_text(MemorySearchTool.execute(json!({"query": "berlin"}), &c).await);
+            assert!(by_title.contains("Berlin"));
+
+            let by_tag = unwrap_text(MemorySearchTool.execute(json!({"query": "drinks", "tag": "preference"}), &c).await);
+            assert!(by_tag.contains("coffee"));
+
+            let no_match = unwrap_text(MemorySearchTool.execute(json!({"query": "xyzzy"}), &c).await);
+            assert!(no_match.contains("No matches"));
+        }
+
+        #[tokio::test]
+        async fn list_shows_titles_without_tag() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            MemorySaveTool.execute(json!({"title": "Fact One"}), &c).await;
+            MemorySaveTool.execute(json!({"title": "Fact Two", "tags": "x"}), &c).await;
+
+            let listed = unwrap_text(MemoryListTool.execute(json!({}), &c).await);
+            assert!(listed.contains("2 memories"));
+            assert!(listed.contains("Fact One"), "list must show title: {}", listed);
+            assert!(listed.contains("Fact Two"), "list must show title: {}", listed);
+        }
+
+        #[tokio::test]
+        async fn list_falls_back_to_quoted_first_line_for_legacy() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            // Hand-write a legacy entry directly to disk.
+            std::fs::write(
+                format!("{}/MEMORY.md", tmp.path().display()),
+                "## [mem_legacy] 2026-04-01T00:00:00Z\nLegacy first line.\n",
+            ).unwrap();
+
+            let listed = unwrap_text(MemoryListTool.execute(json!({}), &c).await);
+            assert!(listed.contains("\"Legacy first line.\""), "expected quoted fallback: {}", listed);
+        }
+
+        #[tokio::test]
+        async fn list_full_content_with_tag_filter() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            MemorySaveTool.execute(json!({"title": "Fact One", "content": "body alpha", "tags": "x"}), &c).await;
+            MemorySaveTool.execute(json!({"title": "Fact Two", "content": "body beta",  "tags": "y"}), &c).await;
+
+            let listed = unwrap_text(MemoryListTool.execute(json!({"tag": "x"}), &c).await);
+            assert!(listed.contains("body alpha"));
+            assert!(!listed.contains("body beta"));
+        }
+
+        #[tokio::test]
+        async fn edit_replaces_title_content_and_tags() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            let saved = unwrap_text(MemorySaveTool.execute(json!({
+                "title":   "Wrong title",
+                "content": "wrong body",
+                "tags":    "old",
+            }), &c).await);
+            let id = id_from_save(&saved);
+
+            unwrap_text(MemoryEditTool.execute(json!({
+                "id":      id,
+                "title":   "Right title",
+                "content": "right body",
+                "tags":    "new",
+            }), &c).await);
+            let got = unwrap_text(MemoryGetTool.execute(json!({"id": id}), &c).await);
+            assert!(got.contains("Right title"));
+            assert!(got.contains("right body"));
+            assert!(got.contains("new"));
+            assert!(!got.contains("Wrong"));
+            assert!(!got.contains("wrong body"));
+            assert!(!got.contains("old"));
+        }
+
+        #[tokio::test]
+        async fn edit_can_add_title_to_legacy_entry() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            std::fs::write(
+                format!("{}/MEMORY.md", tmp.path().display()),
+                "## [mem_legacy] 2026-04-01T00:00:00Z\nbody\n",
+            ).unwrap();
+
+            unwrap_text(MemoryEditTool.execute(json!({
+                "id":    "mem_legacy",
+                "title": "Now titled",
+            }), &c).await);
+
+            let got = unwrap_text(MemoryGetTool.execute(json!({"id": "mem_legacy"}), &c).await);
+            assert!(got.contains("Now titled"), "title not applied: {}", got);
+        }
+
+        #[tokio::test]
+        async fn delete_removes_entry() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            let saved = unwrap_text(MemorySaveTool.execute(json!({"title": "Doomed"}), &c).await);
+            let id = id_from_save(&saved);
+
+            unwrap_text(MemoryDeleteTool.execute(json!({"id": id}), &c).await);
+            let err = unwrap_error(MemoryGetTool.execute(json!({"id": id}), &c).await);
+            assert!(err.contains("not found"));
+        }
+
+        #[tokio::test]
+        async fn save_fails_loudly_at_entry_cap() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            // Hand-craft MEMORY.md at exactly MAX_ENTRIES (legacy-shape entries are fine).
+            let blocks: Vec<MemoryBlock> = (0..MAX_ENTRIES)
+                .map(|i| block(&format!("mem_{:08x}", i), "2026-01-01T00:00:00Z", "", &[], "x"))
+                .collect();
+            std::fs::write(format!("{}/MEMORY.md", tmp.path().display()), serialize_blocks(&blocks)).unwrap();
+
+            let err = unwrap_error(MemorySaveTool.execute(json!({"title": "one more"}), &c).await);
+            assert!(err.contains("Memory full"));
+            assert!(err.contains("compaction"));
+        }
+
+        #[tokio::test]
+        async fn delete_unknown_id_errors() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            let err = unwrap_error(MemoryDeleteTool.execute(json!({"id": "mem_nope"}), &c).await);
+            assert!(err.contains("not found"));
+        }
+
+        #[tokio::test]
+        async fn edit_requires_at_least_one_field() {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(&tmp);
+            let saved = unwrap_text(MemorySaveTool.execute(json!({"title": "x"}), &c).await);
+            let id = id_from_save(&saved);
+            let err = unwrap_error(MemoryEditTool.execute(json!({"id": id}), &c).await);
+            assert!(err.contains("must provide"));
+        }
+    }
 }
