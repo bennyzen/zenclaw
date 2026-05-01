@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
+use crate::core::chat_events::ChatEvent;
 use crate::core::gateway::Gateway;
 use crate::core::sessions::SessionEntry;
 use crate::core::types::Role;
@@ -181,35 +182,85 @@ async fn api_chat_history(
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "Chat history error");
-            return Json(json!({"messages": []}));
+            return Json(json!({"events": []}));
         }
     };
 
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-    for entry in &branch {
-        if let SessionEntry::Message { role, content, .. } = entry {
-            let role_str = match role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                _ => continue,
-            };
-            if content.is_empty() {
-                continue;
+    let events = synthesize_history_events(&branch, &q.chat_id);
+
+    let trimmed = if events.len() > q.limit {
+        let start = events.len() - q.limit;
+        events.into_iter().skip(start).collect::<Vec<_>>()
+    } else {
+        events
+    };
+
+    Json(json!({"events": trimmed}))
+}
+
+/// Replay a chat session as the same `ChatEvent` stream a live turn would
+/// produce. Lossy on tool success/failure (the JSONL doesn't record an
+/// explicit `ok` flag — historical tool finishes always emit `ok: true`).
+/// Intermediate assistant prose attached to a tool-calls turn is not
+/// surfaced, matching the live agent loop which only emits `AssistantText`
+/// on the final-text branch.
+fn synthesize_history_events(branch: &[SessionEntry], chat_id: &str) -> Vec<ChatEvent> {
+    let mut out: Vec<ChatEvent> = Vec::new();
+
+    for entry in branch {
+        let SessionEntry::Message {
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+
+        match role {
+            Role::User => {
+                if !content.is_empty() {
+                    out.push(ChatEvent::UserMessage {
+                        chat_id: chat_id.to_string(),
+                        text: strip_envelope(content),
+                    });
+                }
             }
-            let content = if matches!(role, Role::User) {
-                strip_envelope(content)
-            } else {
-                content.to_string()
-            };
-            messages.push(json!({"role": role_str, "content": content}));
+            Role::Assistant => {
+                if let Some(calls) = tool_calls {
+                    for tc in calls {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&tc.function.arguments).unwrap_or(json!(null));
+                        out.push(ChatEvent::ToolCallStarted {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            args,
+                        });
+                    }
+                } else if !content.is_empty() {
+                    out.push(ChatEvent::AssistantText {
+                        text: content.clone(),
+                        is_final: true,
+                    });
+                }
+            }
+            Role::Tool => {
+                if let Some(id) = tool_call_id {
+                    out.push(ChatEvent::ToolCallFinished {
+                        id: id.clone(),
+                        ok: true,
+                        result: Some(content.clone()),
+                        error: None,
+                    });
+                }
+            }
+            Role::System => {}
         }
     }
 
-    if messages.len() > q.limit {
-        messages = messages.split_off(messages.len() - q.limit);
-    }
-
-    Json(json!({"messages": messages}))
+    out
 }
 
 /// Strip [channel timestamp] prefix from user messages.
@@ -489,46 +540,92 @@ async fn ws_chat(ws: WebSocketUpgrade, State(state): State<AppState>) -> Respons
     ws.on_upgrade(move |socket| handle_chat_ws(socket, state))
 }
 
-async fn handle_chat_ws(mut socket: WebSocket, state: AppState) {
-    while let Some(Ok(msg)) = socket.recv().await {
-        let text = match msg {
-            WsMsg::Text(t) => t.to_string(),
-            WsMsg::Close(_) => break,
-            _ => continue,
-        };
+async fn handle_chat_ws(socket: WebSocket, state: AppState) {
+    use futures::{SinkExt, StreamExt};
+    let (mut ws_tx, mut ws_rx) = socket.split();
 
-        let parsed: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    // One tokio channel for the connection's lifetime. Each turn spawns a
+    // std::thread bridge that pumps the agent's std::sync::mpsc events into
+    // a clone of `turn_async_tx`. The async receiver here multiplexes events
+    // from any in-flight turn into outbound WS frames.
+    let (turn_async_tx, mut turn_async_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
 
-        let message = match parsed.get("message").and_then(|m| m.as_str()) {
-            Some(m) if !m.is_empty() => m.to_string(),
-            _ => {
-                let err = json!({"type": "error", "error": "Empty message"}).to_string();
-                let _ = socket.send(WsMsg::Text(err.into())).await;
-                continue;
+    loop {
+        tokio::select! {
+            biased;
+            // Drain agent events first so back-pressure flows to the bridge.
+            Some(evt) = turn_async_rx.recv() => {
+                let json = match serde_json::to_string(&evt) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if ws_tx.send(WsMsg::Text(json.into())).await.is_err() {
+                    break;
+                }
             }
-        };
-
-        let chat_id = parsed
-            .get("chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or("web")
-            .to_string();
-
-        // No streaming yet — run full chat and send done
-        match state.gateway.chat(&chat_id, &message, "api").await {
-            Ok(reply) => {
-                let done = json!({"type": "done", "text": reply}).to_string();
-                let _ = socket.send(WsMsg::Text(done.into())).await;
-            }
-            Err(e) => {
-                let err = json!({"type": "error", "error": e.to_string()}).to_string();
-                let _ = socket.send(WsMsg::Text(err.into())).await;
+            recv = ws_rx.next() => {
+                let msg = match recv {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+                let text = match msg {
+                    WsMsg::Text(t) => t.to_string(),
+                    WsMsg::Close(_) => break,
+                    _ => continue,
+                };
+                let evt: ChatEvent = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match evt {
+                    ChatEvent::UserMessage { chat_id, text } => {
+                        if text.is_empty() {
+                            let err = ChatEvent::Error {
+                                error: "Empty message".to_string(),
+                            };
+                            let json = serde_json::to_string(&err).unwrap();
+                            let _ = ws_tx.send(WsMsg::Text(json.into())).await;
+                            continue;
+                        }
+                        spawn_turn(state.gateway.clone(), chat_id, text, turn_async_tx.clone());
+                    }
+                    ChatEvent::Cancel { chat_id } => {
+                        state.gateway.cancel_chat(&chat_id).await;
+                    }
+                    _ => { /* ignore — outbound-only events on inbound */ }
+                }
             }
         }
     }
+}
+
+/// Run one chat turn: bridge the agent's std mpsc events to the connection's
+/// async sender via a dedicated std::thread. The thread exits when the chat
+/// task drops its sender (either via `Done`/`Error` emission and return, or
+/// via task abort).
+fn spawn_turn(
+    gateway: Arc<Gateway>,
+    chat_id: String,
+    text: String,
+    async_tx: tokio::sync::mpsc::UnboundedSender<ChatEvent>,
+) {
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<ChatEvent>();
+
+    std::thread::spawn(move || {
+        while let Ok(evt) = sync_rx.recv() {
+            if async_tx.send(evt).is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _ = gateway
+            .chat_with_events(&chat_id, &text, "api", Some(&sync_tx))
+            .await;
+        // sync_tx drops here; bridge thread exits
+    });
 }
 
 // ---------------------------------------------------------------------------
