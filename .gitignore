@@ -1,7 +1,10 @@
 .venv/
 
-# Desktop runtime data
+# Desktop runtime data + secrets. agent/config.json holds provider API keys
+# and is typically a symlink into the user's local desktop env (see README).
 /data/
+/agent/config.json
+/agent/data/
 
 # Web app
 node_modules/

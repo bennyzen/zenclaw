@@ -81,7 +81,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let api_port: u16 = 8080;
+    let api_port: u16 = std::env::var("ZENCLAW_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
     {
         let app_state = AppState {
             gateway: gateway.clone(),
