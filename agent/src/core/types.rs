@@ -24,13 +24,14 @@ pub struct Message {
 }
 
 /// Opaque provider data that must be round-tripped through the agent loop.
+/// On ESP32 builds this enum has no inhabited variants — per-tool-call extras
+/// are carried on `ToolCall::extra_content` instead, so they persist through
+/// JSONL session files automatically.
 #[derive(Debug, Clone)]
 pub enum ProviderData {
     /// Raw genai tool calls with thought_signatures for Gemini 3.x compatibility.
     #[cfg(feature = "desktop")]
     GenaiToolCalls(Vec<genai::chat::ToolCall>),
-    /// Raw Gemini response parts for round-tripping thought_signatures on ESP32.
-    GeminiParts(Vec<serde_json::Value>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +59,13 @@ pub struct ImageUrl {
 pub struct ToolCall {
     pub id: String,
     pub function: FunctionCall,
+    /// Opaque per-call provider extras, round-tripped verbatim. Holds
+    /// `extra_content.google.thought_signature` for Gemini's OpenAI-compat
+    /// endpoint; future providers can stash their own quirks here without
+    /// new code paths. Serializes through JSONL so signatures survive
+    /// across HTTP turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

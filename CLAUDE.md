@@ -253,7 +253,7 @@ Memory is a single text file at `data/MEMORY.md` with `## [id] timestamp (tags: 
     "google": {
       "api_key": "...",
       "model": "gemini-2.5-flash",
-      "base_url": "https://generativelanguage.googleapis.com/v1beta"
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"
     }
   },
   "agent_name": "ZenClaw",
@@ -268,7 +268,9 @@ Memory is a single text file at `data/MEMORY.md` with `## [id] timestamp (tags: 
 }
 ```
 
-Provider `base_url` determines API format: Gemini URLs use Gemini wire format, everything else uses OpenAI-compatible format. Gemini auth uses `?key=` in URL (no Bearer header).
+**ESP32 talks one wire format: OpenAI-compatible.** Every provider — Gemini, OpenAI, zAI, Anthropic, etc. — exposes `/chat/completions` with `Bearer <key>` auth. Gemini routes through the OpenAI-compat endpoint at `…/v1beta/openai/chat/completions`. The runner auto-appends `/openai` to legacy `…/v1beta` configs so existing devices migrate without manual edits. Per-provider quirks (e.g. Gemini's `extra_content.google.thought_signature`) are carried opaquely on `ToolCall.extra_content` and round-tripped verbatim — they persist through JSONL session files automatically.
+
+The desktop runner (`core/runner.rs`) uses the `genai` crate with native wire formats and is independent. The deletion of ESP32's hand-rolled Gemini wire format (commit history pre-`OpenAI-compat pivot`) means ESP32 is no longer affected by Gemini-native protocol changes (`thoughtSignature`, parts shape, `systemInstruction` semantics).
 
 ### NVS Storage
 
@@ -311,6 +313,7 @@ zenclaw/
 
 ## Common Pitfalls (General)
 
-- **Gemini auth**: Gemini uses `?key=API_KEY` in URL. Do NOT also send `Bearer` header — returns 401 if both present.
+- **Gemini auth (legacy)**: Gemini's *native* `/v1beta/models/{model}:generateContent` endpoint uses `?key=API_KEY` in URL and rejects Bearer. ZenClaw doesn't use it anymore on ESP32 (we route through OpenAI-compat with Bearer). Documented for reference.
+- **Multi-tool-call splitting**: A single LLM response containing N `tool_calls` MUST become ONE assistant message with all N calls, followed by N `tool` results matched by `tool_call_id`. Splitting a multi-call response into N synthesized assistant turns silently breaks Gemini (signatures attached to the original turn don't propagate to splits) and corrupts most providers' history protocols. See `agent_loop.rs::execute_tool_calls`.
 - **Session history poisoning**: Repeated tool failures in history can cause the LLM to hallucinate the same error. Clear the session file to reset.
 - **ESP32 NVS**: Never `espflash erase-flash` — wipes WiFi creds and config. Flash specific offsets only.

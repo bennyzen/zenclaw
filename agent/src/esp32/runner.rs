@@ -6,11 +6,13 @@ use log::info;
 use crate::config::Config;
 use crate::core::runner::{LlmRunner, RunnerError};
 use crate::core::types::{
-    FunctionCall, LlmResponse, Message, MessageContent, ProviderData, Role, ToolCall,
-    ToolDefinition,
+    FunctionCall, LlmResponse, Message, MessageContent, Role, ToolCall, ToolDefinition,
 };
 
-/// LLM runner for ESP32 — calls Gemini/OpenAI APIs directly via esp-idf-svc HTTP client (mbedtls TLS).
+/// LLM runner for ESP32 — speaks ONE wire format (OpenAI-compatible) for every
+/// provider. Gemini, OpenAI, zAI, Anthropic, etc. all expose `/chat/completions`.
+/// Per-provider quirks (e.g. Gemini's `extra_content.google.thought_signature`)
+/// are carried opaquely on `ToolCall.extra_content` and round-tripped verbatim.
 pub struct EspRunner {
     config: Arc<Config>,
 }
@@ -55,20 +57,12 @@ impl EspRunner {
         let base_url = provider
             .base_url
             .as_deref()
-            .unwrap_or("https://generativelanguage.googleapis.com/v1beta");
+            .unwrap_or("https://generativelanguage.googleapis.com/v1beta/openai");
+        let base_url = normalize_base_url(base_url);
 
-        let is_gemini = base_url.contains("generativelanguage.googleapis.com");
-
-        let (url, payload, auth_header) = if is_gemini {
-            let clean = base_url.replace("/openai", "");
-            let url = format!("{}/models/{}:generateContent?key={}", clean, model, api_key);
-            let payload = build_gemini_payload(messages, tools);
-            (url, payload, None)
-        } else {
-            let url = format!("{}/chat/completions", base_url);
-            let payload = build_openai_payload(messages, tools, &model);
-            (url, payload, Some(format!("Bearer {}", api_key)))
-        };
+        let url = format!("{}/chat/completions", base_url);
+        let payload = build_openai_payload(messages, tools, &model);
+        let auth_header = format!("Bearer {}", api_key);
 
         let body = serde_json::to_string(&payload)
             .map_err(|e| RunnerError::Parse(e.to_string()))?;
@@ -76,7 +70,7 @@ impl EspRunner {
 
         info!("LLM call: model={} body={}B", model, body.len());
 
-        let response_body = esp_http_post(&url, &body, auth_header.as_deref())
+        let response_body = esp_http_post(&url, &body, Some(&auth_header))
             .map_err(|e| RunnerError::Network(e))?;
         drop(body); // Free request body before parsing response
 
@@ -98,11 +92,20 @@ impl EspRunner {
             return Err(RunnerError::Api(msg.to_string()));
         }
 
-        if is_gemini {
-            parse_gemini_response(&response)
-        } else {
-            parse_openai_response(&response)
-        }
+        parse_openai_response(&response)
+    }
+}
+
+/// Append `/openai` to Gemini's native `…/v1beta` base_url so it routes through
+/// Google's OpenAI-compatibility endpoint. Existing user configs (which point at
+/// the native endpoint) keep working without manual migration. Other providers
+/// pass through untouched.
+fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.contains("generativelanguage.googleapis.com") && !trimmed.contains("/openai") {
+        format!("{}/openai", trimmed)
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -185,155 +188,6 @@ fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<Str
 }
 
 // ---------------------------------------------------------------------------
-// Gemini wire format
-// ---------------------------------------------------------------------------
-
-fn build_gemini_payload(
-    messages: &[Message],
-    tools: &[ToolDefinition],
-) -> serde_json::Value {
-    let mut contents = Vec::new();
-    let mut sys_instruction = None;
-
-    for msg in messages {
-        match msg.role {
-            Role::System => {
-                sys_instruction = Some(msg.content.as_text());
-            }
-            Role::User => {
-                contents.push(serde_json::json!({
-                    "role": "user",
-                    "parts": [{"text": msg.content.as_text()}]
-                }));
-            }
-            Role::Assistant => {
-                if let Some(ref tcs) = msg.tool_calls {
-                    let mut parts: Vec<serde_json::Value> = Vec::new();
-                    let text = msg.content.as_text();
-                    if !text.is_empty() {
-                        parts.push(serde_json::json!({"text": text}));
-                    }
-                    for tc in tcs {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                        parts.push(serde_json::json!({
-                            "functionCall": {"name": tc.function.name, "args": args}
-                        }));
-                    }
-                    contents.push(serde_json::json!({"role": "model", "parts": parts}));
-                } else {
-                    contents.push(serde_json::json!({
-                        "role": "model",
-                        "parts": [{"text": msg.content.as_text()}]
-                    }));
-                }
-            }
-            Role::Tool => {
-                let call_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
-                let fn_name = call_id.strip_prefix("call_").unwrap_or(call_id);
-                contents.push(serde_json::json!({
-                    "role": "function",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": fn_name,
-                            "response": {"result": msg.content.as_text()}
-                        }
-                    }]
-                }));
-            }
-        }
-    }
-
-    let mut payload = serde_json::json!({"contents": contents});
-
-    if let Some(sys) = sys_instruction {
-        payload["systemInstruction"] = serde_json::json!({"parts": [{"text": sys}]});
-    }
-
-    if !tools.is_empty() {
-        let declarations: Vec<serde_json::Value> = tools
-            .iter()
-            .map(|t| {
-                let mut decl = serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                });
-                if !t.parameters.is_null() {
-                    decl["parameters"] = t.parameters.clone();
-                }
-                decl
-            })
-            .collect();
-        payload["tools"] = serde_json::json!([{"functionDeclarations": declarations}]);
-    }
-
-    payload
-}
-
-fn parse_gemini_response(data: &serde_json::Value) -> Result<LlmResponse, RunnerError> {
-    let candidate = data
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .ok_or_else(|| RunnerError::Parse("No candidates in response".to_string()))?;
-
-    let parts = candidate
-        .get("content")
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-
-    for part in &parts {
-        // Skip thought parts
-        if part.get("thought").is_some() {
-            continue;
-        }
-        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-            text.push_str(t);
-        }
-        if let Some(fc) = part.get("functionCall") {
-            let name = fc
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_string();
-            let args = fc.get("args").cloned().unwrap_or_default();
-            tool_calls.push(ToolCall {
-                id: format!("call_{}", name),
-                function: FunctionCall {
-                    name,
-                    arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
-                },
-            });
-        }
-    }
-
-    let provider_data = if !parts.is_empty() {
-        Some(ProviderData::GeminiParts(parts))
-    } else {
-        None
-    };
-
-    if tool_calls.is_empty() {
-        Ok(LlmResponse::Text(text))
-    } else if text.is_empty() {
-        Ok(LlmResponse::ToolCalls {
-            tool_calls,
-            provider_data,
-        })
-    } else {
-        Ok(LlmResponse::Mixed {
-            text,
-            tool_calls,
-            provider_data,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // OpenAI wire format
 // ---------------------------------------------------------------------------
 
@@ -356,14 +210,22 @@ fn build_openai_payload(
                 let oai_tcs: Vec<serde_json::Value> = tcs
                     .iter()
                     .map(|tc| {
-                        serde_json::json!({
+                        let mut obj = serde_json::json!({
                             "id": tc.id,
                             "type": "function",
                             "function": {
                                 "name": tc.function.name,
                                 "arguments": tc.function.arguments
                             }
-                        })
+                        });
+                        // Round-trip opaque per-call extras (e.g. Gemini's
+                        // `extra_content.google.thought_signature`) verbatim.
+                        // Without this, Gemini returns 400 INVALID_ARGUMENT
+                        // citing the missing signature on subsequent turns.
+                        if let Some(extra) = &tc.extra_content {
+                            obj["extra_content"] = extra.clone();
+                        }
+                        obj
                     })
                     .collect();
                 m["tool_calls"] = serde_json::json!(oai_tcs);
@@ -424,9 +286,11 @@ fn parse_openai_response(data: &serde_json::Value) -> Result<LlmResponse, Runner
                         .and_then(|a| a.as_str())
                         .unwrap_or("{}")
                         .to_string();
+                    let extra_content = tc.get("extra_content").cloned();
                     Some(ToolCall {
                         id,
                         function: FunctionCall { name, arguments },
+                        extra_content,
                     })
                 })
                 .collect()
@@ -448,3 +312,4 @@ fn parse_openai_response(data: &serde_json::Value) -> Result<LlmResponse, Runner
         })
     }
 }
+

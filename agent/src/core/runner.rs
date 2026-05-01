@@ -498,6 +498,7 @@ fn convert_tool_calls(tool_calls: &[genai::chat::ToolCall]) -> Vec<ToolCall> {
                 arguments: serde_json::to_string(&tc.fn_arguments)
                     .unwrap_or_else(|_| "{}".to_string()),
             },
+            extra_content: None,
         })
         .collect()
 }
@@ -565,6 +566,7 @@ fn parse_glm_call(chunk: &str, idx: usize) -> Option<ToolCall> {
             name: name.to_string(),
             arguments,
         },
+        extra_content: None,
     })
 }
 

@@ -341,8 +341,23 @@ async fn execute_tool_calls(
     loop_detector: &mut LoopDetector,
     events: Option<&EventSender>,
 ) -> Result<(), AgentLoopError> {
-    // provider_data carries thought_signatures from Gemini; attach to first tool call's message
-    let mut remaining_provider_data = provider_data;
+    // OpenAI-canonical pattern: ONE assistant message carrying every
+    // tool_call from this LLM response, then ONE tool result per call
+    // matched by `tool_call_id`. Splitting a multi-tool response into
+    // multiple synthesized assistant turns breaks providers that tie
+    // signatures (Gemini's `thought_signature`) to the original turn —
+    // the synthesized splits arrive without signatures and fail validation.
+    messages.push(Message {
+        role: Role::Assistant,
+        content: MessageContent::Text(
+            assistant_text.unwrap_or_default().to_string(),
+        ),
+        tool_calls: Some(tool_calls.to_vec()),
+        tool_call_id: None,
+        provider_data,
+    });
+
+    let mut deferred_warnings: Vec<String> = Vec::new();
 
     for tc in tool_calls {
         let name = &tc.function.name;
@@ -361,15 +376,9 @@ async fn execute_tool_calls(
         // Check loop detector
         if let Some(check) = loop_detector.check(name, &args) {
             if check.level == LoopLevel::Critical {
-                // Block execution — add error result
+                // Block execution — add error result for this call
                 let msg = check.message.clone();
-                push_tool_exchange(
-                    messages,
-                    tc,
-                    assistant_text,
-                    &msg,
-                    remaining_provider_data.take(),
-                );
+                push_tool_result(messages, tc, &msg);
                 try_send(
                     events,
                     ChatEvent::ToolCallFinished {
@@ -382,21 +391,16 @@ async fn execute_tool_calls(
                 info!("Loop detector blocked tool call: {} ({})", name, check.detector);
                 continue;
             }
-            // Warning — inject system message but still execute
-            messages.push(Message {
-                role: Role::System,
-                content: MessageContent::Text(check.message),
-                tool_calls: None,
-                tool_call_id: None,
-                provider_data: None,
-            });
+            // Warning — defer to a system message after all tool results so
+            // we don't interleave non-tool messages between tool_call_id pairs.
+            deferred_warnings.push(check.message);
         }
 
         // Check cancellation
         if let Some(flag) = cancel {
             if flag.load(Ordering::Relaxed) {
                 let msg = "Skipped: operation cancelled.";
-                push_tool_exchange(messages, tc, assistant_text, msg, remaining_provider_data.take());
+                push_tool_result(messages, tc, msg);
                 try_send(
                     events,
                     ChatEvent::ToolCallFinished {
@@ -429,7 +433,7 @@ async fn execute_tool_calls(
         let was_capped = result_str.len() > MAX_TOOL_RESULT_BYTES;
         let payload = cap_or_refuse(result_str, MAX_TOOL_RESULT_BYTES);
 
-        push_tool_exchange(messages, tc, assistant_text, &payload, remaining_provider_data.take());
+        push_tool_result(messages, tc, &payload);
 
         if was_capped {
             try_send(
@@ -459,29 +463,23 @@ async fn execute_tool_calls(
         );
     }
 
+    // Emit any deferred loop-detector warnings as a single system message
+    // after all tool results, preserving the assistant↔tool pairing.
+    if !deferred_warnings.is_empty() {
+        messages.push(Message {
+            role: Role::System,
+            content: MessageContent::Text(deferred_warnings.join("\n\n")),
+            tool_calls: None,
+            tool_call_id: None,
+            provider_data: None,
+        });
+    }
+
     Ok(())
 }
 
-/// Push the assistant message (with tool_calls) and the tool result message.
-fn push_tool_exchange(
-    messages: &mut Vec<Message>,
-    tc: &ToolCall,
-    assistant_text: Option<&str>,
-    result: &str,
-    provider_data: Option<ProviderData>,
-) {
-    // Assistant message with tool call (provider_data carries thought_signatures for Gemini)
-    messages.push(Message {
-        role: Role::Assistant,
-        content: MessageContent::Text(
-            assistant_text.unwrap_or_default().to_string(),
-        ),
-        tool_calls: Some(vec![tc.clone()]),
-        tool_call_id: None,
-        provider_data,
-    });
-
-    // Tool result message
+/// Push a single tool-result message that closes a specific tool_call by id.
+fn push_tool_result(messages: &mut Vec<Message>, tc: &ToolCall, result: &str) {
     messages.push(Message {
         role: Role::Tool,
         content: MessageContent::Text(result.to_string()),
