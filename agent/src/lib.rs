@@ -10,7 +10,6 @@ pub mod led_status;
 pub mod net;
 #[cfg(feature = "usb_storage")]
 pub mod usb_storage;
-#[cfg(feature = "desktop")]
 pub mod platform;
 
 /// Global TLS connection mutex — ESP32 without PSRAM can only sustain one TLS context at a time.
