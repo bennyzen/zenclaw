@@ -1037,6 +1037,52 @@ a{{color:#60a5fa;text-decoration:none}}
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(config) => {
                 let json = serde_json::to_string(&config).unwrap();
+
+                // Strict S3 PUT happens BEFORE the NVS write so a cloud
+                // failure leaves the device's running state intact. We
+                // only attempt it when the new config typed-parses as
+                // Config AND has cloud configured — pushing a non-Config
+                // shape (or disabling cloud) skips the strict path.
+                if let Ok(typed_cfg) = serde_json::from_slice::<zenclaw_agent::config::Config>(&body) {
+                    if typed_cfg.is_cloud_enabled() {
+                        use zenclaw_agent::core::cloud::client::S3Client;
+                        let storage = typed_cfg.storage.as_ref().expect("is_cloud_enabled checked");
+                        match S3Client::from_config(storage) {
+                            Some(client) => {
+                                use zenclaw_agent::core::cloud::client::ObjectStore;
+                                let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(client);
+                                if let Err(e) = zenclaw_agent::core::cloud::strict::strict_put(
+                                    &store,
+                                    "sys/config.json",
+                                    json.as_bytes(),
+                                    storage.replicator.retry_max,
+                                    storage.replicator.backoff_cap_secs,
+                                ) {
+                                    log::warn!("Config strict_put failed; aborting reboot: {}", e);
+                                    let err_body = serde_json::json!({
+                                        "error": format!("Cloud strict_put failed: {}", e),
+                                    }).to_string();
+                                    let mut resp = req.into_response(503, None, CORS_HEADERS)?;
+                                    resp.write_all(err_body.as_bytes())?;
+                                    return Ok(());
+                                }
+                                log::info!("Config strict_put OK ({}B → sys/config.json)", json.len());
+                            }
+                            None => {
+                                // is_cloud_enabled() guarantees the four required
+                                // fields are present, so client construction
+                                // failing here means an internal error. Surface it.
+                                let err_body = serde_json::json!({
+                                    "error": "Cloud client construction failed despite is_cloud_enabled",
+                                }).to_string();
+                                let mut resp = req.into_response(503, None, CORS_HEADERS)?;
+                                resp.write_all(err_body.as_bytes())?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 save_config_nvs(&nvs_w, &json).map_err(|e| anyhow::anyhow!(e))?;
                 log::info!("Config saved to NVS ({}B), restarting...", json.len());
                 let resp_body = serde_json::json!({"ok": true}).to_string();
