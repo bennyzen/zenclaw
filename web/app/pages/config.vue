@@ -149,6 +149,37 @@ const presets = computed<Preset[]>(() => {
     .sort((a, b) => a.slug.localeCompare(b.slug))
 })
 
+const switchOpen = ref(false)
+const switchTarget = ref<Preset | null>(null)
+const switching = ref(false)
+
+function openSwitch(p: Preset) {
+  if (p.isActive) return
+  switchTarget.value = p
+  switchOpen.value = true
+}
+
+async function confirmSwitch() {
+  const target = switchTarget.value
+  if (!target) return
+  switching.value = true
+  error.value = null
+  successMsg.value = null
+  try {
+    const config = {
+      ...rawConfig.value,
+      providers: { ...(rawConfig.value.providers || {}), default: target.slug },
+    }
+    await saveConfig(config)
+    rawConfig.value = config
+    successMsg.value = `Switching to ${target.provider} / ${target.model}. Device is rebooting…`
+    switchOpen.value = false
+  } catch (e: any) {
+    error.value = `Switch failed: ${e.message}`
+  }
+  switching.value = false
+}
+
 function stripScheme(url: string): string {
   return url.replace(/^https?:\/\//, '')
 }
@@ -472,6 +503,7 @@ watch(() => state.networkConnected, (connected) => {
                     :class="p.isActive
                       ? 'border-primary bg-primary/5 cursor-default'
                       : 'border-default hover:border-primary/50 hover:bg-elevated cursor-pointer'"
+                    @click="openSwitch(p)"
                   >
                     <div class="flex items-start justify-between gap-2">
                       <div class="min-w-0 flex-1">
@@ -728,6 +760,36 @@ watch(() => state.networkConnected, (connected) => {
             </template>
           </UButton>
         </div>
+
+        <UModal v-model:open="switchOpen" title="Switch active model?">
+          <template #body>
+            <p class="text-sm text-default">
+              Switch the active model to
+              <span class="font-medium">{{ switchTarget?.provider }} / {{ switchTarget?.model }}</span>?
+            </p>
+            <p class="mt-3 text-sm text-muted">
+              The device will reboot to apply the change (~12 seconds offline).
+            </p>
+          </template>
+          <template #footer>
+            <div class="flex justify-end gap-2 w-full">
+              <UButton
+                label="Cancel"
+                variant="ghost"
+                color="neutral"
+                :disabled="switching"
+                @click="switchOpen = false"
+              />
+              <UButton
+                label="Switch & Reboot"
+                color="primary"
+                :loading="switching"
+                :disabled="switching"
+                @click="confirmSwitch"
+              />
+            </div>
+          </template>
+        </UModal>
       </template>
     </template>
   </div>
