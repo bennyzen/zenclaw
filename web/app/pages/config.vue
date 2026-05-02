@@ -155,6 +155,7 @@ const switching = ref(false)
 
 function openSwitch(p: Preset) {
   if (p.isActive) return
+  error.value = null
   switchTarget.value = p
   switchOpen.value = true
 }
@@ -172,7 +173,8 @@ async function confirmSwitch() {
     }
     await saveConfig(config)
     rawConfig.value = config
-    successMsg.value = `Switching to ${target.provider} / ${target.model}. Device is rebooting…`
+    const label = target.model ? `${target.provider} / ${target.model}` : target.provider
+    successMsg.value = `Switching to ${label}. Device is rebooting…`
     switchOpen.value = false
   } catch (e: any) {
     error.value = `Switch failed: ${e.message}`
