@@ -22,9 +22,7 @@ const TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
     ("session", "Session management: status (time/uptime/memory/model), list, history"),
     ("gateway", "Gateway management: status/reload"),
     ("subagents", "Spawn, list, or cancel background sub-agents"),
-    ("mcp", "MCP server management: connect/list_tools/call/disconnect/servers"),
     ("storage", "Cloud storage (S3): read/write/delete/list/info/grep/analyze"),
-    ("gsheets", "Google Sheets: read/write/append/clear"),
 ];
 
 /// Build the full system prompt from config, tools, context files, and runtime info.
@@ -126,9 +124,7 @@ fn build_time_section() -> String {
 fn build_tooling_section(tools: &[ToolDefinition]) -> String {
     let mut lines = vec![
         "## Tooling".to_string(),
-        "These are your built-in tools — always available. \
-         Distinct from MCP servers (mcp action=servers) which are optional extensions."
-            .to_string(),
+        "These are your built-in tools — always available.".to_string(),
         "Tool names are case-sensitive. Call tools exactly as listed. \
          Many tools use an action parameter to select the operation."
             .to_string(),

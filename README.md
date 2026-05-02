@@ -164,11 +164,11 @@ The following features are described in this README as part of the agent's desig
 - **Shipped when**: inbound voice messages are downloaded via `getFile`, transcribed (likely via the configured provider's STT endpoint or a dedicated provider), and dispatched to the agent loop as text. Outbound `sendVoice` for assistant replies is a stretch goal — text replies to voice messages are the v1 deliverable.
 - **Estimated effort**: medium. The transcription dependency is the open design question (which provider, what wire format) — `genai`'s STT support is the natural starting point.
 
-### 5. MCP client and Google Sheets tools
+### 5. MCP client
 
-- **Today**: `mcp_tools.rs` and `gsheets_tools.rs` are implemented in `agent/src/core/tools/` but **not** registered in `register_defaults`, so the LLM can't call them.
-- **Shipped when**: both tools are added to `register_defaults`, schemas validated against current OpenAI function-calling shape, and a smoke test from a real LLM call exercises one action per tool.
-- **Estimated effort**: small. Mostly schema-vetting + a registration line each. Likely the lowest-cost item on this list.
+- **Today**: nothing on device. (An earlier announce-stub `mcp_tools.rs` was deleted as actively misleading — it told the LLM the tool existed but did nothing on call.) MCP is the universal tool protocol that Anthropic, OpenAI, Cursor, and VS Code all speak; an ESP32 that can connect to remote MCP servers inherits a large tool ecosystem (web search, GitHub, filesystem servers, etc.) without needing each integration coded by hand.
+- **Shipped when**: an `mcp` tool exposes `connect`, `list_tools`, `call`, `disconnect`, and `servers` actions; supports HTTP+SSE and Streamable HTTP transports (stdio is impossible on device); manages multiple concurrent server sessions; handles per-server auth headers; and survives a smoke test connecting to one Anthropic-hosted MCP server and one local-network MCP server with at least one round-trip tool call each.
+- **Estimated effort**: medium-to-large. Real surface area: JSON-RPC 2.0 client + transport layer + session lifecycle + per-server auth + result-size budgeting (MCP responses can be huge). Worth doing — the leverage is high — but not a wire-up.
 
 If you depend on any of these for your use case, please open an issue so we can prioritize.
 
