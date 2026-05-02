@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const { state, connectNetwork } = useConnection()
+const { state, connectNetwork, disconnectNetwork } = useConnection()
 const router = useRouter()
 
 const STORAGE_KEY = 'zenclaw_provision'
@@ -25,6 +25,12 @@ async function connect() {
     router.push('/dashboard')
   } catch { /* error shown via state.error */ }
 }
+
+const connectedName = computed(() => {
+  const ip = state.deviceIp
+  if (!ip) return null
+  return ip.endsWith('.local') ? ip.slice(0, -'.local'.length) : ip
+})
 </script>
 
 <template>
@@ -57,7 +63,32 @@ async function connect() {
       </UCard>
 
       <UCard>
-        <div class="space-y-3">
+        <div v-if="state.networkConnected" class="space-y-3">
+          <div class="flex items-center gap-2">
+            <UIcon name="i-lucide-plug-zap" class="text-green-400" />
+            <h3 class="font-semibold">Connected</h3>
+          </div>
+          <p class="text-sm text-muted">
+            Talking to <span class="font-mono text-default">{{ connectedName }}</span>.
+            Disconnect to switch to another device.
+          </p>
+          <div class="flex gap-2">
+            <UButton
+              to="/dashboard"
+              label="Open dashboard"
+              icon="i-lucide-layout-dashboard"
+              variant="solid"
+            />
+            <UButton
+              label="Disconnect"
+              icon="i-lucide-unplug"
+              color="neutral"
+              variant="outline"
+              @click="disconnectNetwork"
+            />
+          </div>
+        </div>
+        <div v-else class="space-y-3">
           <div class="flex items-center gap-2">
             <UIcon name="i-lucide-plug" class="text-primary" />
             <h3 class="font-semibold">Connect to device</h3>
