@@ -197,10 +197,21 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{}/memory", data_dir));
     zenclaw_agent::core::workspace::seed_defaults(data_dir);
 
+    // --- Cloud bootstrap (only if storage is configured) -------------------
+    // Build the cache + replicator, run boot_restore against S3, spawn the
+    // drainer + snapshot timer. Cloud-disabled boot keeps the existing
+    // local-file path with zero overhead.
+    let cloud_handles = bootstrap_cloud(&config, data_dir, &hostname);
+
     let config_for_tg = config.clone();
     let config_arc = std::sync::Arc::new(config.clone());
     let runner = Box::new(zenclaw_agent::esp32::runner::EspRunner::new(config_arc));
-    let gateway = zenclaw_agent::core::gateway::Gateway::new(config, data_dir, runner);
+    let gateway = match cloud_handles {
+        Some(h) => zenclaw_agent::core::gateway::Gateway::new_with_cloud(
+            config, data_dir, runner, h,
+        ),
+        None => zenclaw_agent::core::gateway::Gateway::new(config, data_dir, runner),
+    };
     let gateway = std::sync::Arc::new(gateway);
 
     // --- Chat request channel (httpd → agent thread) ---
@@ -355,6 +366,134 @@ fn chip_label() -> &'static str {
         m if m == sys::esp_chip_model_t_CHIP_ESP32P4 => "ESP32-P4",
         _ => "ESP32",
     }
+}
+
+/// Boot-time stash of `BootResult` so `/api/status.cloud_storage` can
+/// surface warnings + heartbeat conflict without re-running the
+/// restore. Set once during cloud bootstrap; never mutated after.
+#[cfg(feature = "esp32")]
+static CLOUD_BOOT_RESULT: std::sync::OnceLock<zenclaw_agent::core::cloud::BootResult> =
+    std::sync::OnceLock::new();
+
+/// Stand up the cloud-persistence machinery for this boot if storage is
+/// configured. Returns `None` when cloud is disabled — the caller falls
+/// back to local-file mode with no behavior change.
+///
+/// Side effects on the `Some` path:
+/// - runs `boot_restore` (populates the cache from S3, applies L3/L4/L5
+///   safety layers per chat, restores memory + cron + identity files);
+/// - stashes the resulting `BootResult` in `CLOUD_BOOT_RESULT` for
+///   `/api/status.cloud_storage` to surface;
+/// - spawns the replicator drainer thread (32KB stack — TLS handshakes
+///   dominate; smaller stacks blow up at handshake);
+/// - spawns the snapshot timer thread (8KB stack — pure file IO).
+///
+/// Both spawned threads run for the lifetime of the process; we never
+/// shut them down (the device only exits via reboot).
+#[cfg(feature = "esp32")]
+fn bootstrap_cloud(
+    config: &zenclaw_agent::config::Config,
+    data_dir: &str,
+    hostname: &str,
+) -> Option<zenclaw_agent::core::gateway::CloudHandles> {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use zenclaw_agent::core::cloud::{
+        boot_restore, client::ObjectStore, client::S3Client, snapshots, BootConfig, CloudCache,
+        Replicator, ReplicatorConfig,
+    };
+
+    if !config.is_cloud_enabled() {
+        log::info!("Cloud: disabled (no storage block in config)");
+        return None;
+    }
+    let storage = config.storage.as_ref().expect("is_cloud_enabled checked");
+    let s3 = S3Client::from_config(storage)?;
+    let store: Arc<dyn ObjectStore> = Arc::new(s3);
+
+    let cache = CloudCache::new();
+
+    // Step 1: boot restore. On hard failure (top-level LIST blew up),
+    // log and continue with an empty cache — better to come up with no
+    // history than to refuse boot. Per-chat failures are absorbed into
+    // the BootResult.warnings vec and surface on /api/status.
+    let boot_cfg = BootConfig {
+        session_max_bytes: storage.session_max_bytes,
+        log_compaction_bytes: storage.log_compaction_bytes,
+        device_id: hostname.to_string(),
+        heartbeat_stale_secs: 3600,
+    };
+    match boot_restore(&store, &cache, &boot_cfg) {
+        Ok(result) => {
+            log::info!(
+                "Cloud boot_restore: {} warning(s), heartbeat_conflict={:?}, cache={} keys",
+                result.warnings.len(),
+                result.heartbeat_conflict,
+                cache.snapshot().len()
+            );
+            let _ = CLOUD_BOOT_RESULT.set(result);
+        }
+        Err(e) => {
+            log::warn!("Cloud boot_restore failed (continuing with empty cache): {}", e);
+            // Try snapshot fallback before giving up.
+            let snap_path = format!("{}/.snapshot.bin", data_dir);
+            match snapshots::read_from(&snap_path) {
+                Ok(Some(snap)) => {
+                    log::info!(
+                        "Cloud: restored from snapshot ({} keys, written_at={})",
+                        snap.entries.len(),
+                        snap.written_at
+                    );
+                    cache.restore_from(snap.entries);
+                }
+                Ok(None) => log::info!("Cloud: no snapshot found"),
+                Err(e2) => log::warn!("Cloud: snapshot read failed: {}", e2),
+            }
+        }
+    }
+
+    // Step 2: replicator + drainer.
+    let replicator = Arc::new(Replicator::new(ReplicatorConfig::from(&storage.replicator)));
+    let _drainer = replicator.spawn_drainer(store.clone());
+    log::info!(
+        "Cloud: drainer thread spawned (queue_max={}, retry_max={})",
+        storage.replicator.queue_max,
+        storage.replicator.retry_max
+    );
+
+    // Step 3: snapshot timer thread.
+    let cache_for_snap = cache.clone();
+    let snap_path = format!("{}/.snapshot.bin", data_dir);
+    let snap_interval = Duration::from_secs(storage.snapshot.interval_secs as u64);
+    std::thread::Builder::new()
+        .name("cloud-snap".into())
+        .stack_size(8 * 1024)
+        .spawn(move || loop {
+            std::thread::sleep(snap_interval);
+            if let Err(e) = snapshots::write_to(&cache_for_snap, &snap_path) {
+                log::warn!("snapshot write failed: {}", e);
+            }
+        })
+        .expect("Failed to spawn snapshot thread");
+    log::info!("Cloud: snapshot timer thread spawned (interval={}s)", storage.snapshot.interval_secs);
+
+    Some(zenclaw_agent::core::gateway::CloudHandles {
+        cache,
+        replicator,
+        log_compaction_bytes: storage.log_compaction_bytes,
+    })
+}
+
+/// No-op stub for non-esp32 builds (desktop). Cloud bootstrap is
+/// ESP32-only because S3Client itself is `#[cfg(feature = "esp32")]`.
+#[cfg(not(feature = "esp32"))]
+#[allow(dead_code)]
+fn bootstrap_cloud(
+    _config: &zenclaw_agent::config::Config,
+    _data_dir: &str,
+    _hostname: &str,
+) -> Option<zenclaw_agent::core::gateway::CloudHandles> {
+    None
 }
 
 #[cfg(feature = "esp32")]
