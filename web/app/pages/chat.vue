@@ -28,6 +28,10 @@ let nextId = 1
 let stream: ReturnType<typeof openChatStream> | null = null
 
 const messageContainer = ref<HTMLElement | null>(null)
+const messagesInner = ref<HTMLElement | null>(null)
+const stickToBottom = ref(true)
+let lastScrollHeight = 0
+let resizeObserver: ResizeObserver | null = null
 
 function newId() {
   return `i${nextId++}`
@@ -90,18 +94,51 @@ function applyEvent(evt: ChatEvent) {
       // outbound only — never received from server
       break
   }
-  scrollToBottom()
 }
 
-function scrollToBottom() {
-  nextTick(() => {
-    const el = messageContainer.value
-    if (el) el.scrollTop = el.scrollHeight
-  })
+function isNearBottom() {
+  const el = messageContainer.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 80
 }
+
+function onScroll() {
+  stickToBottom.value = isNearBottom()
+}
+
+// MDC renders markdown asynchronously (after nextTick), so measuring
+// scrollHeight from a Vue effect lands mid-stream. Observe the messages
+// wrapper instead — any layout-affecting change (new bubble, MDC late
+// render, tool-widget expansion) fires here once the DOM has settled.
+watch(messagesInner, (el, _prev, onCleanup) => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  if (!el) return
+  lastScrollHeight = 0
+  resizeObserver = new ResizeObserver(() => {
+    if (!stickToBottom.value) return
+    const c = messageContainer.value
+    if (!c) return
+    const delta = c.scrollHeight - lastScrollHeight
+    lastScrollHeight = c.scrollHeight
+    // Big jump (initial load, large message arriving) → instant, so we
+    // don't burn a long animated scroll from top to bottom. Small jump
+    // (token streaming, single bubble) → smooth, for that polished feel.
+    c.scrollTo({
+      top: c.scrollHeight,
+      behavior: delta > 200 ? 'auto' : 'smooth',
+    })
+  })
+  resizeObserver.observe(el)
+  onCleanup(() => {
+    resizeObserver?.disconnect()
+    resizeObserver = null
+  })
+})
 
 async function loadHistory() {
   loading.value = true
+  stickToBottom.value = true
   try {
     const result = await getChatHistory('web', 200)
     items.value = []
@@ -113,7 +150,8 @@ async function loadHistory() {
     items.value = []
   }
   loading.value = false
-  scrollToBottom()
+  // The ResizeObserver attached after `loading` flips will scroll to bottom
+  // automatically as MDC content lays out — no manual scroll needed here.
 }
 
 function ensureStream() {
@@ -131,7 +169,9 @@ function send() {
   // Optimistically render the user bubble — the server doesn't echo it back
   // on the live WS path.
   items.value.push({ kind: 'user', id: newId(), text })
-  scrollToBottom()
+  // User just engaged — re-anchor to the bottom even if they had scrolled up.
+  // The ResizeObserver handles the actual scroll once layout settles.
+  stickToBottom.value = true
   ensureStream()
   stream!.send(text)
 }
@@ -208,8 +248,10 @@ onBeforeUnmount(() => {
       <template v-else>
         <div
           ref="messageContainer"
-          class="flex-1 min-h-0 overflow-y-auto space-y-2 pr-1"
+          class="flex-1 min-h-0 overflow-y-auto pr-1"
+          @scroll.passive="onScroll"
         >
+          <div ref="messagesInner" class="space-y-2">
           <template v-for="item in items" :key="item.id">
             <div v-if="item.kind === 'user'" class="flex justify-end">
               <div class="bg-primary-500/10 text-default rounded-lg px-3 py-2 max-w-[80%] whitespace-pre-wrap">
@@ -293,6 +335,7 @@ onBeforeUnmount(() => {
             <span class="size-2 rounded-full bg-zinc-400 animate-bounce" style="animation-delay: 150ms" />
             <span class="size-2 rounded-full bg-zinc-400 animate-bounce" style="animation-delay: 300ms" />
             <span>thinking</span>
+          </div>
           </div>
         </div>
 
