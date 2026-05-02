@@ -11,3 +11,6 @@ pub mod sigv4;
 // can be unit-tested on host. The S3Client itself is feature-gated
 // inside the file because it needs esp-idf-svc.
 pub mod client;
+
+pub mod cache;
+pub use cache::CloudCache;
