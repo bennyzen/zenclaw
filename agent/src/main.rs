@@ -519,8 +519,11 @@ static CLOUD_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_js
     std::sync::Mutex::new(None);
 
 #[cfg(feature = "esp32")]
-fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json::Value> {
+fn cloud_status_block(
+    gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
+) -> Option<serde_json::Value> {
     use zenclaw_agent::core::cloud::client::S3Client;
+    let cfg = gw.config.as_ref();
     let storage = cfg.storage.as_ref()?;
     if !storage.is_cloud_configured() {
         return None;
@@ -530,7 +533,15 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
         let cache = CLOUD_STATUS_CACHE.lock().ok()?;
         if let Some((ts, val)) = cache.as_ref() {
             if ts.elapsed() < std::time::Duration::from_secs(60) {
-                return Some(val.clone());
+                // Re-attach the live (uncached) sync/boot/heartbeat
+                // sub-blocks so the UI reflects the queue depth and
+                // dead-letter state in real time.
+                let mut v = val.clone();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("sync".to_string(), sync_block(gw));
+                    obj.insert("boot".to_string(), boot_block());
+                }
+                return Some(v);
             }
         }
     }
@@ -538,14 +549,17 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
     let provider = storage.provider();
     let bucket = storage.bucket.clone().unwrap_or_default();
 
-    let (block, cache_ok) = match S3Client::from_config(storage) {
+    let (mut block, cache_ok) = match S3Client::from_config(storage) {
         Some(client) => match client.list("", None, 1000) {
             Ok(listing) => {
                 let total: u64 = listing.objects.iter().map(|o| o.size).sum();
                 let v = serde_json::json!({
                     "configured": true,
+                    "enabled": true,
                     "provider": provider,
                     "bucket": bucket,
+                    "endpoint": storage.endpoint.clone().unwrap_or_default(),
+                    "region": storage.region,
                     "objects": listing.objects.len(),
                     "total_bytes": total,
                 });
@@ -554,6 +568,7 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
             Err(e) => (
                 serde_json::json!({
                     "configured": true,
+                    "enabled": true,
                     "provider": provider,
                     "bucket": bucket,
                     "error": e.to_string(),
@@ -564,6 +579,7 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
         None => (
             serde_json::json!({
                 "configured": true,
+                "enabled": true,
                 "provider": provider,
                 "bucket": bucket,
                 "error": "client init failed",
@@ -571,6 +587,12 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
             false,
         ),
     };
+
+    // Live sync/boot blocks always overlay (not subject to 60s cache).
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert("sync".to_string(), sync_block(gw));
+        obj.insert("boot".to_string(), boot_block());
+    }
 
     // Only cache successful results — caching transient failures (e.g.
     // RequestTimeTooSkewed before SNTP syncs) would freeze them in for 60s.
@@ -580,6 +602,49 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
         }
     }
     Some(block)
+}
+
+/// Live replicator state — queue depth, dead-letter count, last-sync
+/// age. Kept out of the 60s LIST cache so the UI reflects writes in
+/// real time.
+#[cfg(feature = "esp32")]
+fn sync_block(gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>) -> serde_json::Value {
+    use zenclaw_agent::core::cloud::DeadLetterEntry;
+    let Some(rep) = gw.cloud_replicator.as_ref() else {
+        return serde_json::json!({ "active": false });
+    };
+    let dl: Vec<DeadLetterEntry> = rep.dead_letter();
+    let last_sync_age = rep
+        .last_sync_at()
+        .map(|i| i.elapsed().as_secs() as i64)
+        .unwrap_or(-1);
+    serde_json::json!({
+        "active": true,
+        "queue_depth": rep.queue_depth(),
+        "queue_max": gw.config.storage.as_ref()
+            .map(|s| s.replicator.queue_max).unwrap_or(0),
+        "last_sync_age_secs": last_sync_age,
+        "dead_letter_count": dl.len(),
+        "failures": dl.iter().take(10).map(|e| serde_json::json!({
+            "key": e.key,
+            "retry_count": e.retry_count,
+            "last_error": e.last_error_msg,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Boot warnings + heartbeat conflict captured at startup. Stable for
+/// the lifetime of the process — set once in `bootstrap_cloud`.
+#[cfg(feature = "esp32")]
+fn boot_block() -> serde_json::Value {
+    let Some(result) = CLOUD_BOOT_RESULT.get() else {
+        return serde_json::json!({ "ran": false });
+    };
+    serde_json::json!({
+        "ran": true,
+        "warnings": result.warnings,
+        "heartbeat_conflict": result.heartbeat_conflict,
+    })
 }
 
 #[cfg(feature = "esp32")]
@@ -792,7 +857,7 @@ a{{color:#60a5fa;text-decoration:none}}
             "uptime_s": uptime_us / 1_000_000
         });
         let mut body = body;
-        if let Some(cloud) = cloud_status_block(&gw.config) {
+        if let Some(cloud) = cloud_status_block(&gw) {
             body["cloud_storage"] = cloud;
         }
         let body_str = body.to_string();
