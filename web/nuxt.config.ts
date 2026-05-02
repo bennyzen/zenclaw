@@ -48,6 +48,7 @@ export default defineNuxtConfig({
         '@codemirror/lang-json',
         '@codemirror/lang-markdown',
         '@codemirror/theme-one-dark',
+        'remark-emoji',
       ],
     },
   },

@@ -2,6 +2,7 @@
   "name": "web",
   "type": "module",
   "private": true,
+  "packageManager": "npm@11.12.1",
   "scripts": {
     "build": "nuxt build",
     "dev": "nuxt dev",
