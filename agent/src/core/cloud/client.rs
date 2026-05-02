@@ -45,7 +45,25 @@ impl std::fmt::Display for S3Error {
 
 impl std::error::Error for S3Error {}
 
-type Result<T> = std::result::Result<T, S3Error>;
+pub type Result<T> = std::result::Result<T, S3Error>;
+
+/// Trait abstraction over S3 ops so the replicator can be unit-tested
+/// against a fake without real network. Implemented by S3Client; mocked
+/// in tests.
+pub trait ObjectStore: Send + Sync {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    fn get(&self, key: &str) -> Result<Vec<u8>>;
+    fn delete(&self, key: &str) -> Result<()>;
+    fn head(&self, key: &str) -> Result<Option<u64>>;
+}
+
+#[cfg(feature = "esp32")]
+impl ObjectStore for S3Client {
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()> { Self::put(self, key, bytes) }
+    fn get(&self, key: &str) -> Result<Vec<u8>> { Self::get(self, key) }
+    fn delete(&self, key: &str) -> Result<()> { Self::delete(self, key) }
+    fn head(&self, key: &str) -> Result<Option<u64>> { Self::head(self, key) }
+}
 
 pub struct S3Client {
     /// Endpoint scheme+host with no trailing slash (e.g.

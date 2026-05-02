@@ -14,3 +14,6 @@ pub mod client;
 
 pub mod cache;
 pub use cache::CloudCache;
+
+pub mod replicator;
+pub use replicator::{Replicator, ReplicatorConfig, PendingWrite, DeadLetterEntry};
