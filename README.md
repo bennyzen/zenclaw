@@ -4,13 +4,13 @@
 
 # ZenClaw
 
-A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) protects your data from flash wear and reflashes. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
+A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) is designed to protect your data from flash wear and reflashes (transparent replication is on the [Roadmap](#roadmap); the S3 client and signer ship today). Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
 
 ## Features
 
-- **Multi-provider LLM support**: Google Gemini (native API), any OpenAI-compatible provider (OpenAI, DeepSeek, Groq, local models via Ollama, etc.)
+- **Multi-provider LLM support**: any OpenAI-compatible provider (OpenAI, Google Gemini via its OpenAI-compat endpoint, DeepSeek, Groq, zAI, Anthropic, local models via Ollama, etc.) — all spoken over `POST /chat/completions` with `Bearer` auth
 - **Tool-use agent loop**: Call LLM, execute tools, persist context, repeat
-- **Consolidated tool system**: ~20 tools using an action-param pattern (file I/O, code exec, memory, cron, web, sub-agents, MCP client, cloud storage, skills)
+- **Consolidated tool system**: 13 action-param tools on device (file I/O, memory, sessions, gateway, cron, web fetch/search, cloud storage). Each tool dispatches multiple actions, so the LLM sees many more operations than schemas. Sub-agents, MCP client, and Google Sheets exist in the codebase but are not wired on ESP32 yet — see [Roadmap](#roadmap)
 - **Circuit breaker**: Detects stuck loops, no-progress polling, ping-pong patterns
 - **Persistent memory**: Markdown-backed memory store with keyword search (vector embeddings deferred — see [`CLAUDE.md`](CLAUDE.md))
 - **Session management**: JSONL-persisted branching conversation trees
@@ -37,20 +37,22 @@ For developers building from source, see [`agent/`](agent/) and [`CLAUDE.md`](CL
 
 ```
 agent/src/
-  main.rs          ESP32 entry: NIC bring-up, mDNS, SPIFFS, HTTP server, Telegram poller
-  core/            Shared agent logic
-    gateway.rs     Core orchestrator, chat() entry point
-    agent_loop.rs  LLM <-> tool execution loop
-    runner.rs      Provider dispatch trait
-    tools/         Tool implementations (action-param pattern)
-    sessions/      JSONL conversation persistence
-    channels/      Channel abstraction (Telegram, API)
-    memory/        Persistent memory store
-    telegram.rs    Telegram bot (long-poll + send)
-    cron.rs        Scheduled tasks
-  net/             NIC abstraction (WiFi for S3, Ethernet for P4)
-  esp32/           ESP32 HTTP runner (esp-idf-svc)
-  desktop/         Desktop HTTP server + client (axum + reqwest)
+  main.rs                 ESP32 entry: NIC bring-up, mDNS, SPIFFS, HTTP server, Telegram poller
+  core/                   Shared agent logic
+    gateway.rs            Core orchestrator, chat() entry point
+    agent_loop.rs         LLM <-> tool execution loop
+    runner.rs             Provider dispatch trait
+    compaction.rs         Session compaction
+    tools/                Tool implementations (action-param pattern)
+      memory_tools.rs     Persistent memory store (markdown-backed, keyword search)
+    sessions/             JSONL conversation persistence
+    channels/
+      telegram.rs         Telegram bot (long-poll + send)
+    cron.rs               Scheduled tasks
+    cloud/                S3-compatible client + SigV4 signer
+  net/                    NIC abstraction (WiFi for S3, Ethernet for P4)
+  esp32/                  ESP32 HTTP runner (esp-idf-svc)
+  desktop/                Desktop HTTP server + client (axum + reqwest)
 ```
 
 See [`CLAUDE.md`](CLAUDE.md) for the full architecture, board profiles, and build workflow.
@@ -81,7 +83,7 @@ Configuration is handled through the web UI — the Config page edits the device
     "google": {
       "api_key": "...",
       "model": "gemini-2.5-flash",
-      "base_url": "https://generativelanguage.googleapis.com/v1beta"
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"
     }
   },
   "agent_name": "ZenClaw",
@@ -96,9 +98,11 @@ Configuration is handled through the web UI — the Config page edits the device
 }
 ```
 
-Multiple providers can be configured. The `default` key selects which one to use. Provider `base_url` determines the wire format: Gemini URLs use Gemini's native format, everything else uses OpenAI-compatible format (`POST /chat/completions` with Bearer auth). Any OpenAI-compatible API (DeepSeek, Groq, Ollama, etc.) works out of the box.
+Multiple providers can be configured. The `default` key selects which one to use. **All providers speak OpenAI-compatible** (`POST /chat/completions` with `Bearer <key>` auth) — Gemini included, via its own OpenAI-compat endpoint at `…/v1beta/openai`. Any OpenAI-compatible API (OpenAI, DeepSeek, Groq, zAI, Anthropic, Ollama, etc.) works out of the box. The runner auto-appends `/openai` to legacy `…/v1beta` Gemini URLs so existing devices migrate without manual edits.
 
 ## Cloud Persistence
+
+> **This section describes the target design.** Today, S3-compatible storage is exposed as a `storage` tool the agent can call (SigV4 signer + S3 client wired and verified end-to-end on Guition P4). Transparent file-system replication — the boot-restore + background-sync flow described below — is on the [Roadmap](#roadmap).
 
 The ESP32 has limited, wear-prone flash storage. Filesystem corruption from power loss, firmware reflashes, or flash wear is a real risk. ZenClaw mitigates this with automatic write-through replication to S3-compatible cloud storage.
 
@@ -131,6 +135,42 @@ Agent system data is stored under a `sys/` prefix in the bucket (stripped transp
 ## Agent Identity
 
 The agent's personality and instructions live in `SOUL.md` on the device's filesystem. Edit it via the web UI's File Manager to customize how ZenClaw behaves.
+
+## Roadmap
+
+The following features are described in this README as part of the agent's design but are **not yet shipping in the on-device build**. They were either dropped during the no-PSRAM era and are being re-added now that the DevKitC (8MB PSRAM) is the floor, or are partially built and waiting on integration. Each item lists what exists today and what "shipped" means, so progress is measurable.
+
+### 1. Cloud persistence — automatic write-through replication
+
+- **Today**: `agent/src/core/cloud/` ships a SigV4 signer + S3 client. Exposed to the agent only via the `storage` tool (LLM calls `storage(action="put"/"get"/...)` explicitly). 3 endpoints verified end-to-end on Guition P4 against bucket `tinyclaw1`.
+- **Shipped when**: (a) on boot, missing local files under `data/sessions/`, `data/MEMORY.md`, and `data/cron.json` are restored from the bucket if present; (b) writes to those paths replicate asynchronously to the bucket without blocking the agent loop; (c) the `sys/` prefix split is enforced; (d) `/api/status.cloud_storage` reports last-sync timestamp + dirty-file count.
+- **Estimated effort**: medium. SigV4 + S3 plumbing is the hard part and it's done; the gap is a small replicator thread + a write-hook on the session/memory writers.
+
+### 2. Sub-agents on ESP32
+
+- **Today**: `subagent_tools.rs` and `subagents.rs` exist and run on desktop. ESP32 explicitly omits them (`agent/src/core/tools/mod.rs`: *"message_send and subagent omitted — not viable on ESP32 hardware"*). Constraint inherited from the no-PSRAM era.
+- **Shipped when**: `register_defaults` registers `SubagentTool` on ESP32, the spawn path uses PSRAM heap explicitly, depth limits are enforced (default 2), and a memory-pressure smoke test on DevKitC survives 5 nested spawns without OOM.
+- **Estimated effort**: small-to-medium. The desktop implementation is a working reference; the surgery is mostly removing the gate + verifying memory headroom.
+
+### 3. Heartbeat loop on ESP32
+
+- **Today**: `HeartbeatConfig` is parsed from config (`agent/src/config.rs`) on both targets. The actual loop only runs on desktop (`agent/src/desktop/background/`). On ESP32 the field is inert.
+- **Shipped when**: a thread spawned from `main.rs` ticks every `heartbeat.every_secs` (default 300) when `enabled: true`, runs a reflection turn against the configured provider, and persists the result to a session named `heartbeat`. Off by default; verifiable via `/api/status` showing last-tick timestamp.
+- **Estimated effort**: small. Thread + cron-style scheduler exist; just needs to be wired from `main.rs` and budgeted for heap usage during reflection turns.
+
+### 4. Telegram voice messages
+
+- **Today**: photos (`getFile` receive, vision path), typing indicator (`sendChatAction`), and text are shipping in `agent/src/core/channels/telegram.rs`.
+- **Shipped when**: inbound voice messages are downloaded via `getFile`, transcribed (likely via the configured provider's STT endpoint or a dedicated provider), and dispatched to the agent loop as text. Outbound `sendVoice` for assistant replies is a stretch goal — text replies to voice messages are the v1 deliverable.
+- **Estimated effort**: medium. The transcription dependency is the open design question (which provider, what wire format) — `genai`'s STT support is the natural starting point.
+
+### 5. MCP client and Google Sheets tools
+
+- **Today**: `mcp_tools.rs` and `gsheets_tools.rs` are implemented in `agent/src/core/tools/` but **not** registered in `register_defaults`, so the LLM can't call them.
+- **Shipped when**: both tools are added to `register_defaults`, schemas validated against current OpenAI function-calling shape, and a smoke test from a real LLM call exercises one action per tool.
+- **Estimated effort**: small. Mostly schema-vetting + a registration line each. Likely the lowest-cost item on this list.
+
+If you depend on any of these for your use case, please open an issue so we can prioritize.
 
 ## License
 
