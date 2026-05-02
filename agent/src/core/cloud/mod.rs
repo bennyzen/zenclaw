@@ -23,3 +23,6 @@ pub use strict::strict_put;
 
 pub mod boot;
 pub use boot::{boot_restore, BootConfig, BootResult, BootWarning, BootWarningKind};
+
+pub mod snapshots;
+pub use snapshots::{read_snapshot, write_snapshot, Snapshot};

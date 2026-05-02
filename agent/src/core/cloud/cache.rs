@@ -42,6 +42,23 @@ impl CloudCache {
     pub fn total_bytes(&self) -> usize {
         self.inner.lock().map(|g| g.values().map(|v| v.len()).sum()).unwrap_or(0)
     }
+
+    /// Clone every entry into a flat HashMap. Used by `snapshots` to
+    /// dump the working set to flash for boot-time fallback.
+    pub fn snapshot(&self) -> HashMap<String, Vec<u8>> {
+        match self.inner.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Replace cache contents with `entries` (used by boot-fallback
+    /// when S3 is unreachable and we restore from the on-flash snapshot).
+    pub fn restore_from(&self, entries: HashMap<String, Vec<u8>>) {
+        if let Ok(mut g) = self.inner.lock() {
+            *g = entries;
+        }
+    }
 }
 
 #[cfg(test)]
