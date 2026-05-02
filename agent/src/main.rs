@@ -480,7 +480,10 @@ fn bootstrap_cloud(
     Some(zenclaw_agent::core::gateway::CloudHandles {
         cache,
         replicator,
+        store,
         log_compaction_bytes: storage.log_compaction_bytes,
+        retry_max: storage.replicator.retry_max,
+        backoff_cap_secs: storage.replicator.backoff_cap_secs,
     })
 }
 

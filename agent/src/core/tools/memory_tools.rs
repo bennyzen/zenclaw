@@ -117,8 +117,8 @@ impl Tool for MemorySaveTool {
             .unwrap_or_default();
         let tags = parse_tags(args["tags"].as_str().unwrap_or(""));
 
-        let path = memory_path(ctx);
-        let mut blocks = match read_blocks(&path) {
+
+        let mut blocks = match read_memory_blocks(ctx) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
         };
@@ -144,7 +144,7 @@ impl Tool for MemorySaveTool {
             ));
         }
 
-        if let Err(e) = write_file(&path, &serialized) {
+        if let Err(e) = write_memory_file(ctx, &serialized) {
             return ToolResult::Error(format!("Failed to write memory: {}", e));
         }
 
@@ -189,7 +189,7 @@ impl Tool for MemorySearchTool {
         };
         let tag_filter = args["tag"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
 
-        let blocks = match read_blocks(&memory_path(ctx)) {
+        let blocks = match read_memory_blocks(ctx) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
         };
@@ -237,7 +237,7 @@ impl Tool for MemoryListTool {
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let tag_filter = args["tag"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
 
-        let blocks = match read_blocks(&memory_path(ctx)) {
+        let blocks = match read_memory_blocks(ctx) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
         };
@@ -291,7 +291,7 @@ impl Tool for MemoryGetTool {
             _ => return ToolResult::Error("memory_get: 'id' is required".into()),
         };
 
-        let blocks = match read_blocks(&memory_path(ctx)) {
+        let blocks = match read_memory_blocks(ctx) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
         };
@@ -351,8 +351,8 @@ impl Tool for MemoryEditTool {
             return ToolResult::Error("memory_edit: must provide 'title', 'content', and/or 'tags'".into());
         }
 
-        let path = memory_path(ctx);
-        let mut blocks = match read_blocks(&path) {
+
+        let mut blocks = match read_memory_blocks(ctx) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
         };
@@ -381,7 +381,7 @@ impl Tool for MemoryEditTool {
             ));
         }
 
-        if let Err(e) = write_file(&path, &serialized) {
+        if let Err(e) = write_memory_file(ctx, &serialized) {
             return ToolResult::Error(format!("Failed to write memory: {}", e));
         }
 
@@ -416,8 +416,8 @@ impl Tool for MemoryDeleteTool {
             _ => return ToolResult::Error("memory_delete: 'id' is required".into()),
         };
 
-        let path = memory_path(ctx);
-        let mut blocks = match read_blocks(&path) {
+
+        let mut blocks = match read_memory_blocks(ctx) {
             Ok(b) => b,
             Err(e) => return ToolResult::Error(format!("Failed to read memory: {}", e)),
         };
@@ -429,7 +429,7 @@ impl Tool for MemoryDeleteTool {
         }
 
         let serialized = serialize_blocks(&blocks);
-        if let Err(e) = write_file(&path, &serialized) {
+        if let Err(e) = write_memory_file(ctx, &serialized) {
             return ToolResult::Error(format!("Failed to write memory: {}", e));
         }
 
@@ -468,20 +468,54 @@ fn parse_tags(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn read_blocks(path: &str) -> std::io::Result<Vec<MemoryBlock>> {
-    match std::fs::read_to_string(path) {
+/// Cloud key for the agent's MEMORY.md file. Derived once so callers
+/// can pass the same key to read + write paths.
+const MEMORY_CLOUD_KEY: &str = "sys/MEMORY.md";
+
+fn read_memory_blocks(ctx: &ToolContext) -> std::io::Result<Vec<MemoryBlock>> {
+    // Cloud mode: cache is the source of truth (boot_restore populated
+    // it; subsequent writes update it before strict_put). Fall back to
+    // local FS only when the cache hasn't been seeded yet (post-boot
+    // before any read or write).
+    if let Some(cloud) = &ctx.cloud {
+        if let Some(bytes) = cloud.cache.get(MEMORY_CLOUD_KEY) {
+            let s = String::from_utf8_lossy(&bytes);
+            return Ok(parse_blocks(&s));
+        }
+    }
+    let path = memory_path(ctx);
+    match std::fs::read_to_string(&path) {
         Ok(c) => Ok(parse_blocks(&c)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
     }
 }
 
-fn write_file(path: &str, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
+/// Write `content` to MEMORY.md. In cloud mode: update the cache, then
+/// `strict_put` to S3 (block on confirmation, retry up to retry_max,
+/// surface the error to the caller on exhaustion). Always also write
+/// to the local FS as a snapshot fallback — if cloud machinery breaks
+/// in a future boot, the user's MEMORY.md is still readable on flash.
+fn write_memory_file(ctx: &ToolContext, content: &str) -> std::io::Result<()> {
+    if let Some(cloud) = &ctx.cloud {
+        cloud
+            .cache
+            .put(MEMORY_CLOUD_KEY, content.as_bytes().to_vec());
+        crate::core::cloud::strict::strict_put(
+            &cloud.store,
+            MEMORY_CLOUD_KEY,
+            content.as_bytes(),
+            cloud.retry_max,
+            cloud.backoff_cap_secs,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    let path = memory_path(ctx);
+    if let Some(parent) = std::path::Path::new(&path).parent() {
         // SPIFFS rejects mkdir with ENOTSUP on flat filesystems; ignore.
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, content)
+    std::fs::write(&path, content)
 }
 
 /// Parse the on-disk MEMORY.md format. Accepts both the current shape
@@ -937,6 +971,7 @@ trailing body
                 config: Arc::new(config),
                 sessions: Arc::new(SessionManager::new(&format!("{}/sessions", tmp.path().display()))),
                 data_dir: tmp.path().display().to_string(),
+                cloud: None,
             }
         }
 

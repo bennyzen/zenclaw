@@ -34,6 +34,17 @@ impl std::fmt::Display for ToolResult {
     }
 }
 
+/// Cloud handles available to tools that need to write through the
+/// strict path (memory_save, cron save) or read from the cache.
+/// `None` on the outer field of [`ToolContext`] means cloud is
+/// disabled — tools fall back to local-file behavior.
+pub struct CloudToolHandles {
+    pub cache: crate::core::cloud::CloudCache,
+    pub store: Arc<dyn crate::core::cloud::client::ObjectStore>,
+    pub retry_max: u8,
+    pub backoff_cap_secs: u32,
+}
+
 /// Context passed to tool execution — carries shared gateway state.
 pub struct ToolContext {
     pub chat_id: String,
@@ -41,6 +52,9 @@ pub struct ToolContext {
     pub config: Arc<Config>,
     pub sessions: Arc<SessionManager>,
     pub data_dir: String,
+    /// Cloud handles for strict-path tool writes. `None` when cloud
+    /// is disabled or when the tool was constructed in a unit test.
+    pub cloud: Option<CloudToolHandles>,
 }
 
 /// Trait for an executable tool.
