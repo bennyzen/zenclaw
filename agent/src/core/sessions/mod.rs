@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+use std::sync::Arc;
 
+use crate::core::cloud::{CloudCache, Replicator};
 use crate::core::types::{Role, ToolCall};
 
 // ---------------------------------------------------------------------------
@@ -77,6 +79,15 @@ pub struct SessionState {
 pub struct SessionManager {
     sessions_dir: String,
     states: HashMap<String, SessionState>,
+    /// Cloud Tier-1 cache. `None` → local-file path. `Some` → all reads
+    /// come from here, all writes update here + enqueue to `replicator`.
+    cache: Option<CloudCache>,
+    /// Eager-path replicator. Always set together with `cache`.
+    replicator: Option<Arc<Replicator>>,
+    /// Threshold (bytes) at which the active log file gets folded into
+    /// `base.jsonl` and a new log file starts. Mirrors
+    /// [`crate::config::StorageConfig::log_compaction_bytes`].
+    log_compaction_bytes: usize,
 }
 
 fn safe_chat_id(chat_id: &str) -> String {
@@ -94,7 +105,25 @@ impl SessionManager {
         Self {
             sessions_dir: sessions_dir.to_string(),
             states,
+            cache: None,
+            replicator: None,
+            log_compaction_bytes: 0,
         }
+    }
+
+    /// Enable cloud persistence. After this, `append` writes through the
+    /// cache + replicator instead of the local filesystem, and `load`
+    /// reads from `base.jsonl` + unabsorbed `log-NN.jsonl` in the cache.
+    pub fn with_cloud(
+        mut self,
+        cache: CloudCache,
+        replicator: Arc<Replicator>,
+        log_compaction_bytes: usize,
+    ) -> Self {
+        self.cache = Some(cache);
+        self.replicator = Some(replicator);
+        self.log_compaction_bytes = log_compaction_bytes;
+        self
     }
 
     pub fn sessions_dir(&self) -> &str {
@@ -149,7 +178,12 @@ impl SessionManager {
     }
 
     /// On-disk byte size of the session JSONL, or None if it doesn't exist.
+    /// In cloud mode, returns the sum of `base.jsonl` plus all unabsorbed
+    /// `log-NN.jsonl` bytes for this chat — i.e. the materialized view.
     pub fn session_size_bytes(&self, chat_id: &str) -> Option<usize> {
+        if let Some(cache) = &self.cache {
+            return Some(self.cloud_session_bytes(chat_id, cache));
+        }
         let path = self.session_path(chat_id);
         fs::metadata(&path).ok().map(|m| m.len() as usize)
     }
@@ -158,11 +192,15 @@ impl SessionManager {
 
     /// Load all entries from a session JSONL file.
     pub fn load(&self, chat_id: &str) -> Result<Vec<SessionEntry>, Box<dyn std::error::Error>> {
-        let path = self.session_path(chat_id);
-        let data = match fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
+        let data = if let Some(cache) = &self.cache {
+            self.cloud_load_text(chat_id, cache)
+        } else {
+            let path = self.session_path(chat_id);
+            match fs::read_to_string(&path) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            }
         };
 
         let mut entries = Vec::new();
@@ -181,6 +219,160 @@ impl SessionManager {
         Ok(entries)
     }
 
+    // -- Cloud helpers (active when `cache` is Some) -------------------------
+
+    /// `sys/sessions/{chat_id}/...` key prefix for this chat (uses the
+    /// same `safe_chat_id` sanitization as the local-file path).
+    fn cloud_prefix(chat_id: &str) -> String {
+        format!("sys/sessions/{}/", safe_chat_id(chat_id))
+    }
+
+    fn cloud_base_key(chat_id: &str) -> String {
+        format!("{}base.jsonl", Self::cloud_prefix(chat_id))
+    }
+
+    fn cloud_meta_key(chat_id: &str) -> String {
+        format!("{}base.meta.json", Self::cloud_prefix(chat_id))
+    }
+
+    fn cloud_log_key(chat_id: &str, idx: u32) -> String {
+        format!("{}log-{:02}.jsonl", Self::cloud_prefix(chat_id), idx)
+    }
+
+    /// Highest log index that has been folded into base.jsonl, per
+    /// `base.meta.json`. None if no compaction has happened yet.
+    fn cloud_highest_absorbed(&self, chat_id: &str, cache: &CloudCache) -> Option<u32> {
+        cache
+            .get(&Self::cloud_meta_key(chat_id))
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("highest_absorbed_log")
+                    .and_then(|n| n.as_u64())
+                    .map(|n| n as u32)
+            })
+    }
+
+    /// Index of the active (writable) log file. After absorbing log-N
+    /// into base, future appends go to log-(N+1).
+    fn current_log_index(&self, chat_id: &str, cache: &CloudCache) -> u32 {
+        self.cloud_highest_absorbed(chat_id, cache)
+            .map(|n| n + 1)
+            .unwrap_or(0)
+    }
+
+    /// Concat base.jsonl + all unabsorbed log-NN.jsonl in numeric order.
+    fn cloud_load_text(&self, chat_id: &str, cache: &CloudCache) -> String {
+        let mut out = String::new();
+        if let Some(base) = cache.get(&Self::cloud_base_key(chat_id)) {
+            out.push_str(&String::from_utf8_lossy(&base));
+        }
+        let absorbed = self.cloud_highest_absorbed(chat_id, cache);
+        let prefix = format!("{}log-", Self::cloud_prefix(chat_id));
+        let mut indices: Vec<u32> = cache
+            .keys_with_prefix(&prefix)
+            .iter()
+            .filter_map(|k| {
+                k.strip_prefix(&prefix)?
+                    .strip_suffix(".jsonl")?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .filter(|n| absorbed.map(|a| *n > a).unwrap_or(true))
+            .collect();
+        indices.sort();
+        for idx in indices {
+            if let Some(log) = cache.get(&Self::cloud_log_key(chat_id, idx)) {
+                out.push_str(&String::from_utf8_lossy(&log));
+            }
+        }
+        out
+    }
+
+    /// Sum of base.jsonl + unabsorbed logs in the cache. Used by
+    /// `session_size_bytes` so callers (e.g. compaction trigger in
+    /// `gateway`) get the materialized view, not the on-disk file size.
+    fn cloud_session_bytes(&self, chat_id: &str, cache: &CloudCache) -> usize {
+        let base_len = cache
+            .get(&Self::cloud_base_key(chat_id))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let absorbed = self.cloud_highest_absorbed(chat_id, cache);
+        let prefix = format!("{}log-", Self::cloud_prefix(chat_id));
+        let logs_len: usize = cache
+            .keys_with_prefix(&prefix)
+            .iter()
+            .filter_map(|k| {
+                let idx = k
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(".jsonl")?
+                    .parse::<u32>()
+                    .ok()?;
+                if absorbed.map(|a| idx > a).unwrap_or(true) {
+                    cache.get(k).map(|v| v.len())
+                } else {
+                    None
+                }
+            })
+            .sum();
+        base_len + logs_len
+    }
+
+    /// Append `lines` (already serialized + newline-terminated) to the
+    /// active log in the cache, enqueue the resulting log blob to the
+    /// replicator, and run compaction if the active log crossed the
+    /// `log_compaction_bytes` threshold.
+    fn append_via_cloud(
+        &self,
+        chat_id: &str,
+        lines: &[u8],
+        cache: &CloudCache,
+        replicator: &Arc<Replicator>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let log_idx = self.current_log_index(chat_id, cache);
+        let log_key = Self::cloud_log_key(chat_id, log_idx);
+
+        let mut current = cache.get(&log_key).unwrap_or_default();
+        current.extend_from_slice(lines);
+        cache.put(&log_key, current.clone());
+        replicator.enqueue(log_key.clone(), current.clone());
+
+        if current.len() >= self.log_compaction_bytes {
+            self.compact_log(chat_id, log_idx, cache, replicator)?;
+        }
+        Ok(())
+    }
+
+    /// Fold the active log into `base.jsonl` and bump `highest_absorbed_log`.
+    /// The next call to `current_log_index` will return `log_idx + 1`, so
+    /// future appends go to a fresh log file. The absorbed log key stays in
+    /// the cache (cheap to keep; matters for boot-time crash recovery).
+    fn compact_log(
+        &self,
+        chat_id: &str,
+        log_idx: u32,
+        cache: &CloudCache,
+        replicator: &Arc<Replicator>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base_key = Self::cloud_base_key(chat_id);
+        let log_key = Self::cloud_log_key(chat_id, log_idx);
+        let meta_key = Self::cloud_meta_key(chat_id);
+
+        let mut new_base = cache.get(&base_key).unwrap_or_default();
+        if let Some(log) = cache.get(&log_key) {
+            new_base.extend_from_slice(&log);
+        }
+
+        cache.put(&base_key, new_base.clone());
+        replicator.enqueue(base_key, new_base);
+
+        let meta = serde_json::json!({ "highest_absorbed_log": log_idx }).to_string();
+        let meta_bytes = meta.into_bytes();
+        cache.put(&meta_key, meta_bytes.clone());
+        replicator.enqueue(meta_key, meta_bytes);
+
+        Ok(())
+    }
+
     /// Append an entry to the session file (write-through).
     /// If the entry is a Message or Compaction with `parent: None`, the
     /// parent is auto-linked to the current leaf_id of the session — this
@@ -194,12 +386,11 @@ impl SessionManager {
         chat_id: &str,
         entry: &SessionEntry,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let path = self.session_path(chat_id);
-
         // Auto-link parent for Message/Compaction entries that were
         // constructed with `parent: None`. We compute it from the current
-        // leaf_id on disk; if there is no prior leaf this remains None
-        // (i.e. the new entry is the root of a fresh session).
+        // leaf_id (cache-aware via load() → cloud-aware fork); if there is
+        // no prior leaf this remains None (i.e. the new entry is the root
+        // of a fresh session).
         let to_write = match entry {
             SessionEntry::Message {
                 id,
@@ -238,24 +429,31 @@ impl SessionManager {
             other => other.clone(),
         };
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-
-        let line = serde_json::to_string(&to_write)?;
-        writeln!(file, "{}", line)?;
-
-        // Auto-append session_info when we add a message or compaction
+        // Build the bytes we'd write — entry line plus an optional
+        // session_info line (mirrors the historic local-file layout so
+        // load() can use the same parser for both paths).
+        let mut bytes = Vec::with_capacity(256);
+        bytes.extend_from_slice(serde_json::to_string(&to_write)?.as_bytes());
+        bytes.push(b'\n');
         if let Some(id) = to_write.id() {
             let info = SessionEntry::Info {
                 leaf_id: id.to_string(),
             };
-            let info_line = serde_json::to_string(&info)?;
-            writeln!(file, "{}", info_line)?;
+            bytes.extend_from_slice(serde_json::to_string(&info)?.as_bytes());
+            bytes.push(b'\n');
         }
 
-        file.flush()?;
+        if let (Some(cache), Some(replicator)) = (&self.cache, &self.replicator) {
+            self.append_via_cloud(chat_id, &bytes, cache, replicator)?;
+        } else {
+            let path = self.session_path(chat_id);
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+        }
         Ok(())
     }
 
@@ -691,6 +889,148 @@ mod tests {
 
         let leaf = mgr.get_leaf_id("nonexistent").unwrap();
         assert!(leaf.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Cloud routing tests -------------------------------------------------
+
+    fn cloud_mgr(
+        log_compaction_bytes: usize,
+    ) -> (SessionManager, CloudCache, std::sync::Arc<Replicator>, String) {
+        use crate::core::cloud::ReplicatorConfig;
+        let dir = temp_dir();
+        let cache = CloudCache::new();
+        let cfg = ReplicatorConfig {
+            queue_max: 32,
+            retry_max: 1,
+            backoff_cap_secs: 1,
+        };
+        let replicator = std::sync::Arc::new(Replicator::new(cfg));
+        let mgr = SessionManager::new(&dir).with_cloud(
+            cache.clone(),
+            replicator.clone(),
+            log_compaction_bytes,
+        );
+        (mgr, cache, replicator, dir)
+    }
+
+    #[test]
+    fn append_when_cloud_enabled_writes_to_log_in_cache_and_replicator() {
+        let (mgr, cache, replicator, dir) = cloud_mgr(16_384);
+
+        let entry = make_message("msg1", None, Role::User, "hello");
+        mgr.append("web", &entry).unwrap();
+
+        // Cache holds log-00 with the entry + the auto-info line.
+        let log_key = "sys/sessions/web/log-00.jsonl";
+        let cached = cache.get(log_key).expect("log-00 cached");
+        let s = String::from_utf8_lossy(&cached);
+        assert!(s.contains("msg1"), "cached log = {}", s);
+        assert!(s.contains("session_info"), "auto-info missing: {}", s);
+
+        // Replicator queue picked up at least one PUT.
+        assert!(replicator.queue_depth() >= 1);
+
+        // Local file path was NOT touched in cloud mode.
+        let local = format!("{}/web.jsonl", dir);
+        assert!(!std::path::Path::new(&local).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_load_round_trips_through_cache() {
+        let (mgr, _cache, _replicator, dir) = cloud_mgr(16_384);
+
+        mgr.append("web", &make_message("m1", None, Role::User, "first"))
+            .unwrap();
+        mgr.append("web", &make_message("m2", None, Role::User, "second"))
+            .unwrap();
+
+        let entries = mgr.load("web").unwrap();
+        // Two messages + two auto-info entries.
+        assert_eq!(entries.len(), 4);
+
+        // Auto-link from m2 should point at m1 (via the leaf_id resolved
+        // from the cache, not the missing local file).
+        let m2 = entries.iter().find(|e| e.id() == Some("m2")).unwrap();
+        assert_eq!(m2.parent(), Some("m1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_compacts_log_when_threshold_exceeded() {
+        // Tiny threshold: a single padded message trips compaction.
+        let (mgr, cache, _replicator, dir) = cloud_mgr(32);
+
+        for i in 0..3 {
+            let entry = make_message(
+                &format!("msg{}", i),
+                None,
+                Role::User,
+                &format!("content-of-message-number-{}-padding-padding", i),
+            );
+            mgr.append("web", &entry).unwrap();
+        }
+
+        // base.jsonl populated by compaction.
+        let base = cache
+            .get("sys/sessions/web/base.jsonl")
+            .expect("base.jsonl populated after compaction");
+        let base_str = String::from_utf8_lossy(&base);
+        for i in 0..3 {
+            assert!(
+                base_str.contains(&format!("msg{}", i)),
+                "msg{} missing from base: {}",
+                i,
+                base_str
+            );
+        }
+
+        // Meta tracks highest_absorbed_log.
+        let meta = cache.get("sys/sessions/web/base.meta.json").unwrap();
+        let meta_str = String::from_utf8_lossy(&meta);
+        assert!(meta_str.contains("highest_absorbed_log"));
+
+        // load() reads base only (logs absorbed) and returns a coherent
+        // chronological stream — every msgN should appear once.
+        let entries = mgr.load("web").unwrap();
+        let ids: Vec<&str> = entries.iter().filter_map(|e| e.id()).collect();
+        assert_eq!(ids, vec!["msg0", "msg1", "msg2"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_when_cloud_disabled_uses_local_file_only() {
+        let dir = temp_dir();
+        let mgr = SessionManager::new(&dir);
+
+        mgr.append("web", &make_message("m", None, Role::User, "hi"))
+            .unwrap();
+
+        let path = format!("{}/web.jsonl", dir);
+        assert!(std::path::Path::new(&path).exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("hi"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_session_size_bytes_sums_base_and_unabsorbed_logs() {
+        let (mgr, cache, _replicator, dir) = cloud_mgr(16_384);
+
+        // No data → 0.
+        assert_eq!(mgr.session_size_bytes("web"), Some(0));
+
+        mgr.append("web", &make_message("m1", None, Role::User, "hello"))
+            .unwrap();
+
+        let log_len = cache.get("sys/sessions/web/log-00.jsonl").unwrap().len();
+        assert_eq!(mgr.session_size_bytes("web"), Some(log_len));
 
         let _ = fs::remove_dir_all(&dir);
     }
