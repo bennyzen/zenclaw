@@ -463,6 +463,7 @@ mod tests {
             endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
             bucket: Some("test-bucket".to_string()),
             region: "auto".to_string(),
+            ..Default::default()
         }
     }
 
@@ -504,12 +505,9 @@ mod tests {
     fn from_config_returns_none_when_unconfigured() {
         // Missing access keys → not cloud-configured → no client.
         let cfg = StorageConfig {
-            path: None,
-            access_key_id: None,
-            secret_access_key: None,
             endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
             bucket: Some("test-bucket".to_string()),
-            region: "auto".to_string(),
+            ..Default::default()
         };
         assert!(S3Client::from_config(&cfg).is_none());
     }
