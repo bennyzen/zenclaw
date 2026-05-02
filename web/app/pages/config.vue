@@ -788,7 +788,7 @@ watch(() => state.networkConnected, (connected) => {
           <template #body>
             <p class="text-sm text-default">
               Switch the active model to
-              <span class="font-medium">{{ switchTarget?.provider }} / {{ switchTarget?.model }}</span>?
+              <span class="font-medium">{{ switchTarget?.model ? `${switchTarget.provider} / ${switchTarget.model}` : switchTarget?.provider }}</span>?
             </p>
             <p class="mt-3 text-sm text-muted">
               The device will reboot to apply the change (~12 seconds offline).
