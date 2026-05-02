@@ -126,6 +126,33 @@ const filteredModels = computed(() => {
 
 const isCustomProvider = computed(() => providerName.value === 'custom')
 
+interface Preset {
+  slug: string
+  provider: string
+  model: string
+  baseUrl: string
+  isActive: boolean
+}
+
+const presets = computed<Preset[]>(() => {
+  const provs = rawConfig.value?.providers || {}
+  const defaultSlug = provs.default
+  return Object.entries(provs)
+    .filter(([k]) => k !== 'default')
+    .map(([slug, entry]: [string, any]) => ({
+      slug,
+      provider: slug.split('__')[0] || slug,
+      model: entry?.model || '',
+      baseUrl: entry?.base_url || '',
+      isActive: slug === defaultSlug,
+    }))
+    .sort((a, b) => a.slug.localeCompare(b.slug))
+})
+
+function stripScheme(url: string): string {
+  return url.replace(/^https?:\/\//, '')
+}
+
 watch(providerName, (name) => {
   if (BASE_URLS[name]) baseUrl.value = BASE_URLS[name]
 })
@@ -430,6 +457,35 @@ watch(() => state.networkConnected, (connected) => {
               <UFormField label="API Key" class="w-full">
                 <UInput v-model="apiKey" type="text" placeholder="API key" size="xl" class="w-full" />
               </UFormField>
+
+              <div v-if="presets.length" class="pt-6 border-t border-default">
+                <div class="flex items-center justify-between mb-3">
+                  <h3 class="text-sm font-medium">Saved Models</h3>
+                  <span class="text-xs text-dimmed">Click a card to switch</span>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    v-for="p in presets"
+                    :key="p.slug"
+                    type="button"
+                    class="text-left rounded-lg border p-3 transition-colors"
+                    :class="p.isActive
+                      ? 'border-primary bg-primary/5 cursor-default'
+                      : 'border-default hover:border-primary/50 hover:bg-elevated cursor-pointer'"
+                  >
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0 flex-1">
+                        <div class="flex items-center gap-1.5 mb-1">
+                          <span v-if="p.isActive" class="size-1.5 rounded-full bg-primary" />
+                          <span class="text-sm font-medium truncate">{{ p.provider }}</span>
+                        </div>
+                        <p class="text-xs text-muted truncate">{{ p.model || '—' }}</p>
+                        <p class="text-xs text-dimmed truncate font-mono">{{ stripScheme(p.baseUrl) || '—' }}</p>
+                      </div>
+                    </div>
+                  </button>
+                </div>
+              </div>
             </div>
           </template>
 
