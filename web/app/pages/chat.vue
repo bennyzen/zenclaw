@@ -148,10 +148,6 @@ function onSubmitKey(e: KeyboardEvent) {
   }
 }
 
-function toggleTool(item: TimelineItem) {
-  if (item.kind === 'tool') item.expanded = !item.expanded
-}
-
 function formatArgs(args: unknown): string {
   try {
     return JSON.stringify(args, null, 2)
@@ -228,47 +224,63 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
-            <div v-else-if="item.kind === 'tool'" class="flex items-start gap-2 ml-6">
-              <button
-                type="button"
-                class="flex items-center gap-2 text-xs text-dimmed hover:text-default border border-default rounded px-2 py-1 transition-colors"
-                @click="toggleTool(item)"
-              >
-                <UIcon
-                  v-if="item.status === 'pending'"
-                  name="i-lucide-loader-2"
-                  class="animate-spin"
-                />
-                <UIcon
-                  v-else-if="item.status === 'ok'"
-                  name="i-lucide-wrench"
-                  class="text-success"
-                />
-                <UIcon
-                  v-else
-                  name="i-lucide-circle-alert"
-                  class="text-error"
-                />
-                <span class="font-mono">{{ item.name }}</span>
-                <UIcon
-                  :name="item.expanded ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
-                  class="size-3"
-                />
-              </button>
+            <UCollapsible
+              v-else-if="item.kind === 'tool'"
+              v-model:open="item.expanded"
+              class="ml-6 max-w-[80%]"
+            >
+              <template #default="{ open }">
+                <UButton
+                  color="neutral"
+                  variant="subtle"
+                  size="xs"
+                  :ui="{ base: 'font-mono' }"
+                >
+                  <template #leading>
+                    <UIcon
+                      v-if="item.status === 'pending'"
+                      name="i-lucide-loader-2"
+                      class="animate-spin"
+                    />
+                    <UIcon
+                      v-else-if="item.status === 'ok'"
+                      name="i-lucide-wrench"
+                      class="text-success"
+                    />
+                    <UIcon
+                      v-else
+                      name="i-lucide-circle-alert"
+                      class="text-error"
+                    />
+                  </template>
+                  {{ item.name }}
+                  <template #trailing>
+                    <UIcon
+                      :name="open ? 'i-lucide-chevron-down' : 'i-lucide-chevron-right'"
+                      class="size-3.5 text-dimmed"
+                    />
+                  </template>
+                </UButton>
+              </template>
 
-              <div v-if="item.expanded" class="flex-1 min-w-0 space-y-1">
-                <details open class="text-xs">
-                  <summary class="cursor-pointer text-dimmed">args</summary>
-                  <pre class="bg-muted rounded p-2 overflow-x-auto text-xs whitespace-pre-wrap break-all">{{ formatArgs(item.args) }}</pre>
-                </details>
-                <details v-if="item.status !== 'pending'" open class="text-xs">
-                  <summary class="cursor-pointer text-dimmed">
-                    {{ item.status === 'ok' ? 'result' : 'error' }}
-                  </summary>
-                  <pre class="bg-muted rounded p-2 overflow-x-auto text-xs whitespace-pre-wrap break-all">{{ clamp(item.status === 'ok' ? item.result : item.error, 25) }}</pre>
-                </details>
-              </div>
-            </div>
+              <template #content>
+                <div class="mt-2 space-y-3 rounded-md border border-default bg-elevated/40 p-3">
+                  <div>
+                    <p class="mb-1 text-[11px] font-medium uppercase tracking-wide text-dimmed">args</p>
+                    <pre class="overflow-x-auto whitespace-pre-wrap break-all rounded bg-default p-2 text-xs leading-relaxed">{{ formatArgs(item.args) }}</pre>
+                  </div>
+                  <div v-if="item.status !== 'pending'">
+                    <p
+                      class="mb-1 text-[11px] font-medium uppercase tracking-wide"
+                      :class="item.status === 'ok' ? 'text-dimmed' : 'text-error'"
+                    >
+                      {{ item.status === 'ok' ? 'result' : 'error' }}
+                    </p>
+                    <pre class="overflow-x-auto whitespace-pre-wrap break-all rounded bg-default p-2 text-xs leading-relaxed">{{ clamp(item.status === 'ok' ? item.result : item.error, 25) }}</pre>
+                  </div>
+                </div>
+              </template>
+            </UCollapsible>
 
             <div v-else-if="item.kind === 'error'" class="flex items-start gap-2">
               <UIcon name="i-lucide-circle-alert" class="text-error mt-1" />
