@@ -5,10 +5,8 @@
 //! response surface mirrors the MicroPython implementation in
 //! `firmware/lib/s3.py` so the consuming web UI can stay unchanged.
 
-#[cfg(feature = "esp32")]
 use crate::config::StorageConfig;
 
-#[cfg(feature = "esp32")]
 use chrono::Utc;
 #[cfg(feature = "esp32")]
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
@@ -17,8 +15,7 @@ use esp_idf_svc::http::Method;
 #[cfg(feature = "esp32")]
 use std::io::Write;
 
-#[cfg(feature = "esp32")]
-use super::sigv4::{presign_url, sign_authorization_header, SignInput};
+use super::sigv4::{presign_url, sha256_hex, sign_authorization_header, SignInput};
 
 /// One object returned from a LIST call.
 #[derive(Debug, Clone)]
@@ -50,7 +47,6 @@ impl std::error::Error for S3Error {}
 
 type Result<T> = std::result::Result<T, S3Error>;
 
-#[cfg(feature = "esp32")]
 pub struct S3Client {
     /// Endpoint scheme+host with no trailing slash (e.g.
     /// `https://abcdef.r2.cloudflarestorage.com`).
@@ -63,7 +59,6 @@ pub struct S3Client {
     region: String,
 }
 
-#[cfg(feature = "esp32")]
 impl S3Client {
     /// Build a client from the agent's StorageConfig. Returns `None` if
     /// the config doesn't have the four required fields.
@@ -97,8 +92,40 @@ impl S3Client {
         format!("/{}", self.bucket)
     }
 
+    /// Sign a request — returns the headers to attach (`Authorization`,
+    /// `x-amz-date`, `x-amz-content-sha256`, `Host`). Pure SigV4 logic; no
+    /// network IO, so it compiles on every target.
+    fn sign(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<(String, String)> {
+        let signed = sign_authorization_header(&SignInput {
+            method,
+            host: &self.host,
+            path,
+            query,
+            extra_headers: &[],
+            body,
+            access_key: &self.access_key,
+            secret_key: &self.secret_key,
+            region: &self.region,
+            service: "s3",
+            now: Utc::now(),
+        });
+        vec![
+            ("Authorization".to_string(), signed.authorization),
+            ("x-amz-date".to_string(), signed.amz_date),
+            ("x-amz-content-sha256".to_string(), signed.content_sha256),
+            ("Host".to_string(), self.host.clone()),
+        ]
+    }
+
     /// LIST objects via ListObjectsV2. Caller-supplied prefix and
     /// delimiter ("/" gives directory-style listings via CommonPrefixes).
+    #[cfg(feature = "esp32")]
     pub fn list(&self, prefix: &str, delimiter: Option<&str>, max_keys: u32) -> Result<S3Listing> {
         let max_keys_str = max_keys.to_string();
         let mut query: Vec<(&str, &str)> = vec![
@@ -113,34 +140,82 @@ impl S3Client {
         }
 
         let path = self.bucket_path();
-        let signed = sign_authorization_header(&SignInput {
-            method: "GET",
-            host: &self.host,
-            path: &path,
-            query: &query,
-            extra_headers: &[],
-            body: &[],
-            access_key: &self.access_key,
-            secret_key: &self.secret_key,
-            region: &self.region,
-            service: "s3",
-            now: Utc::now(),
-        });
+        let hdrs = self.sign("GET", &path, &query, &[]);
+        let hdr_refs: Vec<(&str, &str)> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let url = build_url(&self.scheme_host, &path, &query);
-        let body = http_request(
-            Method::Get,
-            &url,
-            &[
-                ("Authorization", signed.authorization.as_str()),
-                ("x-amz-date", signed.amz_date.as_str()),
-                ("x-amz-content-sha256", signed.content_sha256.as_str()),
-                ("Host", self.host.as_str()),
-            ],
-            &[],
-        )?;
+        let body = http_request(Method::Get, &url, &hdr_refs, &[])?;
 
         Ok(parse_list_xml(&body))
+    }
+
+    /// PUT an object. Returns Ok on 2xx, [`S3Error`] otherwise.
+    #[cfg(feature = "esp32")]
+    pub fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let hdrs = self.sign("PUT", &path, &[], bytes);
+        let hdr_refs: Vec<(&str, &str)> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        http_request(Method::Put, &url, &hdr_refs, bytes)?;
+        Ok(())
+    }
+
+    /// GET an object's full bytes. Returns [`S3Error`] on 4xx/5xx.
+    #[cfg(feature = "esp32")]
+    pub fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let hdrs = self.sign("GET", &path, &[], &[]);
+        let hdr_refs: Vec<(&str, &str)> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let body = http_request(Method::Get, &url, &hdr_refs, &[])?;
+        Ok(body.into_bytes())
+    }
+
+    /// GET a byte range (`length` bytes starting at `offset`). Inclusive
+    /// HTTP `Range: bytes=offset-(offset+length-1)`.
+    #[cfg(feature = "esp32")]
+    pub fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let mut hdrs = self.sign("GET", &path, &[], &[]);
+        hdrs.push((
+            "range".to_string(),
+            format!("bytes={}-{}", offset, offset + length - 1),
+        ));
+        let hdr_refs: Vec<(&str, &str)> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let body = http_request(Method::Get, &url, &hdr_refs, &[])?;
+        Ok(body.into_bytes())
+    }
+
+    /// DELETE an object. Idempotent — 404 is treated as Ok.
+    #[cfg(feature = "esp32")]
+    pub fn delete(&self, key: &str) -> Result<()> {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let hdrs = self.sign("DELETE", &path, &[], &[]);
+        let hdr_refs: Vec<(&str, &str)> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        match http_request(Method::Delete, &url, &hdr_refs, &[]) {
+            Ok(_) => Ok(()),
+            Err(e) if e.0.starts_with("HTTP 404") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// HEAD an object. Returns `Some(content_length)` on 200, `None` on 404,
+    /// [`S3Error`] otherwise.
+    #[cfg(feature = "esp32")]
+    pub fn head(&self, key: &str) -> Result<Option<u64>> {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let hdrs = self.sign("HEAD", &path, &[], &[]);
+        let hdr_refs: Vec<(&str, &str)> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        head_request(&url, &hdr_refs)
     }
 
     /// Generate a presigned URL valid for `expires_secs` seconds.
@@ -156,6 +231,39 @@ impl S3Client {
             expires_secs,
             Utc::now(),
         )
+    }
+
+    /// Test-only: build the (method, url, headers) tuple for a PUT without
+    /// actually sending it. Lets desktop unit tests assert URL + signing
+    /// shape without an HTTP client.
+    #[cfg(test)]
+    pub fn build_put_request_for_test(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> (String, String, Vec<(String, String)>) {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let hdrs = self.sign("PUT", &path, &[], bytes);
+        ("PUT".to_string(), url, hdrs)
+    }
+
+    /// Test-only: build the (method, url, headers) tuple for a ranged GET.
+    #[cfg(test)]
+    pub fn build_get_range_request_for_test(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> (String, String, Vec<(String, String)>) {
+        let path = self.object_path(key);
+        let url = build_url(&self.scheme_host, &path, &[]);
+        let mut hdrs = self.sign("GET", &path, &[], &[]);
+        hdrs.push((
+            "range".to_string(),
+            format!("bytes={}-{}", offset, offset + length - 1),
+        ));
+        ("GET".to_string(), url, hdrs)
     }
 }
 
@@ -258,6 +366,41 @@ fn http_request(
     Ok(body_str)
 }
 
+/// Issue an HTTPS HEAD request and return `Content-Length` on 200, `None`
+/// on 404, error otherwise. Separate from [`http_request`] because we
+/// don't want to read the (empty) body and we need access to a response
+/// header rather than the body bytes.
+#[cfg(feature = "esp32")]
+fn head_request(url: &str, headers: &[(&str, &str)]) -> Result<Option<u64>> {
+    let config = HttpConfig {
+        buffer_size: Some(2048),
+        buffer_size_tx: Some(2048),
+        timeout: Some(std::time::Duration::from_secs(30)),
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+
+    let mut conn = EspHttpConnection::new(&config)
+        .map_err(|e| S3Error(format!("HTTP init: {}", e)))?;
+    conn.initiate_request(Method::Head, url, headers)
+        .map_err(|e| S3Error(format!("HTTP request: {}", e)))?;
+    conn.initiate_response()
+        .map_err(|e| S3Error(format!("HTTP response: {}", e)))?;
+
+    let status = conn.status();
+    if status == 404 {
+        return Ok(None);
+    }
+    if status >= 400 {
+        return Err(S3Error(format!("HTTP {} on HEAD", status)));
+    }
+
+    let len = conn
+        .header("content-length")
+        .and_then(|s| s.parse::<u64>().ok());
+    Ok(len)
+}
+
 /// Minimal XML parse for ListObjectsV2 responses. Extracts `<Key>` +
 /// `<Size>` tuples from `<Contents>` blocks and `<Prefix>` strings
 /// from `<CommonPrefixes>`. Mirrors the regex approach in
@@ -311,6 +454,65 @@ fn extract_tag(block: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_storage_config() -> StorageConfig {
+        StorageConfig {
+            path: None,
+            access_key_id: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
+            secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
+            bucket: Some("test-bucket".to_string()),
+            region: "auto".to_string(),
+        }
+    }
+
+    #[test]
+    fn put_constructs_correct_url_and_method() {
+        let cfg = test_storage_config();
+        let client = S3Client::from_config(&cfg).unwrap();
+        let (method, url, headers) = client.build_put_request_for_test("sys/MEMORY.md", b"hello");
+
+        assert_eq!(method, "PUT");
+        assert!(
+            url.contains("/test-bucket/sys/MEMORY.md"),
+            "url = {}",
+            url
+        );
+        assert!(headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        let expected_hash = sha256_hex(b"hello");
+        assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-amz-content-sha256")
+            && *v == expected_hash));
+    }
+
+    #[test]
+    fn get_range_includes_range_header() {
+        let cfg = test_storage_config();
+        let client = S3Client::from_config(&cfg).unwrap();
+        let (method, _url, headers) =
+            client.build_get_range_request_for_test("files/manual.pdf", 1024, 4096);
+
+        assert_eq!(method, "GET");
+        // Inclusive range: 1024 + 4096 - 1 = 5119
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("range") && *v == "bytes=1024-5119"));
+    }
+
+    #[test]
+    fn from_config_returns_none_when_unconfigured() {
+        // Missing access keys → not cloud-configured → no client.
+        let cfg = StorageConfig {
+            path: None,
+            access_key_id: None,
+            secret_access_key: None,
+            endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
+            bucket: Some("test-bucket".to_string()),
+            region: "auto".to_string(),
+        };
+        assert!(S3Client::from_config(&cfg).is_none());
+    }
 
     #[test]
     fn parse_list_xml_extracts_keys_and_sizes() {
