@@ -17,3 +17,6 @@ pub use cache::CloudCache;
 
 pub mod replicator;
 pub use replicator::{Replicator, ReplicatorConfig, PendingWrite, DeadLetterEntry};
+
+pub mod strict;
+pub use strict::strict_put;
