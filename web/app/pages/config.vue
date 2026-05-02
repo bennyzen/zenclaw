@@ -182,6 +182,14 @@ async function confirmSwitch() {
   switching.value = false
 }
 
+function deletePreset(p: Preset, ev: Event) {
+  ev.stopPropagation()
+  if (p.isActive) return
+  const provs = { ...(rawConfig.value.providers || {}) }
+  delete provs[p.slug]
+  rawConfig.value = { ...rawConfig.value, providers: provs }
+}
+
 function stripScheme(url: string): string {
   return url.replace(/^https?:\/\//, '')
 }
@@ -516,6 +524,15 @@ watch(() => state.networkConnected, (connected) => {
                         <p class="text-xs text-muted truncate">{{ p.model || '—' }}</p>
                         <p class="text-xs text-dimmed truncate font-mono">{{ stripScheme(p.baseUrl) || '—' }}</p>
                       </div>
+                      <UButton
+                        icon="i-lucide-x"
+                        variant="ghost"
+                        color="neutral"
+                        size="xs"
+                        :disabled="p.isActive"
+                        :title="p.isActive ? 'Cannot delete the active preset' : 'Remove preset'"
+                        @click="(ev: Event) => deletePreset(p, ev)"
+                      />
                     </div>
                   </button>
                 </div>
