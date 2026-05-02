@@ -505,15 +505,19 @@ watch(() => state.networkConnected, (connected) => {
                   <span class="text-xs text-dimmed">Click a card to switch</span>
                 </div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <button
+                  <div
                     v-for="p in presets"
                     :key="p.slug"
-                    type="button"
-                    class="text-left rounded-lg border p-3 transition-colors"
+                    role="button"
+                    :tabindex="p.isActive ? -1 : 0"
+                    :aria-disabled="p.isActive"
+                    class="text-left rounded-lg border p-3 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                     :class="p.isActive
                       ? 'border-primary bg-primary/5 cursor-default'
                       : 'border-default hover:border-primary/50 hover:bg-elevated cursor-pointer'"
                     @click="openSwitch(p)"
+                    @keydown.enter.prevent="openSwitch(p)"
+                    @keydown.space.prevent="openSwitch(p)"
                   >
                     <div class="flex items-start justify-between gap-2">
                       <div class="min-w-0 flex-1">
@@ -534,7 +538,7 @@ watch(() => state.networkConnected, (connected) => {
                         @click="(ev: Event) => deletePreset(p, ev)"
                       />
                     </div>
-                  </button>
+                  </div>
                 </div>
               </div>
             </div>
