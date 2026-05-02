@@ -47,14 +47,32 @@ impl std::error::Error for S3Error {}
 
 pub type Result<T> = std::result::Result<T, S3Error>;
 
-/// Trait abstraction over S3 ops so the replicator can be unit-tested
-/// against a fake without real network. Implemented by S3Client; mocked
-/// in tests.
+/// Trait abstraction over S3 ops so the replicator and boot-restore
+/// flow can be unit-tested against a fake without real network.
+/// Implemented by [`S3Client`]; mocked in tests.
+///
+/// `list_keys` and `get_range` ship default impls so existing test
+/// fakes (replicator, strict_put) that don't need them stay compiling.
+/// Boot-restore overrides both.
 pub trait ObjectStore: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
     fn delete(&self, key: &str) -> Result<()>;
     fn head(&self, key: &str) -> Result<Option<u64>>;
+
+    /// List all object keys whose name begins with `prefix`. Returns an
+    /// empty vec by default — override on real backends and on test
+    /// fakes that exercise the boot-restore code path.
+    fn list_keys(&self, _prefix: &str) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// GET a byte range — `length` bytes starting at `offset`. The
+    /// default impl errors so test fakes that don't need it stay
+    /// compiling without silently returning misleading bytes.
+    fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Vec<u8>> {
+        Err(S3Error("get_range not implemented".to_string()))
+    }
 }
 
 #[cfg(feature = "esp32")]
@@ -63,6 +81,13 @@ impl ObjectStore for S3Client {
     fn get(&self, key: &str) -> Result<Vec<u8>> { Self::get(self, key) }
     fn delete(&self, key: &str) -> Result<()> { Self::delete(self, key) }
     fn head(&self, key: &str) -> Result<Option<u64>> { Self::head(self, key) }
+    fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let listing = Self::list(self, prefix, None, 1000)?;
+        Ok(listing.objects.into_iter().map(|o| o.key).collect())
+    }
+    fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
+        Self::get_range(self, key, offset, length)
+    }
 }
 
 pub struct S3Client {

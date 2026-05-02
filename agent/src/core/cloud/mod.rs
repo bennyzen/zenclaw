@@ -20,3 +20,6 @@ pub use replicator::{Replicator, ReplicatorConfig, PendingWrite, DeadLetterEntry
 
 pub mod strict;
 pub use strict::strict_put;
+
+pub mod boot;
+pub use boot::{boot_restore, BootConfig, BootResult, BootWarning, BootWarningKind};
