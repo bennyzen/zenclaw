@@ -44,6 +44,10 @@ const BASE_URLS: Record<string, string> = {
   'bytedance-seed': 'https://ark.cn-beijing.volces.com/api/v3',
 }
 
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
 // --- Form fields ---
 const providerName = ref('google')
 const apiKey = ref('')
@@ -145,16 +149,18 @@ async function load() {
     const config = await getConfig()
     rawConfig.value = config
 
-    const defaultProvider = config.providers?.default || 'google'
-    const provider = config.providers?.[defaultProvider] || {}
+    const defaultSlug = config.providers?.default || 'google'
+    const provider = config.providers?.[defaultSlug] || {}
     apiKey.value = provider.api_key || ''
     model.value = provider.model || ''
     baseUrl.value = provider.base_url || ''
 
-    // Match to a known provider or fall back to custom
-    // Check both by name and by base_url
-    if (BASE_URLS[defaultProvider]) {
-      providerName.value = defaultProvider
+    // Slugs look like "openai__gpt-4o-mini" — strip the suffix to recover
+    // the provider identity. Legacy keys ("openai") have no suffix and
+    // pass through unchanged.
+    const providerKey = defaultSlug.split('__')[0] || 'google'
+    if (BASE_URLS[providerKey]) {
+      providerName.value = providerKey
     } else {
       const match = Object.entries(BASE_URLS).find(([, url]) => baseUrl.value.includes(url))
       providerName.value = match ? match[0] : 'custom'
@@ -235,13 +241,17 @@ async function save() {
   const config = { ...rawConfig.value }
 
   const prov = config.providers || {}
-  const key = isCustomProvider.value ? 'custom' : providerName.value
-  prov.default = key
-  const providerConfig = prov[key] || {}
+  const providerKey = isCustomProvider.value ? 'custom' : providerName.value
+  // Slug-derived key lets multiple presets coexist (openai__gpt-4o-mini,
+  // openai__gpt-5, etc.). Falls back to the bare provider name when the
+  // model is empty so the form still saves something usable.
+  const slug = model.value ? `${providerKey}__${slugify(model.value)}` : providerKey
+  prov.default = slug
+  const providerConfig = prov[slug] || {}
   providerConfig.api_key = apiKey.value
   providerConfig.model = model.value
   providerConfig.base_url = baseUrl.value
-  prov[key] = providerConfig
+  prov[slug] = providerConfig
   config.providers = prov
 
   config.agent_name = agentName.value
