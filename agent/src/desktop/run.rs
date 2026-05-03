@@ -49,7 +49,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_arc = Arc::new(config.clone());
     let runner: Box<dyn LlmRunner> = Box::new(Runner::new(config_arc));
-    let gateway = Gateway::new(config.clone(), data_dir, runner);
+    // Temporary stub — real `DesktopHostFacts` lands in Task 12.
+    struct StubFacts;
+    impl crate::core::commands::HostFacts for StubFacts {
+        fn hostname(&self) -> String { "unknown".to_string() }
+        fn ip(&self) -> Option<String> { None }
+        fn link(&self) -> crate::core::commands::LinkKind {
+            crate::core::commands::LinkKind::Desktop
+        }
+        fn free_internal_heap(&self) -> Option<u32> { None }
+        fn free_psram(&self) -> Option<u32> { None }
+        fn uptime_secs(&self) -> u64 { 0 }
+    }
+    let host_facts: Arc<dyn crate::core::commands::HostFacts> = Arc::new(StubFacts);
+    let gateway = Gateway::new(config.clone(), data_dir, runner, host_facts);
     info!("Tools registered: {}", gateway.tools.len());
 
     let gateway = Arc::new(gateway);

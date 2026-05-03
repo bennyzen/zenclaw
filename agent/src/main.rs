@@ -206,11 +206,27 @@ fn main() {
     let config_for_tg = config.clone();
     let config_arc = std::sync::Arc::new(config.clone());
     let runner = Box::new(zenclaw_agent::esp32::runner::EspRunner::new(config_arc));
+    // Temporary stub — real `Esp32HostFacts` lands in Task 11.
+    struct StubFacts;
+    impl zenclaw_agent::core::commands::HostFacts for StubFacts {
+        fn hostname(&self) -> String { "unknown".to_string() }
+        fn ip(&self) -> Option<String> { None }
+        fn link(&self) -> zenclaw_agent::core::commands::LinkKind {
+            zenclaw_agent::core::commands::LinkKind::Desktop
+        }
+        fn free_internal_heap(&self) -> Option<u32> { None }
+        fn free_psram(&self) -> Option<u32> { None }
+        fn uptime_secs(&self) -> u64 { 0 }
+    }
+    let host_facts: std::sync::Arc<dyn zenclaw_agent::core::commands::HostFacts> =
+        std::sync::Arc::new(StubFacts);
     let gateway = match cloud_handles {
         Some(h) => zenclaw_agent::core::gateway::Gateway::new_with_cloud(
-            config, data_dir, runner, h,
+            config, data_dir, runner, h, host_facts,
         ),
-        None => zenclaw_agent::core::gateway::Gateway::new(config, data_dir, runner),
+        None => zenclaw_agent::core::gateway::Gateway::new(
+            config, data_dir, runner, host_facts,
+        ),
     };
     let gateway = std::sync::Arc::new(gateway);
 

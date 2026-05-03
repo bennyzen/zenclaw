@@ -48,13 +48,21 @@ pub struct Gateway {
     /// `backoff_cap_secs` from `StorageConfig`).
     pub cloud_retry_max: u8,
     pub cloud_backoff_cap_secs: u32,
+    /// Bridge to platform-specific runtime reads (heap, link, RSSI, IP).
+    /// Populated at construction by `main.rs` (ESP32) or `desktop/run.rs`.
+    pub host_facts: Arc<dyn crate::core::commands::HostFacts>,
     /// Per-chat cancellation flags — new message on a busy chat cancels the running turn.
     active_chats: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl Gateway {
-    pub fn new(config: Config, data_dir: &str, runner: Box<dyn LlmRunner>) -> Self {
-        Self::new_inner(config, data_dir, runner, None)
+    pub fn new(
+        config: Config,
+        data_dir: &str,
+        runner: Box<dyn LlmRunner>,
+        host_facts: Arc<dyn crate::core::commands::HostFacts>,
+    ) -> Self {
+        Self::new_inner(config, data_dir, runner, None, host_facts)
     }
 
     /// Cloud-aware constructor. Builds the inner [`SessionManager`] with
@@ -67,8 +75,9 @@ impl Gateway {
         data_dir: &str,
         runner: Box<dyn LlmRunner>,
         cloud: CloudHandles,
+        host_facts: Arc<dyn crate::core::commands::HostFacts>,
     ) -> Self {
-        Self::new_inner(config, data_dir, runner, Some(cloud))
+        Self::new_inner(config, data_dir, runner, Some(cloud), host_facts)
     }
 
     fn new_inner(
@@ -76,6 +85,7 @@ impl Gateway {
         data_dir: &str,
         runner: Box<dyn LlmRunner>,
         cloud: Option<CloudHandles>,
+        host_facts: Arc<dyn crate::core::commands::HostFacts>,
     ) -> Self {
         let sessions_dir = format!("{}/sessions", data_dir);
         let config = Arc::new(config);
@@ -113,6 +123,7 @@ impl Gateway {
             cloud_store,
             cloud_retry_max,
             cloud_backoff_cap_secs,
+            host_facts,
             active_chats: Mutex::new(HashMap::new()),
         }
     }
@@ -327,6 +338,47 @@ impl Gateway {
         try_send(events, ChatEvent::Done);
 
         Ok(result)
+    }
+
+    /// Build a complete `RuntimeFacts` for the given `chat_id`, combining
+    /// `HostFacts` reads (heap, link, RSSI) with state `Gateway` already owns
+    /// (session size, model override resolution, agent name, platform).
+    pub fn runtime_facts(&self, chat_id: &str) -> crate::core::commands::RuntimeFacts {
+        use crate::core::commands::{detect_platform, RuntimeFacts};
+
+        let session_bytes = self
+            .sessions
+            .session_size_bytes(chat_id)
+            .unwrap_or(0) as u64;
+        let session_entries = self
+            .sessions
+            .load(chat_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        let state = self.sessions.get_state(chat_id);
+        let model = state
+            .model_override
+            .clone()
+            .or_else(|| {
+                let p = &self.config.providers;
+                p.entries.get(&p.default).and_then(|cfg| cfg.model.clone())
+            })
+            .unwrap_or_else(|| "(unset)".to_string());
+
+        RuntimeFacts {
+            hostname: self.host_facts.hostname(),
+            ip: self.host_facts.ip(),
+            link: self.host_facts.link(),
+            free_internal_heap: self.host_facts.free_internal_heap(),
+            free_psram: self.host_facts.free_psram(),
+            uptime_secs: self.host_facts.uptime_secs(),
+            agent_name: self.config.agent_name.clone(),
+            platform: detect_platform(),
+            session_bytes,
+            session_entries,
+            model,
+        }
     }
 
     /// Cancel an active chat turn.
