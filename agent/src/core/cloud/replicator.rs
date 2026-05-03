@@ -99,11 +99,26 @@ impl Replicator {
     }
 
     /// Spawn the drainer thread. Returns a JoinHandle for shutdown.
+    ///
+    /// Stack budget: 8 KiB. The pthread default of 3-4 KiB overflows
+    /// during mbedTLS handshake (observed as "Stack overflow in task
+    /// pthread"). Going larger starves the 32 KiB agent thread of
+    /// internal SRAM ("Failed to create task: OutOfMemory") — internal
+    /// SRAM is the limiting resource because pthread stacks live there,
+    /// not in PSRAM. 8 KiB matches the proven-safe size used by the
+    /// Telegram poller threads in `main.rs`, which also do TLS through
+    /// mbedTLS. The handshake's heap allocations land in PSRAM (per
+    /// `project_esp32_chat_broken_postmortem`), keeping stack usage in
+    /// the 4-6 KiB range during TLS.
     pub fn spawn_drainer(&self, store: Arc<dyn ObjectStore>) -> thread::JoinHandle<()> {
         let state = self.state.clone();
         let cv = self.cv.clone();
         let cfg = self.cfg.clone();
-        thread::spawn(move || drainer_loop(state, cv, cfg, store))
+        thread::Builder::new()
+            .name("cloud-drainer".into())
+            .stack_size(8 * 1024)
+            .spawn(move || drainer_loop(state, cv, cfg, store))
+            .expect("Failed to spawn cloud-drainer thread")
     }
 }
 
