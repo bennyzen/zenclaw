@@ -101,6 +101,32 @@ pub fn menu() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// Execute a parsed slash command. Returns the user-visible reply.
+///
+/// `async` for forward-compat — v1 ops are sync but `/restart`, `/model`
+/// (deferred to v2) will need NVS / HTTP I/O. Async now avoids breaking
+/// callers later.
+///
+/// Note: `Clear` and `New` need access to `SessionManager`, which is on
+/// `Gateway`. The signature in subsequent tasks will grow to include
+/// `&SessionManager` + cloud handles. We start with the simplest shape
+/// and extend.
+pub async fn execute(cmd: Command, facts: &RuntimeFacts) -> String {
+    match cmd {
+        Command::Help => render_help(),
+        // Other arms wired in later tasks.
+        _ => format!("(command {:?} not yet implemented)", cmd),
+    }
+}
+
+fn render_help() -> String {
+    let mut s = String::from("**Available commands:**\n\n");
+    for (name, desc) in menu() {
+        s.push_str(&format!("- `/{}` — {}\n", name, desc));
+    }
+    s
+}
+
 /// Parse a user message into a recognized command.
 ///
 /// Matches only when the message *starts* with `/<name>`. Trailing
@@ -233,5 +259,34 @@ mod tests {
             "expected host platform, got {:?}",
             p,
         );
+    }
+
+    #[tokio::test]
+    async fn execute_help_lists_all_commands_with_descriptions() {
+        let facts = make_fake_runtime_facts();
+        let out = execute(Command::Help, &facts).await;
+        for (name, desc) in menu() {
+            assert!(out.contains(&format!("/{}", name)),
+                "expected /{} in /help output, got: {}", name, out);
+            assert!(out.contains(desc),
+                "expected description {:?} in /help output", desc);
+        }
+    }
+
+    fn make_fake_runtime_facts() -> RuntimeFacts {
+        let h = FakeHostFacts::new();
+        RuntimeFacts {
+            hostname: h.hostname(),
+            ip: h.ip(),
+            link: h.link(),
+            free_internal_heap: h.free_internal_heap(),
+            free_psram: h.free_psram(),
+            uptime_secs: h.uptime_secs(),
+            agent_name: "TestAgent".to_string(),
+            platform: "test",
+            session_bytes: 0,
+            session_entries: 0,
+            model: "test-model".to_string(),
+        }
     }
 }
