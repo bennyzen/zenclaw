@@ -113,8 +113,8 @@ pub fn menu() -> &'static [(&'static str, &'static str)] {
 /// and extend.
 pub async fn execute(cmd: Command, facts: &RuntimeFacts) -> String {
     match cmd {
-        Command::Help => render_help(),
-        // Other arms wired in later tasks.
+        Command::Help   => render_help(),
+        Command::Status => render_status(facts),
         _ => format!("(command {:?} not yet implemented)", cmd),
     }
 }
@@ -125,6 +125,49 @@ fn render_help() -> String {
         s.push_str(&format!("- `/{}` — {}\n", name, desc));
     }
     s
+}
+
+fn render_status(f: &RuntimeFacts) -> String {
+    fn or_dash<T: std::fmt::Display>(v: Option<T>) -> String {
+        v.map(|x| x.to_string()).unwrap_or_else(|| "—".to_string())
+    }
+    fn fmt_kb(bytes: Option<u32>) -> String {
+        match bytes {
+            Some(b) if b >= 1_000_000 => format!("{} MB", b / 1_000_000),
+            Some(b) => format!("{} KB", b / 1000),
+            None => "—".to_string(),
+        }
+    }
+    let link = match &f.link {
+        LinkKind::Wifi { ssid, rssi } => format!("WiFi {} ({} dBm)", ssid, or_dash(*rssi)),
+        LinkKind::Ethernet => "Ethernet".to_string(),
+        LinkKind::Desktop  => "Desktop".to_string(),
+    };
+    format!(
+        "**{} Status**\n\n\
+         | Field | Value |\n\
+         |---|---|\n\
+         | Hostname | `{}` |\n\
+         | IP | {} |\n\
+         | Link | {} |\n\
+         | Platform | `{}` |\n\
+         | Free internal heap | {} |\n\
+         | Free PSRAM | {} |\n\
+         | Uptime | {}s |\n\
+         | Model | `{}` |\n\
+         | Session | {} bytes, {} entries |\n",
+        f.agent_name,
+        f.hostname,
+        or_dash(f.ip.as_deref()),
+        link,
+        f.platform,
+        fmt_kb(f.free_internal_heap),
+        fmt_kb(f.free_psram),
+        f.uptime_secs,
+        f.model,
+        f.session_bytes,
+        f.session_entries,
+    )
 }
 
 /// Parse a user message into a recognized command.
@@ -271,6 +314,41 @@ mod tests {
             assert!(out.contains(desc),
                 "expected description {:?} in /help output", desc);
         }
+    }
+
+    #[tokio::test]
+    async fn execute_status_renders_full_facts() {
+        let facts = make_fake_runtime_facts();
+        let out = execute(Command::Status, &facts).await;
+        // Header
+        assert!(out.contains("TestAgent"), "agent_name missing: {}", out);
+        // Identity rows
+        assert!(out.contains("test-host"));
+        assert!(out.contains("10.0.0.1"));
+        // Platform fix — the bug we set out to fix.
+        assert!(out.contains("test"));
+        // Link
+        assert!(out.contains("test") && out.contains("-55"),
+            "WiFi SSID and RSSI missing: {}", out);
+        // Heap (formatted in KB or MB)
+        assert!(out.contains("120"), "heap missing: {}", out);
+        assert!(out.contains("7"), "psram missing: {}", out);
+        // Model
+        assert!(out.contains("test-model"));
+    }
+
+    #[tokio::test]
+    async fn execute_status_renders_em_dash_for_missing_fields() {
+        let mut facts = make_fake_runtime_facts();
+        facts.ip = None;
+        facts.free_internal_heap = None;
+        facts.free_psram = None;
+        facts.link = LinkKind::Ethernet;
+        let out = execute(Command::Status, &facts).await;
+        // Em-dash placeholder (—) appears for unknown fields rather than
+        // dropping the row entirely.
+        assert!(out.contains("—"), "expected em-dash for missing fields: {}", out);
+        assert!(out.contains("Ethernet"), "Ethernet link missing: {}", out);
     }
 
     fn make_fake_runtime_facts() -> RuntimeFacts {
