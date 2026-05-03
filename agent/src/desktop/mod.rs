@@ -10,6 +10,8 @@ mod server;
 #[cfg(feature = "desktop")]
 pub mod background;
 #[cfg(feature = "desktop")]
+pub mod host_facts;
+#[cfg(feature = "desktop")]
 pub mod subagents;
 
 #[cfg(feature = "desktop")]

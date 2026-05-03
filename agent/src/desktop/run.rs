@@ -49,19 +49,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_arc = Arc::new(config.clone());
     let runner: Box<dyn LlmRunner> = Box::new(Runner::new(config_arc));
-    // Temporary stub — real `DesktopHostFacts` lands in Task 12.
-    struct StubFacts;
-    impl crate::core::commands::HostFacts for StubFacts {
-        fn hostname(&self) -> String { "unknown".to_string() }
-        fn ip(&self) -> Option<String> { None }
-        fn link(&self) -> crate::core::commands::LinkKind {
-            crate::core::commands::LinkKind::Desktop
-        }
-        fn free_internal_heap(&self) -> Option<u32> { None }
-        fn free_psram(&self) -> Option<u32> { None }
-        fn uptime_secs(&self) -> u64 { 0 }
-    }
-    let host_facts: Arc<dyn crate::core::commands::HostFacts> = Arc::new(StubFacts);
+    let host_facts: Arc<dyn crate::core::commands::HostFacts> =
+        Arc::new(crate::desktop::host_facts::DesktopHostFacts::new());
     let gateway = Gateway::new(config.clone(), data_dir, runner, host_facts);
     info!("Tools registered: {}", gateway.tools.len());
 
@@ -142,6 +131,21 @@ fn spawn_telegram_loop(
 ) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(32);
+
+        // Register the BotFather menu — single source of truth in commands::menu().
+        // Failures are non-fatal: if Telegram rate-limits or the bot can't
+        // reach the API, the menu is degraded but the bot still works.
+        let menu_token = bot_token.clone();
+        let menu_http = http.clone();
+        tokio::spawn(async move {
+            let p = Poller::new(menu_token);
+            if let Err(e) = p
+                .set_my_commands(&*menu_http, crate::core::commands::menu())
+                .await
+            {
+                tracing::warn!(error = %e, "setMyCommands failed (non-fatal)");
+            }
+        });
 
         // Producer: poll_once in a loop, forward messages to the consumer.
         let producer_http = http.clone();
