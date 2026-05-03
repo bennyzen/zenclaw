@@ -133,6 +133,13 @@ function mergeStats(raw: Record<string, any>) {
       wifi: partial.wifi,
       storage: partial.storage,
       uptimeS: partial.uptimeS,
+      // Carry provider/model so a config switch (which reboots) reflects
+      // in the footer on the next successful poll instead of waiting for
+      // a full page reload. Fall back to the previous value when the poll
+      // doesn't include them (desktop /api/status does not, transient
+      // boot-window responses may not).
+      provider: partial.provider ?? state.lastStatus.provider,
+      model: partial.model ?? state.lastStatus.model,
     }
   }
 }
