@@ -66,6 +66,14 @@ impl Replicator {
         }
     }
 
+    /// Construct a Replicator with a tiny default config — for tests
+    /// that just need a non-null replicator handle (e.g. `clear()` cache
+    /// wipe) without exercising the queue.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new(ReplicatorConfig { queue_max: 8, retry_max: 1, backoff_cap_secs: 1 })
+    }
+
     /// Enqueue a write. Coalesces by key — if the same key is already
     /// pending and not yet started, replace its bytes (last-writer-wins).
     /// Blocks if queue is at queue_max until depth drops below half-cap.

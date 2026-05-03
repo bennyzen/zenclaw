@@ -111,11 +111,32 @@ pub fn menu() -> &'static [(&'static str, &'static str)] {
 /// `Gateway`. The signature in subsequent tasks will grow to include
 /// `&SessionManager` + cloud handles. We start with the simplest shape
 /// and extend.
-pub async fn execute(cmd: Command, facts: &RuntimeFacts) -> String {
+pub async fn execute(
+    cmd: Command,
+    chat_id: &str,
+    facts: &RuntimeFacts,
+    sessions: &crate::core::sessions::SessionManager,
+    cloud_store: Option<&dyn crate::core::cloud::client::ObjectStore>,
+) -> String {
     match cmd {
         Command::Help   => render_help(),
         Command::Status => render_status(facts),
-        _ => format!("(command {:?} not yet implemented)", cmd),
+        Command::New | Command::Clear => clear_session(chat_id, sessions, cloud_store),
+    }
+}
+
+fn clear_session(
+    chat_id: &str,
+    sessions: &crate::core::sessions::SessionManager,
+    store: Option<&dyn crate::core::cloud::client::ObjectStore>,
+) -> String {
+    let result = match store {
+        Some(s) => sessions.clear_with_store(chat_id, s),
+        None    => sessions.clear(chat_id),
+    };
+    match result {
+        Ok(()) => "Session cleared.".to_string(),
+        Err(e) => format!("Failed to clear session: {}", e),
     }
 }
 
@@ -307,7 +328,8 @@ mod tests {
     #[tokio::test]
     async fn execute_help_lists_all_commands_with_descriptions() {
         let facts = make_fake_runtime_facts();
-        let out = execute(Command::Help, &facts).await;
+        let (_tmp, sessions) = make_test_sessions();
+        let out = execute(Command::Help, "chat-test", &facts, &sessions, None).await;
         for (name, desc) in menu() {
             assert!(out.contains(&format!("/{}", name)),
                 "expected /{} in /help output, got: {}", name, out);
@@ -316,10 +338,19 @@ mod tests {
         }
     }
 
+    fn make_test_sessions() -> (tempfile::TempDir, crate::core::sessions::SessionManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sessions");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mgr = crate::core::sessions::SessionManager::new(sub.to_str().unwrap());
+        (dir, mgr)
+    }
+
     #[tokio::test]
     async fn execute_status_renders_full_facts() {
         let facts = make_fake_runtime_facts();
-        let out = execute(Command::Status, &facts).await;
+        let (_tmp, sessions) = make_test_sessions();
+        let out = execute(Command::Status, "chat-test", &facts, &sessions, None).await;
         // Header
         assert!(out.contains("TestAgent"), "agent_name missing: {}", out);
         // Identity rows
@@ -344,7 +375,8 @@ mod tests {
         facts.free_internal_heap = None;
         facts.free_psram = None;
         facts.link = LinkKind::Ethernet;
-        let out = execute(Command::Status, &facts).await;
+        let (_tmp, sessions) = make_test_sessions();
+        let out = execute(Command::Status, "chat-test", &facts, &sessions, None).await;
         // Em-dash placeholder (—) appears for unknown fields rather than
         // dropping the row entirely.
         assert!(out.contains("—"), "expected em-dash for missing fields: {}", out);
@@ -366,5 +398,53 @@ mod tests {
             session_entries: 0,
             model: "test-model".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_clear_deletes_session_file() {
+        let (_tmp, sessions) = make_test_sessions();
+        let path = format!("{}/abc.jsonl", sessions.sessions_dir());
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let facts = make_fake_runtime_facts();
+        let out = execute(Command::Clear, "abc", &facts, &sessions, None).await;
+
+        assert!(out.contains("cleared"), "out was: {}", out);
+        assert!(!std::path::Path::new(&path).exists(),
+            "session file should have been deleted");
+    }
+
+    #[tokio::test]
+    async fn execute_clear_preserves_model_override() {
+        let (_tmp, sessions_owned) = make_test_sessions();
+        // SessionManager::set_state is `&mut self`, so we need ownership.
+        let mut sessions = sessions_owned;
+        sessions.set_state("abc", crate::core::sessions::SessionState {
+            turn_count: 0,
+            model_override: Some("gpt-4".to_string()),
+            last_channel: None,
+        });
+        let path = format!("{}/abc.jsonl", sessions.sessions_dir());
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let facts = make_fake_runtime_facts();
+        let _out = execute(Command::Clear, "abc", &facts, &sessions, None).await;
+
+        let st = sessions.get_state("abc");
+        assert_eq!(st.model_override, Some("gpt-4".to_string()),
+            "model_override must survive /clear");
+    }
+
+    #[tokio::test]
+    async fn execute_new_is_alias_for_clear() {
+        let (_tmp, sessions) = make_test_sessions();
+        let path = format!("{}/abc.jsonl", sessions.sessions_dir());
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let facts = make_fake_runtime_facts();
+        let out = execute(Command::New, "abc", &facts, &sessions, None).await;
+
+        assert!(out.contains("cleared"));
+        assert!(!std::path::Path::new(&path).exists());
     }
 }

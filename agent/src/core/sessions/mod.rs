@@ -515,14 +515,57 @@ impl SessionManager {
         Ok(branch)
     }
 
-    /// Clear a session (delete the file).
+    /// Wipe the session for `chat_id`.
+    ///
+    /// Local mode: deletes `{sessions_dir}/{chat_id}.jsonl`.
+    /// Cloud mode: also drops every cache key matching `sessions/{chat_id}/`
+    /// and, when an `ObjectStore` is supplied via `clear_with_store`,
+    /// issues a best-effort S3 delete for the listed keys.
+    ///
+    /// Preserves `SessionState` (model_override, turn_count, last_channel) —
+    /// the user's fast-dial setting must survive a clear.
     pub fn clear(&self, chat_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Cloud-side cache wipe (in-memory tier-1).
+        if let Some(cache) = &self.cache {
+            let prefix = format!("sessions/{}/", safe_chat_id(chat_id));
+            for key in cache.keys_with_prefix(&prefix) {
+                cache.delete(&key);
+            }
+        }
+
+        // Local-file mode (or fallback if the cache has no entries).
         let path = self.session_path(chat_id);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// As `clear`, but also issues best-effort `delete` for matching keys
+    /// against `store`. Used by `/clear` so S3-side state is wiped too.
+    /// Errors from individual deletes are logged and swallowed —
+    /// `/clear` is destructive and idempotent; partial S3 failures are
+    /// recoverable by re-running.
+    pub fn clear_with_store(
+        &self,
+        chat_id: &str,
+        store: &dyn crate::core::cloud::client::ObjectStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prefix = format!("sessions/{}/", safe_chat_id(chat_id));
+        match store.list_keys(&prefix) {
+            Ok(keys) => {
+                for k in keys {
+                    if let Err(e) = store.delete(&k) {
+                        tracing::warn!(error = %e, key = %k, "/clear: S3 delete failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, prefix = %prefix, "/clear: S3 list_keys failed");
+            }
+        }
+        self.clear(chat_id)
     }
 
     /// List all session chat_ids (derived from .jsonl filenames).
@@ -1017,6 +1060,53 @@ mod tests {
         assert!(content.contains("hi"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_in_cloud_mode_drops_cache_keys_for_chat_id() {
+        use crate::core::cloud::{CloudCache, Replicator};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CloudCache::new();
+        cache.put(
+            "sessions/abc/base.jsonl",
+            b"{\"role\":\"user\"}\n".to_vec(),
+        );
+        cache.put(
+            "sessions/abc/log-00.jsonl",
+            b"{\"role\":\"assistant\"}\n".to_vec(),
+        );
+        cache.put(
+            "sessions/other/base.jsonl",
+            b"different chat".to_vec(),
+        );
+        // Replicator with a no-op store — we only verify cache wipe here.
+        let replicator = Arc::new(Replicator::new_for_test());
+
+        let mgr = SessionManager::new(dir.path().to_str().unwrap())
+            .with_cloud(cache.clone(), replicator, 0);
+
+        mgr.clear("abc").unwrap();
+
+        // Both `abc` keys gone, `other` untouched.
+        assert!(cache.get("sessions/abc/base.jsonl").is_none());
+        assert!(cache.get("sessions/abc/log-00.jsonl").is_none());
+        assert!(cache.get("sessions/other/base.jsonl").is_some());
+    }
+
+    #[test]
+    fn clear_local_mode_still_deletes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("abc.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let mgr = SessionManager::new(sessions_dir.to_str().unwrap());
+        mgr.clear("abc").unwrap();
+
+        assert!(!path.exists(), "session file should be deleted");
     }
 
     #[test]
