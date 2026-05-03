@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const { state, restartDevice } = useConnection()
+const { state, restartDevice, baseUrl } = useConnection()
 
 const restarting = ref(false)
 
@@ -30,7 +30,7 @@ import prettyBytes from 'pretty-bytes'
 const deviceFrameKey = ref(0)
 const deviceUrl = computed(() => {
   if (!state.deviceIp) return 'about:blank'
-  return `http://${state.deviceIp}`
+  return baseUrl()
 })
 let retryTimer: ReturnType<typeof setTimeout> | null = null
 

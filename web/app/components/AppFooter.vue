@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import prettyBytes from 'pretty-bytes'
 
-const { state, disconnectNetwork } = useConnection()
+const { state, disconnectNetwork, baseUrl } = useConnection()
 
 const modeColor = computed(() => {
   switch (state.mode) {
@@ -50,7 +50,7 @@ const tooltipUi = {
       <UTooltip :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <a
           v-if="state.deviceIp"
-          :href="'http://' + state.deviceIp"
+          :href="baseUrl()"
           target="_blank"
           class="cell text-muted hover:text-default transition-colors"
         >

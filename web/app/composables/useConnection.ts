@@ -11,8 +11,8 @@ const state = reactive<ConnectionState>({
   networkConnected: false,
   connecting: false,
   deviceIp: null,
-  devicePort: 8443,
-  useTls: true,
+  devicePort: 80,
+  useTls: false,
   lastStatus: null,
   error: null,
 })
@@ -22,6 +22,7 @@ let statsPollTimer: ReturnType<typeof setInterval> | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectDelay = 2000
 let _savedHostname: string | null = null
+let _savedPort: number = 80
 
 function updateMode() {
   const s = state.serialConnected
@@ -33,13 +34,34 @@ function updateMode() {
 }
 
 function baseUrl(): string {
-  if (state.useTls) return `https://${state.deviceIp}:${state.devicePort}`
-  return `http://${state.deviceIp}`
+  const proto = state.useTls ? 'https' : 'http'
+  return `${proto}://${state.deviceIp}:${state.devicePort}`
+}
+
+/// Resolve a user-typed connection string into a (host, port) pair.
+/// Bare names ("zenclaw-foo") are mDNS shortcuts → ".local" + port 80.
+/// Anything containing "." or ":" is taken literally — covers IPs,
+/// already-qualified hostnames, and host:port pairs (e.g. "localhost:8080").
+export function parseConnectInput(input: string): { host: string; port: number } {
+  const trimmed = input.trim()
+  if (trimmed.includes(':')) {
+    const idx = trimmed.lastIndexOf(':')
+    const host = trimmed.slice(0, idx)
+    const port = parseInt(trimmed.slice(idx + 1), 10)
+    if (host && Number.isFinite(port) && port > 0 && port <= 65535) {
+      return { host, port }
+    }
+    return { host: trimmed, port: 80 }
+  }
+  if (trimmed.includes('.')) {
+    return { host: trimmed, port: 80 }
+  }
+  return { host: `${trimmed}.local`, port: 80 }
 }
 
 function wsUrl(): string {
-  if (state.useTls) return `wss://${state.deviceIp}:${state.devicePort}`
-  return `ws://${state.deviceIp}`
+  const proto = state.useTls ? 'wss' : 'ws'
+  return `${proto}://${state.deviceIp}:${state.devicePort}`
 }
 
 async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -114,7 +136,7 @@ function scheduleReconnect() {
     reconnectTimer = null
     if (state.networkConnected || !_savedHostname) return
     try {
-      await useConnection().connectNetwork(_savedHostname)
+      await useConnection().connectNetwork(_savedHostname, _savedPort)
       reconnectDelay = 2000
     } catch {
       reconnectDelay = Math.min(reconnectDelay * 2, 30000)
@@ -216,17 +238,21 @@ function stopStatsStream() {
 }
 
 export function useConnection() {
-  async function connectNetwork(ip: string, port: number = 8443) {
+  async function connectNetwork(ip: string, port: number = 80) {
     state.error = null
     state.deviceIp = ip
     state.devicePort = port
     state.connecting = true
     _savedHostname = ip
+    _savedPort = port
     cancelReconnect()
 
-    // Race HTTP and HTTPS in parallel with 30s timeout each
+    // Race HTTP and HTTPS in parallel against the same port — whichever
+    // protocol the server speaks wins. The other attempt fails fast on
+    // handshake and is dropped by Promise.any.
     const attempts = [false, true].map(async (tls): Promise<{ tls: boolean; data: Record<string, any> }> => {
-      const base = tls ? `https://${ip}:${port}` : `http://${ip}`
+      const proto = tls ? 'https' : 'http'
+      const base = `${proto}://${ip}:${port}`
       const res = await fetch(`${base}/api/status`, {
         signal: AbortSignal.timeout(30000),
       })
@@ -492,6 +518,7 @@ export function useConnection() {
     openChatStream,
     getChatHistory,
     restartDevice,
+    baseUrl,
     wsUrl,
   }
 }

@@ -5,6 +5,11 @@ const { state, connectNetwork, disconnectNetwork } = useConnection()
 const STORAGE_KEY = 'zenclaw_provision'
 const hostname = ref('')
 
+const isQualified = computed(() => {
+  const v = hostname.value.trim()
+  return v.includes('.') || v.includes(':')
+})
+
 onMounted(() => {
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
@@ -21,19 +26,24 @@ onMounted(() => {
 async function connect() {
   if (!hostname.value) return
   try {
-    await connectNetwork(hostname.value + '.local')
-    // Persist hostname for next session
+    const { host, port } = parseConnectInput(hostname.value)
+    await connectNetwork(host, port)
+    // Persist the literal input string so reconnect shows what the user typed.
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')
     saved.deviceName = hostname.value
     localStorage.setItem(STORAGE_KEY, JSON.stringify(saved))
   } catch { /* error shown via state.error */ }
 }
 
-// Sync hostname field when reconnect succeeds (e.g. auto-reconnect restored connection)
+// Only fill the field if it's empty when a connection appears (e.g. the
+// banner mounts after another component triggered the connect). Don't
+// clobber a user-typed value — that would lose the `:port` they entered.
 watch(() => state.networkConnected, (connected) => {
-  if (connected && state.deviceIp) {
-    const name = state.deviceIp.replace('.local', '')
-    if (name && name !== hostname.value) hostname.value = name
+  if (connected && state.deviceIp && !hostname.value) {
+    const name = state.deviceIp.endsWith('.local')
+      ? state.deviceIp.slice(0, -'.local'.length)
+      : state.deviceIp
+    hostname.value = state.devicePort === 80 ? name : `${state.deviceIp}:${state.devicePort}`
   }
 })
 </script>
@@ -44,13 +54,13 @@ watch(() => state.networkConnected, (connected) => {
       <UIcon name="i-lucide-unplug" class="text-dimmed shrink-0" />
       <UInput
         v-model="hostname"
-        placeholder="zenclaw-wild-crow"
+        placeholder="zenclaw-wild-crow or localhost:8080"
         size="sm"
         class="max-w-xs"
         :disabled="state.connecting"
         @keydown.enter="connect"
       >
-        <template #trailing>
+        <template v-if="!isQualified" #trailing>
           <span class="text-xs text-dimmed">.local</span>
         </template>
       </UInput>

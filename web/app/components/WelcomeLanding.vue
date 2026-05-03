@@ -18,10 +18,8 @@ onMounted(() => {
 async function connect() {
   if (!hostname.value || state.connecting) return
   try {
-    // If it looks like a raw address (IP, localhost:port), use as-is; otherwise append .local
-    const raw = hostname.value
-    const addr = raw.includes('.') || raw.includes(':') ? raw : raw + '.local'
-    await connectNetwork(addr)
+    const { host, port } = parseConnectInput(hostname.value)
+    await connectNetwork(host, port)
     router.push('/dashboard')
   } catch { /* error shown via state.error */ }
 }
