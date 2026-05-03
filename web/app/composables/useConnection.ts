@@ -123,7 +123,25 @@ function scheduleReconnect() {
   }, reconnectDelay)
 }
 
-function mergeStats(raw: Record<string, any>) {
+// /ws/stats pushes volatile metrics every 5s with no provider/model.
+// /api/status polls return the full snapshot every 15s, including
+// provider/model. Same merge function would null provider/model on every
+// WS frame and refill them on every poll, causing the footer to flicker.
+function mergeMetrics(raw: Record<string, any>) {
+  const partial = mapStatus(raw)
+  if (state.lastStatus) {
+    state.lastStatus = {
+      ...state.lastStatus,
+      memory: partial.memory,
+      temperatureC: partial.temperatureC,
+      wifi: partial.wifi,
+      storage: partial.storage,
+      uptimeS: partial.uptimeS,
+    }
+  }
+}
+
+function mergeStatus(raw: Record<string, any>) {
   const partial = mapStatus(raw)
   if (state.lastStatus) {
     state.lastStatus = {
@@ -149,7 +167,7 @@ function startStatsPoll() {
     try {
       const res = await fetch(`${baseUrl()}/api/status`, { signal: AbortSignal.timeout(10000) })
       if (res.ok) {
-        mergeStats(await res.json())
+        mergeStatus(await res.json())
         _pollFailCount = 0
       } else {
         _pollFailCount++
@@ -183,7 +201,7 @@ function startStatsStream() {
   statsWs = new WebSocket(url)
   statsWs.onmessage = (event) => {
     try {
-      mergeStats(JSON.parse(event.data))
+      mergeMetrics(JSON.parse(event.data))
     } catch { /* ignore parse errors */ }
   }
   statsWs.onclose = () => {
