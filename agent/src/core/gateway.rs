@@ -160,6 +160,38 @@ impl Gateway {
             flag
         };
 
+        // Slash-command interception. Recognized commands skip the LLM
+        // entirely (and the auto-compaction step below). Unknown `/foo`
+        // falls through to the normal LLM path.
+        if let Some(cmd) = crate::core::commands::parse(message) {
+            let facts = self.runtime_facts(chat_id);
+            let cloud_store_ref = self.cloud_store.as_ref().map(|s| s.as_ref() as &dyn ObjectStore);
+            let reply = crate::core::commands::execute(
+                cmd,
+                chat_id,
+                &facts,
+                self.sessions.as_ref(),
+                cloud_store_ref,
+            )
+            .await;
+
+            if let Some(sender) = events {
+                let _ = sender.send(ChatEvent::AssistantText {
+                    text: reply.clone(),
+                    is_final: true,
+                });
+                let _ = sender.send(ChatEvent::Done);
+            }
+
+            // Drop the cancellation flag we just registered — no async work
+            // is pending on this chat. Without this, a subsequent message
+            // on the same chat would think a turn is still in flight.
+            self.active_chats.lock().unwrap().remove(chat_id);
+            let _ = cancel; // suppress unused
+
+            return Ok(reply);
+        }
+
         info!("GW chat: id={} ch={}", chat_id, channel);
 
         // Auto-compaction: before reading session history into the message
@@ -445,5 +477,84 @@ mod tests {
             ContentPart::ImageUrl { image_url: ImageUrl { url: "x".to_string() } },
         ]);
         assert_eq!(message_content_as_text(&c), "");
+    }
+
+    // --- Slash-command interception tests ---------------------------------
+
+    struct StubFacts;
+    impl crate::core::commands::HostFacts for StubFacts {
+        fn hostname(&self) -> String { "test-host".into() }
+        fn ip(&self) -> Option<String> { Some("127.0.0.1".into()) }
+        fn link(&self) -> crate::core::commands::LinkKind {
+            crate::core::commands::LinkKind::Desktop
+        }
+        fn free_internal_heap(&self) -> Option<u32> { None }
+        fn free_psram(&self) -> Option<u32> { None }
+        fn uptime_secs(&self) -> u64 { 0 }
+    }
+
+    /// Runner that increments a counter when called. Tests assert the
+    /// counter to prove whether the LLM path was hit (slash commands
+    /// must skip it; unknown `/foo` must fall through to it).
+    struct CountingRunner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl LlmRunner for CountingRunner {
+        async fn call(
+            &self,
+            _messages: &[crate::core::types::Message],
+            _tools: &[crate::core::types::ToolDefinition],
+            _model_override: Option<&str>,
+        ) -> Result<crate::core::types::LlmResponse, crate::core::runner::RunnerError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Return a deterministic error so chat() resolves to Err and
+            // tests can finish without ever reaching real provider HTTP.
+            Err(crate::core::runner::RunnerError::Api(
+                "test-runner-was-called".to_string(),
+            ))
+        }
+    }
+
+    fn build_test_gateway(
+        tmp: &tempfile::TempDir,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Gateway {
+        let cfg = Config::default();
+        let data_dir = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(format!("{}/sessions", data_dir)).unwrap();
+        let host_facts: Arc<dyn crate::core::commands::HostFacts> = Arc::new(StubFacts);
+        Gateway::new(cfg, data_dir, Box::new(CountingRunner(counter)), host_facts)
+    }
+
+    #[tokio::test]
+    async fn slash_help_returns_deterministic_string_without_llm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gw = build_test_gateway(&tmp, counter.clone());
+        let out = gw.chat("test-chat", "/help", "test").await.unwrap();
+        // /help must list the canonical commands.
+        assert!(out.contains("/help"), "expected /help in reply, got: {}", out);
+        assert!(out.contains("/status"), "expected /status in reply, got: {}", out);
+        // The LLM runner must NOT have been called.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "slash command must skip the LLM runner",
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_falls_through_to_llm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gw = build_test_gateway(&tmp, counter.clone());
+        let res = gw.chat("test-chat", "/foo bar", "test").await;
+        // Runner returns Err — chat() bubbles that up.
+        assert!(res.is_err(), "expected Err from runner, got: {:?}", res);
+        // The LLM runner MUST have been reached (proves no false slash match).
+        assert!(
+            counter.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "unknown slash must fall through to the LLM runner",
+        );
     }
 }
