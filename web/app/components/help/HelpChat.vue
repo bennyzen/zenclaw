@@ -36,11 +36,13 @@
       </div>
     </div>
 
-    <UCallout icon="i-lucide-terminal" title="Slash Commands">
-      <div class="space-y-1">
-        <p><code>/new</code> — start a fresh conversation (clears current session)</p>
-        <p><code>/reset</code> — full reset including session file</p>
-      </div>
-    </UCallout>
+    <UAlert icon="i-lucide-terminal" title="Slash Commands">
+      <template #description>
+        <div class="space-y-1">
+          <p><code>/new</code> — start a fresh conversation (clears current session)</p>
+          <p><code>/reset</code> — full reset including session file</p>
+        </div>
+      </template>
+    </UAlert>
   </div>
 </template>

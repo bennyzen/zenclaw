@@ -36,30 +36,36 @@
       </div>
     </div>
 
-    <UCallout icon="i-lucide-cpu" title="Hardware">
-      ZenClaw runs on ESP32-S3 (WiFi, native USB, $3–8 — look for USB-OTG
-      support) or ESP32-P4 (wired Ethernet, more horsepower — e.g.&nbsp;the
-      Guition JC-ESP32P4-M3-DEV). Pick your board in the wizard; it verifies
-      the connected chip matches before flashing.
-    </UCallout>
+    <UAlert icon="i-lucide-cpu" title="Hardware">
+      <template #description>
+        ZenClaw runs on ESP32-S3 (WiFi, native USB, $3–8 — look for USB-OTG
+        support) or ESP32-P4 (wired Ethernet, more horsepower — e.g.&nbsp;the
+        Guition JC-ESP32P4-M3-DEV). Pick your board in the wizard; it verifies
+        the connected chip matches before flashing.
+      </template>
+    </UAlert>
 
-    <UCallout icon="i-lucide-alert-triangle" color="warning" title="Troubleshooting">
-      <div class="space-y-2">
-        <p><strong>Blank device / won't flash:</strong> Hold BOOT, press RESET,
-        then release BOOT. The device enters bootloader mode and the serial port
-        changes to PID <code>0x0002</code>.</p>
-        <p><strong>Linux — permission denied:</strong> Add your user to the
-        <code>dialout</code> group:
-        <code>sudo usermod -aG dialout $USER</code>, then log out and back in.</p>
-        <p><strong>Device not found after flash:</strong> Press RESET. The device
-        needs a manual reset after flashing to boot into application mode.</p>
-      </div>
-    </UCallout>
+    <UAlert icon="i-lucide-alert-triangle" color="warning" title="Troubleshooting">
+      <template #description>
+        <div class="space-y-2">
+          <p><strong>Blank device / won't flash:</strong> Hold BOOT, press RESET,
+          then release BOOT. The device enters bootloader mode and the serial port
+          changes to PID <code>0x0002</code>.</p>
+          <p><strong>Linux — permission denied:</strong> Add your user to the
+          <code>dialout</code> group:
+          <code>sudo usermod -aG dialout $USER</code>, then log out and back in.</p>
+          <p><strong>Device not found after flash:</strong> Press RESET. The device
+          needs a manual reset after flashing to boot into application mode.</p>
+        </div>
+      </template>
+    </UAlert>
 
-    <UCallout icon="i-lucide-globe" title="Browser requirement">
-      Web Serial is only available in Chromium-based browsers. Use
-      <strong>Chrome</strong> or <strong>Edge</strong>. Firefox and Safari
-      do not support Web Serial.
-    </UCallout>
+    <UAlert icon="i-lucide-globe" title="Browser requirement">
+      <template #description>
+        Web Serial is only available in Chromium-based browsers. Use
+        <strong>Chrome</strong> or <strong>Edge</strong>. Firefox and Safari
+        do not support Web Serial.
+      </template>
+    </UAlert>
   </div>
 </template>

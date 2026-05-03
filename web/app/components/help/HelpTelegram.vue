@@ -47,22 +47,26 @@
       </div>
     </div>
 
-    <UCallout icon="i-lucide-users" title="Group Chats">
-      <p>To use in a group:</p>
-      <ol class="list-decimal list-inside mt-1 space-y-1">
-        <li>Add the bot to the group</li>
-        <li>Get the group chat ID (it will be a negative number)</li>
-        <li>Add it to <code>allowed_chat_ids</code> in config</li>
-      </ol>
-      <p class="mt-2">
-        DMs use direct message delivery. Group chats use edit-based streaming
-        for real-time responses.
-      </p>
-    </UCallout>
+    <UAlert icon="i-lucide-users" title="Group Chats">
+      <template #description>
+        <p>To use in a group:</p>
+        <ol class="list-decimal list-inside mt-1 space-y-1">
+          <li>Add the bot to the group</li>
+          <li>Get the group chat ID (it will be a negative number)</li>
+          <li>Add it to <code>allowed_chat_ids</code> in config</li>
+        </ol>
+        <p class="mt-2">
+          DMs use direct message delivery. Group chats use edit-based streaming
+          for real-time responses.
+        </p>
+      </template>
+    </UAlert>
 
-    <UCallout icon="i-lucide-shield" title="Privacy">
-      Use <code>allowed_chat_ids</code> to restrict which chats can interact
-      with the bot. Without it, anyone who finds your bot can send messages.
-    </UCallout>
+    <UAlert icon="i-lucide-shield" title="Privacy">
+      <template #description>
+        Use <code>allowed_chat_ids</code> to restrict which chats can interact
+        with the bot. Without it, anyone who finds your bot can send messages.
+      </template>
+    </UAlert>
   </div>
 </template>

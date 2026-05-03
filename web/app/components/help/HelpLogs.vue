@@ -26,10 +26,12 @@
       </div>
     </div>
 
-    <UCallout icon="i-lucide-wifi" title="Connection">
-      The log stream auto-reconnects if the WebSocket connection drops. If you
-      need to scroll through history, pause the live stream first — new
-      messages won't auto-scroll while paused.
-    </UCallout>
+    <UAlert icon="i-lucide-wifi" title="Connection">
+      <template #description>
+        The log stream auto-reconnects if the WebSocket connection drops. If you
+        need to scroll through history, pause the live stream first — new
+        messages won't auto-scroll while paused.
+      </template>
+    </UAlert>
   </div>
 </template>

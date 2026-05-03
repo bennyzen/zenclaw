@@ -69,10 +69,12 @@
       </div>
     </div>
 
-    <UCallout icon="i-lucide-cloud" title="Cloud Storage">
-      Cloud browsing requires cloud storage to be configured. See
-      <NuxtLink to="/config" class="text-primary underline">Config</NuxtLink>
-      for setup. Cloudflare R2 offers 10 GB free storage.
-    </UCallout>
+    <UAlert icon="i-lucide-cloud" title="Cloud Storage">
+      <template #description>
+        Cloud browsing requires cloud storage to be configured. See
+        <NuxtLink to="/config" class="text-primary underline">Config</NuxtLink>
+        for setup. Cloudflare R2 offers 10 GB free storage.
+      </template>
+    </UAlert>
   </div>
 </template>

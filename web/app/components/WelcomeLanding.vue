@@ -174,9 +174,11 @@ const connectedName = computed(() => {
       </div>
     </div>
 
-    <UCallout icon="i-lucide-info" title="Browser requirement">
-      Provisioning uses Web Serial, which requires Chrome or Edge on desktop.
-      The dashboard and config editor work in any modern browser.
-    </UCallout>
+    <UAlert icon="i-lucide-info" title="Browser requirement">
+      <template #description>
+        Provisioning uses Web Serial, which requires Chrome or Edge on desktop.
+        The dashboard and config editor work in any modern browser.
+      </template>
+    </UAlert>
   </div>
 </template>

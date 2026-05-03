@@ -47,9 +47,11 @@
 
     <HelpTelegram />
 
-    <UCallout icon="i-lucide-key" title="API keys">
-      API keys are stored in <code>config.json</code> on the device. They are
-      never sent to the web UI — the config editor shows a masked version.
-    </UCallout>
+    <UAlert icon="i-lucide-key" title="API keys">
+      <template #description>
+        API keys are stored in <code>config.json</code> on the device. They are
+        never sent to the web UI — the config editor shows a masked version.
+      </template>
+    </UAlert>
   </div>
 </template>
