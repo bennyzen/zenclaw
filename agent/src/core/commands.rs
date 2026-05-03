@@ -36,6 +36,36 @@ pub fn menu() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// Parse a user message into a recognized command.
+///
+/// Matches only when the message *starts* with `/<name>`. Trailing
+/// arguments are ignored (no v1 command takes args). The Telegram
+/// group-chat suffix `@<botname>` after the command name is stripped
+/// before lookup.
+pub fn parse(text: &str) -> Option<Command> {
+    let rest = text.strip_prefix('/')?;
+
+    // First whitespace OR newline ends the command token.
+    let token_end = rest
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(rest.len());
+    let token = &rest[..token_end];
+    if token.is_empty() {
+        return None;
+    }
+
+    // Strip Telegram group-chat suffix: "/status@zenclaw_bot".
+    let name = token.split('@').next().unwrap_or(token);
+
+    match name {
+        "new"    => Some(Command::New),
+        "clear"  => Some(Command::Clear),
+        "status" => Some(Command::Status),
+        "help"   => Some(Command::Help),
+        _        => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +78,53 @@ mod tests {
         assert_eq!(names, vec!["new", "clear", "status", "help"]);
         for (_, desc) in m {
             assert!(!desc.is_empty(), "every command needs a description");
+        }
+    }
+
+    #[test]
+    fn parse_recognizes_all_four_commands() {
+        assert_eq!(parse("/new"), Some(Command::New));
+        assert_eq!(parse("/clear"), Some(Command::Clear));
+        assert_eq!(parse("/status"), Some(Command::Status));
+        assert_eq!(parse("/help"), Some(Command::Help));
+    }
+
+    #[test]
+    fn parse_strips_telegram_botname_suffix() {
+        assert_eq!(parse("/status@zenclaw_bot"), Some(Command::Status));
+        assert_eq!(parse("/clear@anything"), Some(Command::Clear));
+    }
+
+    #[test]
+    fn parse_returns_none_for_unknown_commands() {
+        assert_eq!(parse("/foo"), None);
+        assert_eq!(parse("/"), None);
+        assert_eq!(parse("hello"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn parse_ignores_trailing_args() {
+        assert_eq!(parse("/clear extra trailing words"), Some(Command::Clear));
+        assert_eq!(parse("/status\nmore stuff"), Some(Command::Status));
+    }
+
+    #[test]
+    fn parse_only_matches_at_start() {
+        assert_eq!(parse("not a command /clear"), None);
+        assert_eq!(parse(" /clear"), None); // leading space — not at start
+    }
+
+    /// Drift guard: every command in `menu()` must round-trip through `parse()`.
+    #[test]
+    fn menu_entries_all_parse() {
+        for (name, _) in menu() {
+            let with_slash = format!("/{}", name);
+            assert!(
+                parse(&with_slash).is_some(),
+                "menu lists `/{}` but parse() does not recognize it",
+                name,
+            );
         }
     }
 }
