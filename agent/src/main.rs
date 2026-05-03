@@ -243,13 +243,22 @@ fn main() {
         });
 
     // --- Start agent thread (handles both Telegram + HTTP chat) ---
-    // Single 32KB thread — no extra thread needed, saves heap.
+    // 24KB. Was 32KB until cloud bootstrap added the drainer (8KB) +
+    // snapshot timer (4KB) threads, which fragment internal SRAM
+    // enough that a contiguous 32KB block isn't always available by
+    // the time we get here (observed: cold boots after `/api/config`
+    // strict_put + reboot, when boot_restore loads one extra cache
+    // entry, push the heap over the edge → "Failed to spawn agent
+    // thread: OutOfMemory"). 24KB matches the typical peak used by
+    // agent_loop (LLM HTTPS handshake ~8KB + tool dispatch ~6KB +
+    // serde_json + futures wrapper). Telegram poller threads spawned
+    // inside agent_thread use 8KB stacks of their own.
     {
         let gw = gateway.clone();
         let http_for_thread = http.clone();
         std::thread::Builder::new()
             .name("agent".into())
-            .stack_size(32768)
+            .stack_size(24 * 1024)
             .spawn(move || agent_thread(chat_rx, gw, http_for_thread, tg_resources))
             .expect("Failed to spawn agent thread");
         log::info!("Agent thread started");
@@ -461,13 +470,17 @@ fn bootstrap_cloud(
         storage.replicator.retry_max
     );
 
-    // Step 3: snapshot timer thread.
+    // Step 3: snapshot timer thread. 4 KiB stack — the loop body is
+    // pure file IO via snapshots::write_to (length-prefixed binary
+    // serializer + atomic rename), no TLS, no LLM. 8 KiB was over-
+    // provisioned and contributed to the agent-thread OOM during cold
+    // boots after a /api/config strict_put + reboot.
     let cache_for_snap = cache.clone();
     let snap_path = format!("{}/.snapshot.bin", data_dir);
     let snap_interval = Duration::from_secs(storage.snapshot.interval_secs as u64);
     std::thread::Builder::new()
         .name("cloud-snap".into())
-        .stack_size(8 * 1024)
+        .stack_size(4 * 1024)
         .spawn(move || loop {
             std::thread::sleep(snap_interval);
             if let Err(e) = snapshots::write_to(&cache_for_snap, &snap_path) {
