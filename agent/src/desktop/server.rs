@@ -1,3 +1,4 @@
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,6 +32,11 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub start_time: Instant,
     pub config_path: String,
+    /// Canonical root for /api/files. Every file handler resolves user paths
+    /// through `safe_join(&data_root, ...)` — without this, `std::fs` hands
+    /// the caller the entire host filesystem (ESP32 gets containment for
+    /// free via SPIFFS; desktop does not).
+    pub data_root: Arc<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +384,44 @@ async fn api_wifi_put() -> Response {
 // Files
 // ---------------------------------------------------------------------------
 
+/// Resolve a user-supplied path against `root`, refusing anything that would
+/// escape it. Two layers:
+///   1. Lexical — strip leading slashes, walk components, reject `..` and
+///      absolute prefixes. Catches direct traversal regardless of fs state.
+///   2. Symlink — if the resolved path exists, canonicalize and verify the
+///      result still starts with the canonical root. Catches symlink escapes
+///      that lexical analysis can't see.
+/// Empty / `.` resolve to `root` itself.
+fn safe_join(root: &Path, user_input: &str) -> Result<PathBuf, String> {
+    let stripped = user_input.trim_start_matches(|c| c == '/' || c == '\\');
+    let mut joined = root.to_path_buf();
+    for component in Path::new(stripped).components() {
+        match component {
+            Component::Normal(s) => joined.push(s),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("path escapes data root".into());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("absolute paths not allowed".into());
+            }
+        }
+    }
+    if let Ok(canon) = joined.canonicalize() {
+        let canon_root = root
+            .canonicalize()
+            .map_err(|e| format!("data root unavailable: {}", e))?;
+        if !canon.starts_with(&canon_root) {
+            return Err("path escapes data root via symlink".into());
+        }
+    }
+    Ok(joined)
+}
+
+fn bad_path(msg: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
+}
+
 #[derive(Deserialize)]
 struct FilesListQuery {
     #[serde(default = "default_dot")]
@@ -405,20 +449,28 @@ struct MkdirBody {
     path: String,
 }
 
-async fn api_files_list(Query(q): Query<FilesListQuery>) -> Response {
-    match std::fs::read_dir(&q.path) {
+async fn api_files_list(
+    State(state): State<AppState>,
+    Query(q): Query<FilesListQuery>,
+) -> Response {
+    let resolved = match safe_join(&state.data_root, &q.path) {
+        Ok(p) => p,
+        Err(e) => return bad_path(e),
+    };
+    match std::fs::read_dir(&resolved) {
         Ok(rd) => {
             let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
             entries.sort_by_key(|e| e.file_name());
 
+            let prefix = q.path.trim_matches(|c| c == '/' || c == '.');
             let result: Vec<serde_json::Value> = entries
                 .iter()
                 .map(|e| {
                     let name = e.file_name().to_string_lossy().to_string();
-                    let full = if q.path == "." {
+                    let full = if prefix.is_empty() {
                         name.clone()
                     } else {
-                        format!("{}/{}", q.path, name)
+                        format!("{}/{}", prefix, name)
                     };
                     let meta = e.metadata();
                     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
@@ -441,7 +493,10 @@ async fn api_files_list(Query(q): Query<FilesListQuery>) -> Response {
     }
 }
 
-async fn api_files_read(Query(q): Query<FilePathQuery>) -> Response {
+async fn api_files_read(
+    State(state): State<AppState>,
+    Query(q): Query<FilePathQuery>,
+) -> Response {
     if q.path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -449,7 +504,11 @@ async fn api_files_read(Query(q): Query<FilePathQuery>) -> Response {
         )
             .into_response();
     }
-    match std::fs::read_to_string(&q.path) {
+    let resolved = match safe_join(&state.data_root, &q.path) {
+        Ok(p) => p,
+        Err(e) => return bad_path(e),
+    };
+    match std::fs::read_to_string(&resolved) {
         Ok(content) => Json(json!({"path": q.path, "content": content})).into_response(),
         Err(e) => (
             StatusCode::NOT_FOUND,
@@ -459,12 +518,19 @@ async fn api_files_read(Query(q): Query<FilePathQuery>) -> Response {
     }
 }
 
-async fn api_files_write(Json(req): Json<WriteFileBody>) -> Response {
-    if let Some(parent) = std::path::Path::new(&req.path).parent() {
+async fn api_files_write(
+    State(state): State<AppState>,
+    Json(req): Json<WriteFileBody>,
+) -> Response {
+    let resolved = match safe_join(&state.data_root, &req.path) {
+        Ok(p) => p,
+        Err(e) => return bad_path(e),
+    };
+    if let Some(parent) = resolved.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let size = req.content.len();
-    match std::fs::write(&req.path, &req.content) {
+    match std::fs::write(&resolved, &req.content) {
         Ok(()) => {
             tracing::info!(path = %req.path, size, "File written");
             Json(json!({"path": req.path, "size": size})).into_response()
@@ -477,7 +543,10 @@ async fn api_files_write(Json(req): Json<WriteFileBody>) -> Response {
     }
 }
 
-async fn api_files_delete(Query(q): Query<FilePathQuery>) -> Response {
+async fn api_files_delete(
+    State(state): State<AppState>,
+    Query(q): Query<FilePathQuery>,
+) -> Response {
     if q.path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -485,11 +554,17 @@ async fn api_files_delete(Query(q): Query<FilePathQuery>) -> Response {
         )
             .into_response();
     }
-    let p = std::path::Path::new(&q.path);
-    let result = if p.is_dir() {
-        std::fs::remove_dir(&q.path)
+    let resolved = match safe_join(&state.data_root, &q.path) {
+        Ok(p) => p,
+        Err(e) => return bad_path(e),
+    };
+    if resolved == *state.data_root {
+        return bad_path("refusing to delete data root".into());
+    }
+    let result = if resolved.is_dir() {
+        std::fs::remove_dir(&resolved)
     } else {
-        std::fs::remove_file(&q.path)
+        std::fs::remove_file(&resolved)
     };
     match result {
         Ok(()) => {
@@ -504,8 +579,12 @@ async fn api_files_delete(Query(q): Query<FilePathQuery>) -> Response {
     }
 }
 
-async fn api_files_mkdir(Json(req): Json<MkdirBody>) -> Response {
-    match std::fs::create_dir_all(&req.path) {
+async fn api_files_mkdir(State(state): State<AppState>, Json(req): Json<MkdirBody>) -> Response {
+    let resolved = match safe_join(&state.data_root, &req.path) {
+        Ok(p) => p,
+        Err(e) => return bad_path(e),
+    };
+    match std::fs::create_dir_all(&resolved) {
         Ok(()) => {
             tracing::info!(path = %req.path, "Directory created");
             Json(json!({"path": req.path})).into_response()
@@ -520,7 +599,11 @@ async fn api_files_mkdir(Json(req): Json<MkdirBody>) -> Response {
 
 const MAX_LOCAL_UPLOAD: usize = 256 * 1024;
 
-async fn api_files_upload(Query(q): Query<FilePathQuery>, body: Bytes) -> Response {
+async fn api_files_upload(
+    State(state): State<AppState>,
+    Query(q): Query<FilePathQuery>,
+    body: Bytes,
+) -> Response {
     if q.path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -539,10 +622,14 @@ async fn api_files_upload(Query(q): Query<FilePathQuery>, body: Bytes) -> Respon
         )
             .into_response();
     }
-    if let Some(parent) = std::path::Path::new(&q.path).parent() {
+    let resolved = match safe_join(&state.data_root, &q.path) {
+        Ok(p) => p,
+        Err(e) => return bad_path(e),
+    };
+    if let Some(parent) = resolved.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&q.path, &body) {
+    match std::fs::write(&resolved, &body) {
         Ok(()) => {
             tracing::info!(path = %q.path, size, "File uploaded");
             Json(json!({"path": q.path, "size": size})).into_response()
@@ -691,5 +778,74 @@ async fn handle_logs_ws(mut socket: WebSocket) {
         {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod safe_join_tests {
+    use super::safe_join;
+    use std::path::PathBuf;
+
+    fn root() -> PathBuf {
+        PathBuf::from("/srv/data")
+    }
+
+    #[test]
+    fn empty_resolves_to_root() {
+        assert_eq!(safe_join(&root(), "").unwrap(), root());
+    }
+
+    #[test]
+    fn dot_resolves_to_root() {
+        assert_eq!(safe_join(&root(), ".").unwrap(), root());
+    }
+
+    #[test]
+    fn relative_under_root_ok() {
+        assert_eq!(
+            safe_join(&root(), "sessions/web.jsonl").unwrap(),
+            PathBuf::from("/srv/data/sessions/web.jsonl"),
+        );
+    }
+
+    #[test]
+    fn double_dot_rejected() {
+        assert!(safe_join(&root(), "..").is_err());
+        assert!(safe_join(&root(), "../etc/passwd").is_err());
+        assert!(safe_join(&root(), "sessions/../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn absolute_path_defanged_to_relative() {
+        // Leading slash is stripped, so the request lands inside the root.
+        // It will 404 if etc/passwd doesn't exist under the root, which is
+        // the correct outcome — never the host's /etc/passwd.
+        assert_eq!(
+            safe_join(&root(), "/etc/passwd").unwrap(),
+            PathBuf::from("/srv/data/etc/passwd"),
+        );
+    }
+
+    #[test]
+    fn dot_segments_collapse() {
+        assert_eq!(
+            safe_join(&root(), "./sessions/./web.jsonl").unwrap(),
+            PathBuf::from("/srv/data/sessions/web.jsonl"),
+        );
+    }
+
+    #[test]
+    fn symlink_escape_rejected() {
+        // Real-fs test: build a temp dir, drop a symlink that points outside,
+        // and verify safe_join refuses to resolve through it.
+        let tmp = std::env::temp_dir().join(format!("zenclaw-safejoin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let outside = std::env::temp_dir();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, tmp.join("escape")).unwrap();
+        let res = safe_join(&tmp, "escape");
+        assert!(res.is_err(), "expected symlink escape to be rejected, got {:?}", res);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

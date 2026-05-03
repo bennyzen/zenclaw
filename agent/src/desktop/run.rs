@@ -86,10 +86,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
     {
+        // Canonicalize the data dir at startup so /api/files can do a
+        // symlink-aware containment check on every request without paying
+        // the canonicalize cost twice.
+        let data_root = std::path::Path::new(data_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(data_dir));
         let app_state = AppState {
             gateway: gateway.clone(),
             start_time,
             config_path: config_path.clone(),
+            data_root: Arc::new(data_root),
         };
         tokio::spawn(async move {
             start_api_server(app_state, api_port).await;
