@@ -76,6 +76,12 @@ pub async fn start_api_server(state: AppState, port: u16) {
 
 async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let uptime = state.start_time.elapsed().as_secs();
+    let providers = &state.gateway.config.providers;
+    let model = providers
+        .entries
+        .get(&providers.default)
+        .and_then(|e| e.model.as_deref())
+        .unwrap_or("");
     Json(json!({
         "agent_name": state.gateway.config.agent_name,
         "version": env!("CARGO_PKG_VERSION"),
@@ -84,6 +90,8 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "temperature_c": null,
         "wifi": null,
         "storage": { "total_kb": null, "free_kb": null },
+        "provider": providers.default,
+        "model": model,
         "uptime_s": uptime
     }))
 }
