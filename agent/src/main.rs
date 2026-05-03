@@ -1462,10 +1462,10 @@ a{{color:#60a5fa;text-decoration:none}}
 
     // --- WS /ws/stats (live stats stream) ---
     //
-    // Pushes the same payload as `/api/status` every 5 seconds. The
+    // Pushes the same payload as `/api/status` every 10 seconds. The
     // shared `build_status_payload` ensures GET and WS never diverge —
     // the web client uses a single `setStatus` (full replace) handler
-    // regardless of transport.
+    // regardless of transport. Desktop builds use the same cadence.
     // See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
     {
         use embedded_svc::ws::FrameType;
@@ -1490,7 +1490,7 @@ a{{color:#60a5fa;text-decoration:none}}
                             if sender.send(FrameType::Text(false), payload.to_string().as_bytes()).is_err() {
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            std::thread::sleep(std::time::Duration::from_secs(10));
                         }
                     }).ok();
                 return Ok(());

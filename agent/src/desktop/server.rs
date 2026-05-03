@@ -652,7 +652,7 @@ fn spawn_turn(
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket: Stats (push every 3s)
+// WebSocket: Stats (push every 10s — symmetric with ESP32 build)
 // ---------------------------------------------------------------------------
 
 async fn ws_stats(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -669,7 +669,7 @@ async fn handle_stats_ws(mut socket: WebSocket, state: AppState) {
         {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
 

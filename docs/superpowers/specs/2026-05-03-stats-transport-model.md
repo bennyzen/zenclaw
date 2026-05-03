@@ -9,7 +9,9 @@
 The web UI runs **two redundant stats streams concurrently**:
 
 - `/ws/stats` WebSocket pushes a lean payload (memory / temperature / wifi
-  RSSI / storage / uptime) every 5 s.
+  RSSI / storage / uptime) every 10 s. (Originally 5 s on ESP32 / 3 s on
+  desktop; bumped to a symmetric 10 s once the unified payload landed —
+  the slow-changing fields don't justify the tighter cadence.)
 - `/api/status` HTTP poll fetches the **full** payload (above + agent
   identity, board, platform, provider, model, channels, cloud_storage,
   network info, USB) every 15 s.
@@ -22,7 +24,7 @@ three bugs in close succession:
 2. A first attempt to fix this by making the merge include `provider`/`model`
    from `/api/status` worked when polling won the race, but the `/ws/stats`
    payload doesn't carry those fields. The next WS frame overwrote them
-   with `null`. Footer flickered every 5 s.
+   with `null`. Footer flickered every 10 s.
 3. Adding a `?? prevValue` fallback masked a real asymmetry between
    `/api/status` and `/ws/stats`. The asymmetry existed because the two
    endpoints were designed for different roles, not because of platform
@@ -43,10 +45,11 @@ two non-equal payloads is fragile.
 
 ## Non-goals
 
-- Reducing the WS push interval below 5 s (current cadence is already
-  comfortable).
+- Reducing the WS push interval below 10 s. The fields the WS carries
+  (free heap, RSSI, temperature, storage, uptime) all change slowly;
+  10 s is the sweet spot between liveness and per-device overhead.
 - Adding "delta only" or change-detection on the device. Pushing the full
-  payload at 5 s is well within budget given the cloud-status block is
+  payload at 10 s is well within budget given the cloud-status block is
   already 60 s-cached server-side.
 - Introducing per-field subscription channels.
 
@@ -58,7 +61,7 @@ The device exposes the *same JSON shape* on two transports:
 
 - **`GET /api/status`** — single-shot request/response. Used once on initial
   connect and as a fallback poll when the WebSocket is down.
-- **`WS /ws/stats`** — server-push. Sends the same payload every 5 s while
+- **`WS /ws/stats`** — server-push. Sends the same payload every 10 s while
   the connection is open.
 
 Both transports are served by a single `build_status_payload()` function
