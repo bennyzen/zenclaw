@@ -23,6 +23,71 @@ pub enum Command {
     Help,
 }
 
+/// Network link description for `/status`.
+#[derive(Debug, Clone)]
+pub enum LinkKind {
+    Wifi { ssid: String, rssi: Option<i32> },
+    Ethernet,
+    Desktop,
+}
+
+/// Live device facts assembled by `Gateway::runtime_facts(chat_id)` and
+/// passed to `execute()`. Stable fields (`agent_name`, `platform`,
+/// session size, model) come from `Gateway` directly; live fields come
+/// from the `HostFacts` trait so platform-specific reads stay out of
+/// `commands.rs` itself.
+#[derive(Debug, Clone)]
+pub struct RuntimeFacts {
+    pub hostname: String,
+    pub ip: Option<String>,
+    pub link: LinkKind,
+    pub free_internal_heap: Option<u32>,
+    pub free_psram: Option<u32>,
+    pub uptime_secs: u64,
+    pub agent_name: String,
+    pub platform: &'static str,
+    pub session_bytes: u64,
+    pub session_entries: usize,
+    pub model: String,
+}
+
+/// Bridge from `Gateway` to platform-specific runtime reads.
+///
+/// `Esp32HostFacts` (in `main.rs`) reads heap/RSSI from `esp_idf_svc`.
+/// `DesktopHostFacts` (in `desktop/host_facts.rs`) returns desktop-shaped
+/// values (heap = `None`, link = `Desktop`).
+pub trait HostFacts: Send + Sync {
+    fn hostname(&self) -> String;
+    fn ip(&self) -> Option<String>;
+    fn link(&self) -> LinkKind;
+    fn free_internal_heap(&self) -> Option<u32>;
+    fn free_psram(&self) -> Option<u32>;
+    fn uptime_secs(&self) -> u64;
+}
+
+/// Detect the build platform. Replaces the broken `cfg!(target_os)`
+/// ladder in `session_tools.rs::do_status` which reported `unknown` on
+/// every ESP32 build.
+pub fn detect_platform() -> &'static str {
+    if cfg!(target_os = "espidf") {
+        if cfg!(target_arch = "xtensa") {
+            "esp32-s3"
+        } else if cfg!(target_arch = "riscv32") {
+            "esp32-p4"
+        } else {
+            "espidf"
+        }
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    }
+}
+
 /// Single source of truth for the BotFather menu and the parser.
 ///
 /// Order matters — this list is what users see in Telegram's `/` menu,
@@ -126,5 +191,47 @@ mod tests {
                 name,
             );
         }
+    }
+
+    pub(super) struct FakeHostFacts {
+        pub hostname: String,
+        pub ip: Option<String>,
+        pub link: LinkKind,
+        pub heap: Option<u32>,
+        pub psram: Option<u32>,
+        pub uptime: u64,
+    }
+
+    impl FakeHostFacts {
+        pub fn new() -> Self {
+            Self {
+                hostname: "test-host".to_string(),
+                ip: Some("10.0.0.1".to_string()),
+                link: LinkKind::Wifi { ssid: "test".to_string(), rssi: Some(-55) },
+                heap: Some(120_000),
+                psram: Some(7_500_000),
+                uptime: 42,
+            }
+        }
+    }
+
+    impl HostFacts for FakeHostFacts {
+        fn hostname(&self) -> String { self.hostname.clone() }
+        fn ip(&self) -> Option<String> { self.ip.clone() }
+        fn link(&self) -> LinkKind { self.link.clone() }
+        fn free_internal_heap(&self) -> Option<u32> { self.heap }
+        fn free_psram(&self) -> Option<u32> { self.psram }
+        fn uptime_secs(&self) -> u64 { self.uptime }
+    }
+
+    #[test]
+    fn detect_platform_returns_known_string_on_test_host() {
+        let p = detect_platform();
+        // Test host is always linux/macos/windows — never the espidf fallback.
+        assert!(
+            matches!(p, "linux" | "macos" | "windows"),
+            "expected host platform, got {:?}",
+            p,
+        );
     }
 }
