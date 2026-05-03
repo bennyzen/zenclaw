@@ -79,6 +79,71 @@ mod log_ring {
     }
 }
 
+/// `HostFacts` impl for the ESP32 build. Reads heap/PSRAM via esp-idf-sys,
+/// link details via the `Nic` trait. Hostname is captured at boot from
+/// the resolved mDNS name (NVS-stored or MAC-derived fallback).
+#[cfg(feature = "esp32")]
+struct Esp32HostFacts {
+    hostname: String,
+    started: std::time::Instant,
+    nic: std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
+}
+
+#[cfg(feature = "esp32")]
+impl Esp32HostFacts {
+    fn new(
+        hostname: String,
+        nic: std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
+    ) -> Self {
+        Self {
+            hostname,
+            started: std::time::Instant::now(),
+            nic,
+        }
+    }
+}
+
+#[cfg(feature = "esp32")]
+impl zenclaw_agent::core::commands::HostFacts for Esp32HostFacts {
+    fn hostname(&self) -> String {
+        self.hostname.clone()
+    }
+
+    fn ip(&self) -> Option<String> {
+        self.nic.ip_info().map(|i| i.ip.to_string())
+    }
+
+    fn link(&self) -> zenclaw_agent::core::commands::LinkKind {
+        match self.nic.kind() {
+            zenclaw_agent::net::NicKind::Wifi => {
+                zenclaw_agent::core::commands::LinkKind::Wifi {
+                    ssid: self.nic.ssid().unwrap_or_else(|| "?".to_string()),
+                    rssi: self.nic.rssi(),
+                }
+            }
+            zenclaw_agent::net::NicKind::Ethernet => {
+                zenclaw_agent::core::commands::LinkKind::Ethernet
+            }
+        }
+    }
+
+    fn free_internal_heap(&self) -> Option<u32> {
+        Some(unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as u32)
+    }
+
+    fn free_psram(&self) -> Option<u32> {
+        let v = unsafe {
+            esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_SPIRAM)
+        };
+        // 0 → "no PSRAM" or "unsupported"; both surface as None.
+        if v == 0 { None } else { Some(v as u32) }
+    }
+
+    fn uptime_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
 #[cfg(feature = "esp32")]
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -206,20 +271,8 @@ fn main() {
     let config_for_tg = config.clone();
     let config_arc = std::sync::Arc::new(config.clone());
     let runner = Box::new(zenclaw_agent::esp32::runner::EspRunner::new(config_arc));
-    // Temporary stub — real `Esp32HostFacts` lands in Task 11.
-    struct StubFacts;
-    impl zenclaw_agent::core::commands::HostFacts for StubFacts {
-        fn hostname(&self) -> String { "unknown".to_string() }
-        fn ip(&self) -> Option<String> { None }
-        fn link(&self) -> zenclaw_agent::core::commands::LinkKind {
-            zenclaw_agent::core::commands::LinkKind::Desktop
-        }
-        fn free_internal_heap(&self) -> Option<u32> { None }
-        fn free_psram(&self) -> Option<u32> { None }
-        fn uptime_secs(&self) -> u64 { 0 }
-    }
     let host_facts: std::sync::Arc<dyn zenclaw_agent::core::commands::HostFacts> =
-        std::sync::Arc::new(StubFacts);
+        std::sync::Arc::new(Esp32HostFacts::new(hostname.clone(), nic.clone()));
     let gateway = match cloud_handles {
         Some(h) => zenclaw_agent::core::gateway::Gateway::new_with_cloud(
             config, data_dir, runner, h, host_facts,
@@ -1722,6 +1775,16 @@ fn agent_thread(
         log::info!("Agent thread: Telegram + HTTP chat");
     } else {
         log::info!("Agent thread: HTTP chat only");
+    }
+
+    // Register the BotFather menu (single source of truth in commands::menu()).
+    // Non-fatal: rate limit / no network — log and continue.
+    if let Some((poller, _channel, _allowed)) = tg.as_ref() {
+        if let Err(e) = esp_idf_svc::hal::task::block_on(
+            poller.set_my_commands(&*http, zenclaw_agent::core::commands::menu()),
+        ) {
+            log::warn!("setMyCommands failed (non-fatal): {}", e);
+        }
     }
 
     loop {
