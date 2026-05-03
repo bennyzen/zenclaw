@@ -197,10 +197,21 @@ fn main() {
     let _ = std::fs::create_dir_all(format!("{}/memory", data_dir));
     zenclaw_agent::core::workspace::seed_defaults(data_dir);
 
+    // --- Cloud bootstrap (only if storage is configured) -------------------
+    // Build the cache + replicator, run boot_restore against S3, spawn the
+    // drainer + snapshot timer. Cloud-disabled boot keeps the existing
+    // local-file path with zero overhead.
+    let cloud_handles = bootstrap_cloud(&config, data_dir, &hostname);
+
     let config_for_tg = config.clone();
     let config_arc = std::sync::Arc::new(config.clone());
     let runner = Box::new(zenclaw_agent::esp32::runner::EspRunner::new(config_arc));
-    let gateway = zenclaw_agent::core::gateway::Gateway::new(config, data_dir, runner);
+    let gateway = match cloud_handles {
+        Some(h) => zenclaw_agent::core::gateway::Gateway::new_with_cloud(
+            config, data_dir, runner, h,
+        ),
+        None => zenclaw_agent::core::gateway::Gateway::new(config, data_dir, runner),
+    };
     let gateway = std::sync::Arc::new(gateway);
 
     // --- Chat request channel (httpd → agent thread) ---
@@ -232,13 +243,22 @@ fn main() {
         });
 
     // --- Start agent thread (handles both Telegram + HTTP chat) ---
-    // Single 32KB thread — no extra thread needed, saves heap.
+    // 24KB. Was 32KB until cloud bootstrap added the drainer (8KB) +
+    // snapshot timer (4KB) threads, which fragment internal SRAM
+    // enough that a contiguous 32KB block isn't always available by
+    // the time we get here (observed: cold boots after `/api/config`
+    // strict_put + reboot, when boot_restore loads one extra cache
+    // entry, push the heap over the edge → "Failed to spawn agent
+    // thread: OutOfMemory"). 24KB matches the typical peak used by
+    // agent_loop (LLM HTTPS handshake ~8KB + tool dispatch ~6KB +
+    // serde_json + futures wrapper). Telegram poller threads spawned
+    // inside agent_thread use 8KB stacks of their own.
     {
         let gw = gateway.clone();
         let http_for_thread = http.clone();
         std::thread::Builder::new()
             .name("agent".into())
-            .stack_size(32768)
+            .stack_size(24 * 1024)
             .spawn(move || agent_thread(chat_rx, gw, http_for_thread, tg_resources))
             .expect("Failed to spawn agent thread");
         log::info!("Agent thread started");
@@ -357,6 +377,141 @@ fn chip_label() -> &'static str {
     }
 }
 
+/// Boot-time stash of `BootResult` so `/api/status.cloud_storage` can
+/// surface warnings + heartbeat conflict without re-running the
+/// restore. Set once during cloud bootstrap; never mutated after.
+#[cfg(feature = "esp32")]
+static CLOUD_BOOT_RESULT: std::sync::OnceLock<zenclaw_agent::core::cloud::BootResult> =
+    std::sync::OnceLock::new();
+
+/// Stand up the cloud-persistence machinery for this boot if storage is
+/// configured. Returns `None` when cloud is disabled — the caller falls
+/// back to local-file mode with no behavior change.
+///
+/// Side effects on the `Some` path:
+/// - runs `boot_restore` (populates the cache from S3, applies L3/L4/L5
+///   safety layers per chat, restores memory + cron + identity files);
+/// - stashes the resulting `BootResult` in `CLOUD_BOOT_RESULT` for
+///   `/api/status.cloud_storage` to surface;
+/// - spawns the replicator drainer thread (32KB stack — TLS handshakes
+///   dominate; smaller stacks blow up at handshake);
+/// - spawns the snapshot timer thread (8KB stack — pure file IO).
+///
+/// Both spawned threads run for the lifetime of the process; we never
+/// shut them down (the device only exits via reboot).
+#[cfg(feature = "esp32")]
+fn bootstrap_cloud(
+    config: &zenclaw_agent::config::Config,
+    data_dir: &str,
+    hostname: &str,
+) -> Option<zenclaw_agent::core::gateway::CloudHandles> {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use zenclaw_agent::core::cloud::{
+        boot_restore, client::ObjectStore, client::S3Client, snapshots, BootConfig, CloudCache,
+        Replicator, ReplicatorConfig,
+    };
+
+    if !config.is_cloud_enabled() {
+        log::info!("Cloud: disabled (no storage block in config)");
+        return None;
+    }
+    let storage = config.storage.as_ref().expect("is_cloud_enabled checked");
+    let s3 = S3Client::from_config(storage)?;
+    let store: Arc<dyn ObjectStore> = Arc::new(s3);
+
+    let cache = CloudCache::new();
+
+    // Step 1: boot restore. On hard failure (top-level LIST blew up),
+    // log and continue with an empty cache — better to come up with no
+    // history than to refuse boot. Per-chat failures are absorbed into
+    // the BootResult.warnings vec and surface on /api/status.
+    let boot_cfg = BootConfig {
+        session_max_bytes: storage.session_max_bytes,
+        log_compaction_bytes: storage.log_compaction_bytes,
+        device_id: hostname.to_string(),
+        heartbeat_stale_secs: 3600,
+    };
+    match boot_restore(&store, &cache, &boot_cfg) {
+        Ok(result) => {
+            log::info!(
+                "Cloud boot_restore: {} warning(s), heartbeat_conflict={:?}, cache={} keys",
+                result.warnings.len(),
+                result.heartbeat_conflict,
+                cache.snapshot().len()
+            );
+            let _ = CLOUD_BOOT_RESULT.set(result);
+        }
+        Err(e) => {
+            log::warn!("Cloud boot_restore failed (continuing with empty cache): {}", e);
+            // Try snapshot fallback before giving up.
+            let snap_path = format!("{}/.snapshot.bin", data_dir);
+            match snapshots::read_from(&snap_path) {
+                Ok(Some(snap)) => {
+                    log::info!(
+                        "Cloud: restored from snapshot ({} keys, written_at={})",
+                        snap.entries.len(),
+                        snap.written_at
+                    );
+                    cache.restore_from(snap.entries);
+                }
+                Ok(None) => log::info!("Cloud: no snapshot found"),
+                Err(e2) => log::warn!("Cloud: snapshot read failed: {}", e2),
+            }
+        }
+    }
+
+    // Step 2: replicator + drainer.
+    let replicator = Arc::new(Replicator::new(ReplicatorConfig::from(&storage.replicator)));
+    let _drainer = replicator.spawn_drainer(store.clone());
+    log::info!(
+        "Cloud: drainer thread spawned (queue_max={}, retry_max={})",
+        storage.replicator.queue_max,
+        storage.replicator.retry_max
+    );
+
+    // Step 3: snapshot timer thread. 4 KiB stack — the loop body is
+    // pure file IO via snapshots::write_to (length-prefixed binary
+    // serializer + atomic rename), no TLS, no LLM. 8 KiB was over-
+    // provisioned and contributed to the agent-thread OOM during cold
+    // boots after a /api/config strict_put + reboot.
+    let cache_for_snap = cache.clone();
+    let snap_path = format!("{}/.snapshot.bin", data_dir);
+    let snap_interval = Duration::from_secs(storage.snapshot.interval_secs as u64);
+    std::thread::Builder::new()
+        .name("cloud-snap".into())
+        .stack_size(4 * 1024)
+        .spawn(move || loop {
+            std::thread::sleep(snap_interval);
+            if let Err(e) = snapshots::write_to(&cache_for_snap, &snap_path) {
+                log::warn!("snapshot write failed: {}", e);
+            }
+        })
+        .expect("Failed to spawn snapshot thread");
+    log::info!("Cloud: snapshot timer thread spawned (interval={}s)", storage.snapshot.interval_secs);
+
+    Some(zenclaw_agent::core::gateway::CloudHandles {
+        cache,
+        replicator,
+        store,
+        log_compaction_bytes: storage.log_compaction_bytes,
+        retry_max: storage.replicator.retry_max,
+        backoff_cap_secs: storage.replicator.backoff_cap_secs,
+    })
+}
+
+/// No-op stub for non-esp32 builds (desktop). Cloud bootstrap is
+/// ESP32-only because S3Client itself is `#[cfg(feature = "esp32")]`.
+#[cfg(not(feature = "esp32"))]
+#[allow(dead_code)]
+fn bootstrap_cloud(
+    _config: &zenclaw_agent::config::Config,
+    _data_dir: &str,
+    _hostname: &str,
+) -> Option<zenclaw_agent::core::gateway::CloudHandles> {
+    None
+}
+
 #[cfg(feature = "esp32")]
 fn get_query_param(uri: &str, key: &str) -> Option<String> {
     let query = uri.split('?').nth(1)?;
@@ -377,8 +532,11 @@ static CLOUD_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_js
     std::sync::Mutex::new(None);
 
 #[cfg(feature = "esp32")]
-fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json::Value> {
+fn cloud_status_block(
+    gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
+) -> Option<serde_json::Value> {
     use zenclaw_agent::core::cloud::client::S3Client;
+    let cfg = gw.config.as_ref();
     let storage = cfg.storage.as_ref()?;
     if !storage.is_cloud_configured() {
         return None;
@@ -388,7 +546,15 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
         let cache = CLOUD_STATUS_CACHE.lock().ok()?;
         if let Some((ts, val)) = cache.as_ref() {
             if ts.elapsed() < std::time::Duration::from_secs(60) {
-                return Some(val.clone());
+                // Re-attach the live (uncached) sync/boot/heartbeat
+                // sub-blocks so the UI reflects the queue depth and
+                // dead-letter state in real time.
+                let mut v = val.clone();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("sync".to_string(), sync_block(gw));
+                    obj.insert("boot".to_string(), boot_block());
+                }
+                return Some(v);
             }
         }
     }
@@ -396,14 +562,17 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
     let provider = storage.provider();
     let bucket = storage.bucket.clone().unwrap_or_default();
 
-    let (block, cache_ok) = match S3Client::from_config(storage) {
+    let (mut block, cache_ok) = match S3Client::from_config(storage) {
         Some(client) => match client.list("", None, 1000) {
             Ok(listing) => {
                 let total: u64 = listing.objects.iter().map(|o| o.size).sum();
                 let v = serde_json::json!({
                     "configured": true,
+                    "enabled": true,
                     "provider": provider,
                     "bucket": bucket,
+                    "endpoint": storage.endpoint.clone().unwrap_or_default(),
+                    "region": storage.region,
                     "objects": listing.objects.len(),
                     "total_bytes": total,
                 });
@@ -412,6 +581,7 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
             Err(e) => (
                 serde_json::json!({
                     "configured": true,
+                    "enabled": true,
                     "provider": provider,
                     "bucket": bucket,
                     "error": e.to_string(),
@@ -422,6 +592,7 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
         None => (
             serde_json::json!({
                 "configured": true,
+                "enabled": true,
                 "provider": provider,
                 "bucket": bucket,
                 "error": "client init failed",
@@ -429,6 +600,12 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
             false,
         ),
     };
+
+    // Live sync/boot blocks always overlay (not subject to 60s cache).
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert("sync".to_string(), sync_block(gw));
+        obj.insert("boot".to_string(), boot_block());
+    }
 
     // Only cache successful results — caching transient failures (e.g.
     // RequestTimeTooSkewed before SNTP syncs) would freeze them in for 60s.
@@ -438,6 +615,154 @@ fn cloud_status_block(cfg: &zenclaw_agent::config::Config) -> Option<serde_json:
         }
     }
     Some(block)
+}
+
+/// Builds the JSON payload returned on `/api/status` and pushed every 5s
+/// over `/ws/stats`. The two transports must serve the **same shape** so
+/// the web client can use a single `setStatus` (full replace) handler
+/// regardless of where the message arrived from.
+///
+/// Includes everything the UI displays: live metrics (memory, temp, wifi,
+/// storage, uptime), config-derived identity (provider, model, board,
+/// platform, agent_name), and capability flags
+/// (channels.telegram.has_token, cloud_storage). Secrets (api keys,
+/// tokens, secret access keys) are never present — they live in
+/// `/api/config` and are only fetched on explicit GET.
+///
+/// Cloud-storage stats are 60s-cached server-side (see
+/// `cloud_status_block`), so the cost of the 5s push remains bounded.
+///
+/// See `docs/superpowers/specs/2026-05-03-stats-transport-model.md`.
+#[cfg(feature = "esp32")]
+fn build_status_payload(
+    gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
+    nic: &std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
+    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
+    temp_handle: usize,
+) -> serde_json::Value {
+    let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
+    let heap_total = unsafe { esp_idf_svc::sys::heap_caps_get_total_size(4096) }; // MALLOC_CAP_DEFAULT
+    let uptime_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+    let mut spiffs_total: usize = 0;
+    let mut spiffs_used: usize = 0;
+    unsafe {
+        esp_idf_svc::sys::esp_spiffs_info(
+            b"storage\0".as_ptr() as *const core::ffi::c_char,
+            &mut spiffs_total,
+            &mut spiffs_used,
+        );
+    }
+    let info = nic.ip_info();
+    let nic_kind_str = match nic.kind() {
+        zenclaw_agent::net::NicKind::Wifi => "wifi",
+        zenclaw_agent::net::NicKind::Ethernet => "ethernet",
+    };
+    let mac = nic.mac();
+    let mac_str = format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    );
+    let is_wifi = nic.kind() == zenclaw_agent::net::NicKind::Wifi;
+    let mut body = serde_json::json!({
+        "agent_name": gw.config.agent_name,
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": chip_label(),
+        "board": env!("ZENCLAW_BOARD"),
+        "memory": {
+            "free_kb": heap_free / 1024,
+            "total_kb": heap_total / 1024,
+            "used_kb": heap_total.saturating_sub(heap_free) / 1024,
+        },
+        "temperature_c": read_temp(temp_handle),
+        "network": {
+            "kind": nic_kind_str,
+            "ip": info.map(|i| i.ip.to_string()),
+            "link_speed_mbps": nic.link_speed_mbps(),
+            "mac": mac_str,
+        },
+        "wifi": {
+            "connected": is_wifi && nic.link_up(),
+            "ip": if is_wifi { info.map(|i| i.ip.to_string()) } else { None },
+            "ssid": nic.ssid().or_else(|| {
+                zenclaw_agent::net::wifi_ui::read_credentials(nvs)
+                    .map(|(s, _)| s)
+            }),
+            "rssi": nic.rssi(),
+            "driver": zenclaw_agent::net::wifi_ui::driver_label(),
+        },
+        "storage": {
+            "total_kb": spiffs_total / 1024,
+            "free_kb": (spiffs_total - spiffs_used) / 1024,
+        },
+        "channels": {
+            "telegram": {
+                "configured": gw.config.channels.telegram.is_some(),
+                "enabled": gw.config.channels.telegram.as_ref().map_or(false, |t| t.enabled),
+                "has_token": gw.config.channels.telegram.as_ref().map_or(false, |t| !t.bot_token.is_empty()),
+            },
+        },
+        "provider": gw.config.providers.default,
+        "model": gw.config.providers.entries.get(&gw.config.providers.default)
+            .and_then(|e| e.model.as_deref())
+            .unwrap_or(""),
+        "usb": {
+            "mounted": cfg!(feature = "usb_storage") && {
+                #[cfg(feature = "usb_storage")]
+                { zenclaw_agent::usb_storage::is_mounted() }
+                #[cfg(not(feature = "usb_storage"))]
+                { false }
+            },
+            "path": if cfg!(feature = "usb_storage") { "/usb" } else { "" },
+        },
+        "uptime_s": uptime_us / 1_000_000
+    });
+    if let Some(cloud) = cloud_status_block(gw) {
+        body["cloud_storage"] = cloud;
+    }
+    body
+}
+
+/// Live replicator state — queue depth, dead-letter count, last-sync
+/// age. Kept out of the 60s LIST cache so the UI reflects writes in
+/// real time.
+#[cfg(feature = "esp32")]
+fn sync_block(gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>) -> serde_json::Value {
+    use zenclaw_agent::core::cloud::DeadLetterEntry;
+    let Some(rep) = gw.cloud_replicator.as_ref() else {
+        return serde_json::json!({ "active": false });
+    };
+    let dl: Vec<DeadLetterEntry> = rep.dead_letter();
+    let last_sync_age = rep
+        .last_sync_at()
+        .map(|i| i.elapsed().as_secs() as i64)
+        .unwrap_or(-1);
+    serde_json::json!({
+        "active": true,
+        "queue_depth": rep.queue_depth(),
+        "queue_max": gw.config.storage.as_ref()
+            .map(|s| s.replicator.queue_max).unwrap_or(0),
+        "last_sync_age_secs": last_sync_age,
+        "dead_letter_count": dl.len(),
+        "failures": dl.iter().take(10).map(|e| serde_json::json!({
+            "key": e.key,
+            "retry_count": e.retry_count,
+            "last_error": e.last_error_msg,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Boot warnings + heartbeat conflict captured at startup. Stable for
+/// the lifetime of the process — set once in `bootstrap_cloud`.
+#[cfg(feature = "esp32")]
+fn boot_block() -> serde_json::Value {
+    let Some(result) = CLOUD_BOOT_RESULT.get() else {
+        return serde_json::json!({ "ran": false });
+    };
+    serde_json::json!({
+        "ran": true,
+        "warnings": result.warnings,
+        "heartbeat_conflict": result.heartbeat_conflict,
+    })
 }
 
 #[cfg(feature = "esp32")]
@@ -568,91 +893,16 @@ a{{color:#60a5fa;text-decoration:none}}
     }).unwrap();
 
     // --- /api/status ---
+    //
+    // Both this handler and the `/ws/stats` push thread call
+    // `build_status_payload` so the JSON shape served on either transport
+    // is identical. See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
     let gw = gateway.clone();
     let nic_for_status = nic.clone();
     let nvs_for_status = nvs.clone();
     let th = temp_handle;
     server.fn_handler::<anyhow::Error, _>("/api/status", Method::Get, move |req| {
-        let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
-        let heap_total = unsafe { esp_idf_svc::sys::heap_caps_get_total_size(4096) }; // MALLOC_CAP_DEFAULT
-        let uptime_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-        let mut spiffs_total: usize = 0;
-        let mut spiffs_used: usize = 0;
-        unsafe {
-            esp_idf_svc::sys::esp_spiffs_info(
-                b"storage\0".as_ptr() as *const core::ffi::c_char,
-                &mut spiffs_total,
-                &mut spiffs_used,
-            );
-        }
-        let info = nic_for_status.ip_info();
-        let nic_kind_str = match nic_for_status.kind() {
-            zenclaw_agent::net::NicKind::Wifi => "wifi",
-            zenclaw_agent::net::NicKind::Ethernet => "ethernet",
-        };
-        let mac = nic_for_status.mac();
-        let mac_str = format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        );
-        let is_wifi = nic_for_status.kind() == zenclaw_agent::net::NicKind::Wifi;
-        let body = serde_json::json!({
-            "agent_name": gw.config.agent_name,
-            "version": env!("CARGO_PKG_VERSION"),
-            "platform": chip_label(),
-            "board": env!("ZENCLAW_BOARD"),
-            "memory": {
-                "free_kb": heap_free / 1024,
-                "total_kb": heap_total / 1024,
-                "used_kb": heap_total.saturating_sub(heap_free) / 1024,
-            },
-            "temperature_c": read_temp(th),
-            "network": {
-                "kind": nic_kind_str,
-                "ip": info.map(|i| i.ip.to_string()),
-                "link_speed_mbps": nic_for_status.link_speed_mbps(),
-                "mac": mac_str,
-            },
-            "wifi": {
-                "connected": is_wifi && nic_for_status.link_up(),
-                "ip": if is_wifi { info.map(|i| i.ip.to_string()) } else { None },
-                "ssid": nic_for_status.ssid().or_else(|| {
-                    zenclaw_agent::net::wifi_ui::read_credentials(&nvs_for_status)
-                        .map(|(s, _)| s)
-                }),
-                "rssi": nic_for_status.rssi(),
-                "driver": zenclaw_agent::net::wifi_ui::driver_label(),
-            },
-            "storage": {
-                "total_kb": spiffs_total / 1024,
-                "free_kb": (spiffs_total - spiffs_used) / 1024,
-            },
-            "channels": {
-                "telegram": {
-                    "configured": gw.config.channels.telegram.is_some(),
-                    "enabled": gw.config.channels.telegram.as_ref().map_or(false, |t| t.enabled),
-                    "has_token": gw.config.channels.telegram.as_ref().map_or(false, |t| !t.bot_token.is_empty()),
-                },
-            },
-            "provider": gw.config.providers.default,
-            "model": gw.config.providers.entries.get(&gw.config.providers.default)
-                .and_then(|e| e.model.as_deref())
-                .unwrap_or(""),
-            "usb": {
-                "mounted": cfg!(feature = "usb_storage") && {
-                    #[cfg(feature = "usb_storage")]
-                    { zenclaw_agent::usb_storage::is_mounted() }
-                    #[cfg(not(feature = "usb_storage"))]
-                    { false }
-                },
-                "path": if cfg!(feature = "usb_storage") { "/usb" } else { "" },
-            },
-            "uptime_s": uptime_us / 1_000_000
-        });
-        let mut body = body;
-        if let Some(cloud) = cloud_status_block(&gw.config) {
-            body["cloud_storage"] = cloud;
-        }
+        let body = build_status_payload(&gw, &nic_for_status, &nvs_for_status, th);
         let body_str = body.to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(body_str.as_bytes())?;
@@ -830,6 +1080,52 @@ a{{color:#60a5fa;text-decoration:none}}
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(config) => {
                 let json = serde_json::to_string(&config).unwrap();
+
+                // Strict S3 PUT happens BEFORE the NVS write so a cloud
+                // failure leaves the device's running state intact. We
+                // only attempt it when the new config typed-parses as
+                // Config AND has cloud configured — pushing a non-Config
+                // shape (or disabling cloud) skips the strict path.
+                if let Ok(typed_cfg) = serde_json::from_slice::<zenclaw_agent::config::Config>(&body) {
+                    if typed_cfg.is_cloud_enabled() {
+                        use zenclaw_agent::core::cloud::client::S3Client;
+                        let storage = typed_cfg.storage.as_ref().expect("is_cloud_enabled checked");
+                        match S3Client::from_config(storage) {
+                            Some(client) => {
+                                use zenclaw_agent::core::cloud::client::ObjectStore;
+                                let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(client);
+                                if let Err(e) = zenclaw_agent::core::cloud::strict::strict_put(
+                                    &store,
+                                    "sys/config.json",
+                                    json.as_bytes(),
+                                    storage.replicator.retry_max,
+                                    storage.replicator.backoff_cap_secs,
+                                ) {
+                                    log::warn!("Config strict_put failed; aborting reboot: {}", e);
+                                    let err_body = serde_json::json!({
+                                        "error": format!("Cloud strict_put failed: {}", e),
+                                    }).to_string();
+                                    let mut resp = req.into_response(503, None, CORS_HEADERS)?;
+                                    resp.write_all(err_body.as_bytes())?;
+                                    return Ok(());
+                                }
+                                log::info!("Config strict_put OK ({}B → sys/config.json)", json.len());
+                            }
+                            None => {
+                                // is_cloud_enabled() guarantees the four required
+                                // fields are present, so client construction
+                                // failing here means an internal error. Surface it.
+                                let err_body = serde_json::json!({
+                                    "error": "Cloud client construction failed despite is_cloud_enabled",
+                                }).to_string();
+                                let mut resp = req.into_response(503, None, CORS_HEADERS)?;
+                                resp.write_all(err_body.as_bytes())?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 save_config_nvs(&nvs_w, &json).map_err(|e| anyhow::anyhow!(e))?;
                 log::info!("Config saved to NVS ({}B), restarting...", json.len());
                 let resp_body = serde_json::json!({"ok": true}).to_string();
@@ -1178,16 +1474,24 @@ a{{color:#60a5fa;text-decoration:none}}
     }).unwrap();
 
     // --- WS /ws/stats (live stats stream) ---
+    //
+    // Pushes the same payload as `/api/status` every 10 seconds. The
+    // shared `build_status_payload` ensures GET and WS never diverge —
+    // the web client uses a single `setStatus` (full replace) handler
+    // regardless of transport. Desktop builds use the same cadence.
+    // See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
     {
         use embedded_svc::ws::FrameType;
+        let gw_for_ws = gateway.clone();
         let nic_for_ws = nic.clone();
-        let ip_for_ws = ip_str.to_string();
+        let nvs_for_ws = nvs.clone();
         let th = temp_handle;
         server.ws_handler::<_, anyhow::Error>("/ws/stats", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() {
                 let sender = ws.create_detached_sender()?;
-                let ip = ip_for_ws.clone();
+                let gw_clone = gw_for_ws.clone();
                 let nic_clone = nic_for_ws.clone();
+                let nvs_clone = nvs_for_ws.clone();
                 std::thread::Builder::new()
                     .name("ws-stats".into())
                     .stack_size(8192)
@@ -1195,42 +1499,11 @@ a{{color:#60a5fa;text-decoration:none}}
                         let mut sender = sender;
                         loop {
                             if sender.is_closed() { break; }
-                            let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
-                            let heap_total = unsafe { esp_idf_svc::sys::heap_caps_get_total_size(4096) }; // MALLOC_CAP_DEFAULT
-                            let uptime_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-                            let mut total: usize = 0;
-                            let mut used: usize = 0;
-                            unsafe {
-                                esp_idf_svc::sys::esp_spiffs_info(
-                                    b"storage\0".as_ptr() as *const core::ffi::c_char,
-                                    &mut total,
-                                    &mut used,
-                                );
-                            }
-                            let rssi = nic_clone.rssi();
-                            let is_wifi = nic_clone.kind() == zenclaw_agent::net::NicKind::Wifi;
-                            let stats = serde_json::json!({
-                                "memory": {
-                                    "free_kb": heap_free / 1024,
-                                    "total_kb": heap_total / 1024,
-                                    "used_kb": heap_total.saturating_sub(heap_free) / 1024,
-                                },
-                                "temperature_c": read_temp(th),
-                                "wifi": {
-                                    "connected": is_wifi && nic_clone.link_up(),
-                                    "ip": ip,
-                                    "rssi": rssi,
-                                },
-                                "storage": {
-                                    "total_kb": total / 1024,
-                                    "free_kb": total.saturating_sub(used) / 1024,
-                                },
-                                "uptime_s": uptime_us / 1_000_000
-                            });
-                            if sender.send(FrameType::Text(false), stats.to_string().as_bytes()).is_err() {
+                            let payload = build_status_payload(&gw_clone, &nic_clone, &nvs_clone, th);
+                            if sender.send(FrameType::Text(false), payload.to_string().as_bytes()).is_err() {
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            std::thread::sleep(std::time::Duration::from_secs(10));
                         }
                     }).ok();
                 return Ok(());

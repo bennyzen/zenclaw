@@ -75,8 +75,29 @@ pub async fn start_api_server(state: AppState, port: u16) {
 // ---------------------------------------------------------------------------
 
 async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(build_status_payload(&state))
+}
+
+/// Builds the JSON payload returned on `/api/status` and pushed every 5s
+/// over `/ws/stats`. The two transports must serve the **same shape** —
+/// the web client uses a single `setStatus` (full replace) handler
+/// regardless of transport.
+///
+/// Desktop has fewer real datapoints than ESP32 (no temperature sensor,
+/// no real wifi metrics, no SPIFFS, no USB) — those fields are returned
+/// as `null` so the JSON shape matches and the consumer doesn't need
+/// per-platform branches.
+///
+/// See `docs/superpowers/specs/2026-05-03-stats-transport-model.md`.
+fn build_status_payload(state: &AppState) -> serde_json::Value {
     let uptime = state.start_time.elapsed().as_secs();
-    Json(json!({
+    let providers = &state.gateway.config.providers;
+    let model = providers
+        .entries
+        .get(&providers.default)
+        .and_then(|e| e.model.as_deref())
+        .unwrap_or("");
+    json!({
         "agent_name": state.gateway.config.agent_name,
         "version": env!("CARGO_PKG_VERSION"),
         "built": "",
@@ -84,8 +105,10 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "temperature_c": null,
         "wifi": null,
         "storage": { "total_kb": null, "free_kb": null },
+        "provider": providers.default,
+        "model": model,
         "uptime_s": uptime
-    }))
+    })
 }
 
 /// Shared shape for `/api/status` and `/ws/stats` memory fields. Maps Linux
@@ -629,7 +652,7 @@ fn spawn_turn(
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket: Stats (push every 3s)
+// WebSocket: Stats (push every 10s — symmetric with ESP32 build)
 // ---------------------------------------------------------------------------
 
 async fn ws_stats(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -638,22 +661,15 @@ async fn ws_stats(ws: WebSocketUpgrade, State(state): State<AppState>) -> Respon
 
 async fn handle_stats_ws(mut socket: WebSocket, state: AppState) {
     loop {
-        let uptime = state.start_time.elapsed().as_secs();
-        let stats = json!({
-            "memory": memory_json(),
-            "temperature_c": null,
-            "wifi": null,
-            "storage": {"total_kb": null, "free_kb": null},
-            "uptime_s": uptime
-        });
+        let payload = build_status_payload(&state);
         if socket
-            .send(WsMsg::Text(stats.to_string().into()))
+            .send(WsMsg::Text(payload.to_string().into()))
             .await
             .is_err()
         {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
 

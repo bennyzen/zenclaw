@@ -48,7 +48,7 @@ fn default_stream_debounce_ms() -> u64 {
     500
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -184,7 +184,29 @@ fn default_storage_region() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn default_session_max_bytes() -> usize {
+    256_000
+}
+fn default_log_compaction_bytes() -> usize {
+    16_384
+}
+fn default_replicator_queue_max() -> u32 {
+    32
+}
+fn default_replicator_retry_max() -> u8 {
+    5
+}
+fn default_replicator_backoff_cap_secs() -> u32 {
+    60
+}
+fn default_snapshot_interval_secs() -> u32 {
+    900
+}
+fn default_snapshot_stale_queue_threshold_secs() -> u32 {
+    300
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct StorageConfig {
     pub path: Option<String>,
 
@@ -200,6 +222,21 @@ pub struct StorageConfig {
     pub bucket: Option<String>,
     #[serde(default = "default_storage_region")]
     pub region: String,
+
+    /// Per-chat log budget. When the on-disk + cloud session log for a
+    /// chat exceeds this, [`SessionManager`] rotates it through compaction.
+    #[serde(default = "default_session_max_bytes")]
+    pub session_max_bytes: usize,
+    /// Threshold for opportunistic in-place log compaction (turning the
+    /// append-only stream into a snapshot + tail). Smaller than
+    /// `session_max_bytes` so compaction kicks in before the rotation cap.
+    #[serde(default = "default_log_compaction_bytes")]
+    pub log_compaction_bytes: usize,
+
+    #[serde(default)]
+    pub replicator: ReplicatorConfig,
+    #[serde(default)]
+    pub snapshot: SnapshotConfig,
 }
 
 impl StorageConfig {
@@ -222,6 +259,54 @@ impl StorageConfig {
     }
 }
 
+/// Cloud-write replicator tunables. The replicator drains the eager-path
+/// queue, signs + PUTs each entry, retries with exponential backoff up to
+/// `retry_max`, and demotes failures to a dead-letter list.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplicatorConfig {
+    /// Max in-flight + pending writes before the producer must spill to
+    /// flash (or block, depending on caller).
+    #[serde(default = "default_replicator_queue_max")]
+    pub queue_max: u32,
+    #[serde(default = "default_replicator_retry_max")]
+    pub retry_max: u8,
+    /// Cap on per-entry exponential backoff (seconds).
+    #[serde(default = "default_replicator_backoff_cap_secs")]
+    pub backoff_cap_secs: u32,
+}
+
+impl Default for ReplicatorConfig {
+    fn default() -> Self {
+        Self {
+            queue_max: default_replicator_queue_max(),
+            retry_max: default_replicator_retry_max(),
+            backoff_cap_secs: default_replicator_backoff_cap_secs(),
+        }
+    }
+}
+
+/// Periodic flash snapshot for boot-time fallback when S3 is unreachable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotConfig {
+    /// Snapshot cadence in seconds. Default 15 min keeps wear low while
+    /// bounding RPO when the network drops.
+    #[serde(default = "default_snapshot_interval_secs")]
+    pub interval_secs: u32,
+    /// If the replicator queue's oldest entry has been waiting longer
+    /// than this, force a snapshot ahead of the next interval tick.
+    #[serde(default = "default_snapshot_stale_queue_threshold_secs")]
+    pub stale_queue_threshold_secs: u32,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_snapshot_interval_secs(),
+            stale_queue_threshold_secs: default_snapshot_stale_queue_threshold_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleConfig {
     pub client_id: Option<String>,
@@ -233,5 +318,61 @@ impl Config {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = serde_json::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// True when cloud-persistence is configured and operational — i.e. the
+    /// `storage` block has bucket + endpoint + access_key_id + secret_access_key
+    /// all set. Wraps [`StorageConfig::is_cloud_configured`] with the
+    /// outer-Option flatten.
+    pub fn is_cloud_enabled(&self) -> bool {
+        self.storage
+            .as_ref()
+            .is_some_and(StorageConfig::is_cloud_configured)
+    }
+}
+
+#[cfg(test)]
+mod cloud_persistence_config_tests {
+    use super::*;
+
+    #[test]
+    fn storage_config_defaults_session_budget_to_256k() {
+        let cfg: StorageConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.session_max_bytes, 256_000);
+        assert_eq!(cfg.log_compaction_bytes, 16_384);
+    }
+
+    #[test]
+    fn storage_config_defaults_replicator() {
+        let cfg: StorageConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.replicator.queue_max, 32);
+        assert_eq!(cfg.replicator.retry_max, 5);
+        assert_eq!(cfg.replicator.backoff_cap_secs, 60);
+    }
+
+    #[test]
+    fn storage_config_defaults_snapshot() {
+        let cfg: StorageConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(cfg.snapshot.interval_secs, 900);
+        assert_eq!(cfg.snapshot.stale_queue_threshold_secs, 300);
+    }
+
+    #[test]
+    fn is_cloud_enabled_requires_bucket_and_keys() {
+        let mut cfg = Config::default();
+        assert!(!cfg.is_cloud_enabled());
+
+        cfg.storage = Some(StorageConfig {
+            bucket: Some("b".to_string()),
+            access_key_id: Some("k".to_string()),
+            secret_access_key: Some("s".to_string()),
+            endpoint: Some("https://e".to_string()),
+            ..Default::default()
+        });
+        assert!(cfg.is_cloud_enabled());
+
+        // Missing endpoint → not enabled.
+        cfg.storage.as_mut().unwrap().endpoint = None;
+        assert!(!cfg.is_cloud_enabled());
     }
 }

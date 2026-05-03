@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::core::cron::{CronDelivery, CronPayload, CronSchedule, CronService, CronStore};
+use crate::core::cron::{
+    CronCloudHandles, CronDelivery, CronPayload, CronSchedule, CronService, CronStore,
+};
 use crate::core::tools::{Tool, ToolContext, ToolResult};
 use crate::core::types::ToolDefinition;
 
@@ -12,10 +14,25 @@ impl CronTool {
         format!("{}/cron/jobs.json", data_dir)
     }
 
-    fn build_service(ctx: &ToolContext) -> CronService {
+    /// Build a CronStore with cloud strict-path attached when the
+    /// gateway plumbed cloud handles into ToolContext. None means the
+    /// store falls back to local-FS-only persistence.
+    fn build_store(ctx: &ToolContext) -> CronStore {
         let path = Self::build_store_path(&ctx.data_dir);
         let store = CronStore::new(path);
-        CronService::new(store)
+        match &ctx.cloud {
+            Some(cloud) => store.with_cloud(CronCloudHandles {
+                cache: cloud.cache.clone(),
+                store: cloud.store.clone(),
+                retry_max: cloud.retry_max,
+                backoff_cap_secs: cloud.backoff_cap_secs,
+            }),
+            None => store,
+        }
+    }
+
+    fn build_service(ctx: &ToolContext) -> CronService {
+        CronService::new(Self::build_store(ctx))
     }
 
     fn do_add(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {
@@ -60,7 +77,15 @@ impl CronTool {
         let delivery = CronDelivery { channel, chat_id };
 
         let mut service = Self::build_service(ctx);
-        let job = service.add_job(name.clone(), schedule, payload, delivery, delete_after_run);
+        let job = match service.add_job(name.clone(), schedule, payload, delivery, delete_after_run) {
+            Ok(j) => j,
+            Err(e) => {
+                return ToolResult::Error(format!(
+                    "Failed to persist cron job (cloud strict_put or local fs): {}",
+                    e
+                ));
+            }
+        };
 
         let next_info = match job.state.next_run_at_ms {
             Some(next) if next > now_ms => {
@@ -119,10 +144,13 @@ impl CronTool {
         };
 
         let mut service = Self::build_service(ctx);
-        if service.remove_job(job_id) {
-            ToolResult::Text(format!("Removed job {}", job_id))
-        } else {
-            ToolResult::Error(format!("Job {} not found", job_id))
+        match service.remove_job(job_id) {
+            Ok(true) => ToolResult::Text(format!("Removed job {}", job_id)),
+            Ok(false) => ToolResult::Error(format!("Job {} not found", job_id)),
+            Err(e) => ToolResult::Error(format!(
+                "Failed to persist cron removal (cloud strict_put or local fs): {}",
+                e
+            )),
         }
     }
 
@@ -204,13 +232,16 @@ impl CronTool {
         let name = updated.name.clone();
         let id = updated.id.clone();
 
-        // Write back through the store
-        let path = Self::build_store_path(&ctx.data_dir);
-        let mut store = CronStore::new(path);
-        if store.update(updated) {
-            ToolResult::Text(format!("Updated job '{}' ({})", name, id))
-        } else {
-            ToolResult::Error(format!("Failed to update job {}", id))
+        // Write back through the store. Build via the same factory as
+        // build_service so cloud strict-path is wired identically.
+        let mut store = Self::build_store(ctx);
+        match store.update(updated) {
+            Ok(true) => ToolResult::Text(format!("Updated job '{}' ({})", name, id)),
+            Ok(false) => ToolResult::Error(format!("Failed to update job {}", id)),
+            Err(e) => ToolResult::Error(format!(
+                "Failed to persist cron update (cloud strict_put or local fs): {}",
+                e
+            )),
         }
     }
 }

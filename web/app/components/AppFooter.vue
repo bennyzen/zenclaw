@@ -27,6 +27,15 @@ const uptime = computed(() => {
   return `${h}h ${m}m ${sec}s`
 })
 
+// `provider` carries the active preset slug (`<provider>__<slugified-model>`)
+// so the model fast-dial can match against saved presets. For display, strip
+// the suffix back to the bare provider name so the footer reads e.g.
+// "z-ai/glm-5.1" instead of "z-ai__glm-5-1/glm-5.1".
+const providerLabel = computed(() => {
+  const p = state.lastStatus?.provider
+  return p ? p.split('__')[0] : null
+})
+
 const tooltipUi = {
   content: 'flex-col items-stretch bg-elevated text-default shadow-lg rounded-md ring ring-default px-3 py-2 text-xs w-56 h-auto',
 }
@@ -115,7 +124,7 @@ const tooltipUi = {
 
       <span v-if="state.lastStatus?.model" class="cell text-muted">
         <UIcon name="i-lucide-bot" class="size-3 text-dimmed" />
-        {{ [state.lastStatus.provider, state.lastStatus.model].filter(Boolean).join('/') }}
+        {{ [providerLabel, state.lastStatus.model].filter(Boolean).join('/') }}
       </span>
 
       <UTooltip v-if="state.lastStatus?.temperatureC != null" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">

@@ -123,31 +123,37 @@ function scheduleReconnect() {
   }, reconnectDelay)
 }
 
-function mergeStats(raw: Record<string, any>) {
-  const partial = mapStatus(raw)
-  if (state.lastStatus) {
-    state.lastStatus = {
-      ...state.lastStatus,
-      memory: partial.memory,
-      temperatureC: partial.temperatureC,
-      wifi: partial.wifi,
-      storage: partial.storage,
-      uptimeS: partial.uptimeS,
-    }
-  }
+// Stats transport: WebSocket is primary, GET poll is fallback when WS is
+// down. The device serves the same payload on both transports (see the
+// shared build_status_payload in agent/src/main.rs and
+// agent/src/desktop/server.rs), so a single setStatus does a full
+// replace regardless of which channel delivered it. No per-field merge,
+// no flicker, no asymmetry.
+//
+// Spec: docs/superpowers/specs/2026-05-03-stats-transport-model.md.
+
+function setStatus(raw: Record<string, any>) {
+  state.lastStatus = mapStatus(raw)
 }
 
 let _pollFailCount = 0
+let wsRetryTimer: ReturnType<typeof setTimeout> | null = null
 
 function startStatsPoll() {
   if (statsPollTimer) return
   _pollFailCount = 0
   statsPollTimer = setInterval(async () => {
     if (!state.networkConnected) return
+    // If WS came back while we were polling, drop the poll and let the
+    // push handler take over.
+    if (statsWs?.readyState === WebSocket.OPEN) {
+      stopStatsPoll()
+      return
+    }
     try {
       const res = await fetch(`${baseUrl()}/api/status`, { signal: AbortSignal.timeout(10000) })
       if (res.ok) {
-        mergeStats(await res.json())
+        setStatus(await res.json())
         _pollFailCount = 0
       } else {
         _pollFailCount++
@@ -171,28 +177,38 @@ function stopStatsPoll() {
   }
 }
 
-function startStatsStream() {
-  // Always start HTTP polling as baseline
-  startStatsPoll()
-
-  // Try WebSocket for faster updates — fall back to polling if it fails
+function ensureStatsTransport() {
+  if (!state.networkConnected) return
   if (statsWs) return
   const url = `${wsUrl()}/ws/stats`
-  statsWs = new WebSocket(url)
-  statsWs.onmessage = (event) => {
-    try {
-      mergeStats(JSON.parse(event.data))
-    } catch { /* ignore parse errors */ }
+  const ws = new WebSocket(url)
+  statsWs = ws
+  ws.onopen = () => {
+    // WS is alive — drop the GET fallback.
+    stopStatsPoll()
+    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null }
   }
-  statsWs.onclose = () => {
+  ws.onmessage = (event) => {
+    try { setStatus(JSON.parse(event.data)) } catch { /* ignore parse errors */ }
+  }
+  ws.onclose = () => {
     statsWs = null
-    // Don't disconnect — polling keeps stats alive
+    if (!state.networkConnected) return
+    // WS dropped — start polling as fallback and keep retrying the WS.
+    startStatsPoll()
+    if (!wsRetryTimer) {
+      wsRetryTimer = setTimeout(() => {
+        wsRetryTimer = null
+        ensureStatsTransport()
+      }, 5000)
+    }
   }
-  statsWs.onerror = () => { statsWs?.close() }
+  ws.onerror = () => { ws.close() }
 }
 
 function stopStatsStream() {
   stopStatsPoll()
+  if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null }
   if (statsWs) {
     statsWs.close()
     statsWs = null
@@ -225,25 +241,10 @@ export function useConnection() {
       state.networkConnected = true
       state.connecting = false
       updateMode()
-      startStatsStream()
-
-      // Fill in model from config if status didn't include it
-      if (!state.lastStatus.model) {
-        try {
-          const cfgRes = await fetch(`${baseUrl()}/api/config`, { signal: AbortSignal.timeout(5000) })
-          if (cfgRes.ok) {
-            const cfg = await cfgRes.json()
-            const defaultProvider = cfg.providers?.default
-            if (defaultProvider && cfg.providers?.[defaultProvider]?.model) {
-              state.lastStatus = {
-                ...state.lastStatus!,
-                provider: state.lastStatus!.provider || defaultProvider,
-                model: cfg.providers[defaultProvider].model,
-              }
-            }
-          }
-        } catch { /* non-critical */ }
-      }
+      // Try the WS first; on failure it falls through to the GET poll.
+      // The /api/config fill-in for model is no longer needed — both
+      // transports now carry provider/model on every payload.
+      ensureStatsTransport()
     } catch (e) {
       state.networkConnected = false
       state.connecting = false

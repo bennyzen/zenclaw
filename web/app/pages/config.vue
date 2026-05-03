@@ -44,6 +44,10 @@ const BASE_URLS: Record<string, string> = {
   'bytedance-seed': 'https://ark.cn-beijing.volces.com/api/v3',
 }
 
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
 // --- Form fields ---
 const providerName = ref('google')
 const apiKey = ref('')
@@ -122,6 +126,74 @@ const filteredModels = computed(() => {
 
 const isCustomProvider = computed(() => providerName.value === 'custom')
 
+interface Preset {
+  slug: string
+  provider: string
+  model: string
+  baseUrl: string
+  isActive: boolean
+}
+
+const presets = computed<Preset[]>(() => {
+  const provs = rawConfig.value?.providers || {}
+  const defaultSlug = provs.default
+  return Object.entries(provs)
+    .filter(([k]) => k !== 'default')
+    .map(([slug, entry]: [string, any]) => ({
+      slug,
+      provider: slug.split('__')[0] || slug,
+      model: entry?.model || '',
+      baseUrl: entry?.base_url || '',
+      isActive: slug === defaultSlug,
+    }))
+    .sort((a, b) => a.slug.localeCompare(b.slug))
+})
+
+const switchOpen = ref(false)
+const switchTarget = ref<Preset | null>(null)
+const switching = ref(false)
+
+function openSwitch(p: Preset) {
+  if (p.isActive) return
+  error.value = null
+  switchTarget.value = p
+  switchOpen.value = true
+}
+
+async function confirmSwitch() {
+  const target = switchTarget.value
+  if (!target) return
+  switching.value = true
+  error.value = null
+  successMsg.value = null
+  try {
+    const config = {
+      ...rawConfig.value,
+      providers: { ...(rawConfig.value.providers || {}), default: target.slug },
+    }
+    await saveConfig(config)
+    rawConfig.value = config
+    const label = target.model ? `${target.provider} / ${target.model}` : target.provider
+    successMsg.value = `Switching to ${label}. Device is rebooting…`
+    switchOpen.value = false
+  } catch (e: any) {
+    error.value = `Switch failed: ${e.message}`
+  }
+  switching.value = false
+}
+
+function deletePreset(p: Preset, ev: Event) {
+  ev.stopPropagation()
+  if (p.isActive) return
+  const provs = { ...(rawConfig.value.providers || {}) }
+  delete provs[p.slug]
+  rawConfig.value = { ...rawConfig.value, providers: provs }
+}
+
+function stripScheme(url: string): string {
+  return url.replace(/^https?:\/\//, '')
+}
+
 watch(providerName, (name) => {
   if (BASE_URLS[name]) baseUrl.value = BASE_URLS[name]
 })
@@ -145,16 +217,18 @@ async function load() {
     const config = await getConfig()
     rawConfig.value = config
 
-    const defaultProvider = config.providers?.default || 'google'
-    const provider = config.providers?.[defaultProvider] || {}
+    const defaultSlug = config.providers?.default || 'google'
+    const provider = config.providers?.[defaultSlug] || {}
     apiKey.value = provider.api_key || ''
     model.value = provider.model || ''
     baseUrl.value = provider.base_url || ''
 
-    // Match to a known provider or fall back to custom
-    // Check both by name and by base_url
-    if (BASE_URLS[defaultProvider]) {
-      providerName.value = defaultProvider
+    // Slugs look like "openai__gpt-4o-mini" — strip the suffix to recover
+    // the provider identity. Legacy keys ("openai") have no suffix and
+    // pass through unchanged.
+    const providerKey = defaultSlug.split('__')[0] || 'google'
+    if (BASE_URLS[providerKey]) {
+      providerName.value = providerKey
     } else {
       const match = Object.entries(BASE_URLS).find(([, url]) => baseUrl.value.includes(url))
       providerName.value = match ? match[0] : 'custom'
@@ -235,13 +309,17 @@ async function save() {
   const config = { ...rawConfig.value }
 
   const prov = config.providers || {}
-  const key = isCustomProvider.value ? 'custom' : providerName.value
-  prov.default = key
-  const providerConfig = prov[key] || {}
+  const providerKey = isCustomProvider.value ? 'custom' : providerName.value
+  // Slug-derived key lets multiple presets coexist (openai__gpt-4o-mini,
+  // openai__gpt-5, etc.). Falls back to the bare provider name when the
+  // model is empty so the form still saves something usable.
+  const slug = model.value ? `${providerKey}__${slugify(model.value)}` : providerKey
+  prov.default = slug
+  const providerConfig = prov[slug] || {}
   providerConfig.api_key = apiKey.value
   providerConfig.model = model.value
   providerConfig.base_url = baseUrl.value
-  prov[key] = providerConfig
+  prov[slug] = providerConfig
   config.providers = prov
 
   config.agent_name = agentName.value
@@ -420,6 +498,49 @@ watch(() => state.networkConnected, (connected) => {
               <UFormField label="API Key" class="w-full">
                 <UInput v-model="apiKey" type="text" placeholder="API key" size="xl" class="w-full" />
               </UFormField>
+
+              <div v-if="presets.length" class="pt-6 border-t border-default">
+                <div class="flex items-center justify-between mb-3">
+                  <h3 class="text-sm font-medium">Saved Models</h3>
+                  <span class="text-xs text-dimmed">Click a card to switch</span>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div
+                    v-for="p in presets"
+                    :key="p.slug"
+                    role="button"
+                    :tabindex="p.isActive ? -1 : 0"
+                    :aria-disabled="p.isActive"
+                    class="text-left rounded-lg border p-3 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                    :class="p.isActive
+                      ? 'border-primary bg-primary/5 cursor-default'
+                      : 'border-default hover:border-primary/50 hover:bg-elevated cursor-pointer'"
+                    @click="openSwitch(p)"
+                    @keydown.enter.prevent="openSwitch(p)"
+                    @keydown.space.prevent="openSwitch(p)"
+                  >
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0 flex-1">
+                        <div class="flex items-center gap-1.5 mb-1">
+                          <span v-if="p.isActive" class="size-1.5 rounded-full bg-primary" />
+                          <span class="text-sm font-medium truncate">{{ p.provider }}</span>
+                        </div>
+                        <p class="text-xs text-muted truncate">{{ p.model || '—' }}</p>
+                        <p class="text-xs text-dimmed truncate font-mono">{{ stripScheme(p.baseUrl) || '—' }}</p>
+                      </div>
+                      <UButton
+                        icon="i-lucide-x"
+                        variant="ghost"
+                        color="neutral"
+                        size="xs"
+                        :disabled="p.isActive"
+                        :title="p.isActive ? 'Cannot delete the active preset' : 'Remove preset'"
+                        @click="(ev: Event) => deletePreset(p, ev)"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </template>
 
@@ -662,6 +783,36 @@ watch(() => state.networkConnected, (connected) => {
             </template>
           </UButton>
         </div>
+
+        <UModal v-model:open="switchOpen" title="Switch active model?">
+          <template #body>
+            <p class="text-sm text-default">
+              Switch the active model to
+              <span class="font-medium">{{ switchTarget?.model ? `${switchTarget.provider} / ${switchTarget.model}` : switchTarget?.provider }}</span>?
+            </p>
+            <p class="mt-3 text-sm text-muted">
+              The device will reboot to apply the change (~12 seconds offline).
+            </p>
+          </template>
+          <template #footer>
+            <div class="flex justify-end gap-2 w-full">
+              <UButton
+                label="Cancel"
+                variant="ghost"
+                color="neutral"
+                :disabled="switching"
+                @click="switchOpen = false"
+              />
+              <UButton
+                label="Switch & Reboot"
+                color="primary"
+                :loading="switching"
+                :disabled="switching"
+                @click="confirmSwitch"
+              />
+            </div>
+          </template>
+        </UModal>
       </template>
     </template>
   </div>

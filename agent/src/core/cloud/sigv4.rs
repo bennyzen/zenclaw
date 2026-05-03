@@ -54,7 +54,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(super) fn sha256_hex(data: &[u8]) -> String {
     hex_encode(&Sha256::digest(data))
 }
 

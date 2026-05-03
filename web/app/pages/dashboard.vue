@@ -161,8 +161,7 @@ onUnmounted(() => {
         <iframe
           :key="deviceFrameKey"
           :src="deviceUrl"
-          class="w-full rounded border border-default bg-black"
-          style="height: 200px"
+          class="h-[28rem] w-full rounded border border-default bg-black"
           @error="retryFrame"
         />
       </UCard>

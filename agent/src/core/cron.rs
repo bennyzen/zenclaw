@@ -1,7 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+use crate::core::cloud::client::ObjectStore;
+use crate::core::cloud::CloudCache;
+
+/// Cloud key for the agent's cron jobs file. Mirror of memory_tools'
+/// `MEMORY_CLOUD_KEY` — paired with the local-FS path `data/cron/jobs.json`.
+const CRON_CLOUD_KEY: &str = "sys/cron.json";
 
 /// Backoff schedule for consecutive errors (milliseconds).
 const ERROR_BACKOFF_SCHEDULE_MS: [u64; 5] = [30_000, 60_000, 300_000, 900_000, 3_600_000];
@@ -189,9 +197,22 @@ struct StoreFile {
     jobs: Vec<CronJob>,
 }
 
+/// Cloud handles that route cron writes through the strict path. When
+/// present, every `save()` updates the PSRAM cache, then synchronously
+/// PUTs to S3 (`sys/cron.json`) with retry, then writes the local file
+/// as a snapshot fallback. Mirrors `tools::CloudToolHandles` but defined
+/// here to keep `core::cron` independent of `core::tools`.
+pub struct CronCloudHandles {
+    pub cache: CloudCache,
+    pub store: Arc<dyn ObjectStore>,
+    pub retry_max: u8,
+    pub backoff_cap_secs: u32,
+}
+
 pub struct CronStore {
     path: String,
     jobs: HashMap<String, CronJob>,
+    cloud: Option<CronCloudHandles>,
 }
 
 impl CronStore {
@@ -199,9 +220,21 @@ impl CronStore {
         let mut store = Self {
             path,
             jobs: HashMap::new(),
+            cloud: None,
         };
         store.load();
         store
+    }
+
+    /// Attach cloud handles so subsequent saves go through the strict
+    /// path. Builder-style; intended to be chained right after `new`:
+    ///
+    /// ```ignore
+    /// let store = CronStore::new(path).with_cloud(handles);
+    /// ```
+    pub fn with_cloud(mut self, handles: CronCloudHandles) -> Self {
+        self.cloud = Some(handles);
+        self
     }
 
     fn load(&mut self) {
@@ -223,39 +256,57 @@ impl CronStore {
         }
     }
 
-    fn save(&self) {
-        // Ensure parent directory exists
-        if let Some(parent) = std::path::Path::new(&self.path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
+    /// Persist the current job set. In cloud mode: cache.put →
+    /// strict_put → local fs (matches memory_tools' write order). On
+    /// strict_put failure the error bubbles up; callers (`add`,
+    /// `remove`, `update`) roll back the in-memory mutation so the
+    /// next `save()` doesn't try to re-PUT a bad state.
+    fn save(&self) -> std::io::Result<()> {
         let sf = StoreFile {
             version: 1,
             jobs: self.jobs.values().cloned().collect(),
         };
-        match serde_json::to_string_pretty(&sf) {
-            Ok(data) => {
-                if let Err(e) = std::fs::write(&self.path, data) {
-                    warn!("Failed to write cron jobs file: {}", e);
-                }
-            }
-            Err(e) => warn!("Failed to serialize cron jobs: {}", e),
+        let data = serde_json::to_string_pretty(&sf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if let Some(cloud) = &self.cloud {
+            cloud.cache.put(CRON_CLOUD_KEY, data.as_bytes().to_vec());
+            crate::core::cloud::strict::strict_put(
+                &cloud.store,
+                CRON_CLOUD_KEY,
+                data.as_bytes(),
+                cloud.retry_max,
+                cloud.backoff_cap_secs,
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
+
+        if let Some(parent) = std::path::Path::new(&self.path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&self.path, &data)
     }
 
-    pub fn add(&mut self, job: CronJob) -> CronJob {
-        self.jobs.insert(job.id.clone(), job.clone());
-        self.save();
-        job
+    pub fn add(&mut self, job: CronJob) -> std::io::Result<CronJob> {
+        let id = job.id.clone();
+        self.jobs.insert(id.clone(), job.clone());
+        if let Err(e) = self.save() {
+            self.jobs.remove(&id);
+            return Err(e);
+        }
+        Ok(job)
     }
 
-    pub fn remove(&mut self, job_id: &str) -> bool {
-        if self.jobs.remove(job_id).is_some() {
-            self.save();
-            true
-        } else {
-            false
+    pub fn remove(&mut self, job_id: &str) -> std::io::Result<bool> {
+        let prev = match self.jobs.remove(job_id) {
+            Some(j) => j,
+            None => return Ok(false),
+        };
+        if let Err(e) = self.save() {
+            self.jobs.insert(prev.id.clone(), prev);
+            return Err(e);
         }
+        Ok(true)
     }
 
     pub fn get(&self, job_id: &str) -> Option<&CronJob> {
@@ -270,14 +321,18 @@ impl CronStore {
         self.jobs.values().collect()
     }
 
-    pub fn update(&mut self, job: CronJob) -> bool {
-        if self.jobs.contains_key(&job.id) {
-            self.jobs.insert(job.id.clone(), job);
-            self.save();
-            true
-        } else {
-            false
+    pub fn update(&mut self, job: CronJob) -> std::io::Result<bool> {
+        let prev = match self.jobs.get(&job.id) {
+            Some(p) => p.clone(),
+            None => return Ok(false),
+        };
+        let id = job.id.clone();
+        self.jobs.insert(id.clone(), job);
+        if let Err(e) = self.save() {
+            self.jobs.insert(id, prev);
+            return Err(e);
         }
+        Ok(true)
     }
 }
 
@@ -301,7 +356,7 @@ impl CronService {
         payload: CronPayload,
         delivery: CronDelivery,
         delete_after_run: bool,
-    ) -> CronJob {
+    ) -> std::io::Result<CronJob> {
         let now = epoch_ms();
         let mut job = CronJob {
             id: generate_id(),
@@ -320,7 +375,7 @@ impl CronService {
         self.store.add(job)
     }
 
-    pub fn remove_job(&mut self, job_id: &str) -> bool {
+    pub fn remove_job(&mut self, job_id: &str) -> std::io::Result<bool> {
         self.store.remove(job_id)
     }
 
@@ -380,7 +435,11 @@ impl CronService {
         }
 
         if delete_after_run && success {
-            self.store.remove(job_id);
+            // Background tick — surface the failure but don't propagate
+            // (no caller is waiting). Next save attempt may recover.
+            if let Err(e) = self.store.remove(job_id) {
+                warn!("CRON: persist (remove) failed for {}: {}", job_id, e);
+            }
         } else {
             // Recompute next run
             let job = self.store.get_mut(job_id).unwrap();
@@ -400,7 +459,9 @@ impl CronService {
 
             job.updated_at_ms = now;
             let updated = job.clone();
-            self.store.update(updated);
+            if let Err(e) = self.store.update(updated) {
+                warn!("CRON: persist (update) failed for {}: {}", job_id, e);
+            }
         }
     }
 }
@@ -572,7 +633,7 @@ mod tests {
             created_at_ms: 1000,
             updated_at_ms: 1000,
         };
-        store.add(job);
+        store.add(job).unwrap();
 
         assert_eq!(store.list().len(), 1);
         assert_eq!(store.get("test-1").unwrap().name, "Test Job");
@@ -605,12 +666,12 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         };
-        store.add(job);
+        store.add(job).unwrap();
         assert_eq!(store.list().len(), 1);
 
-        assert!(store.remove("rm-1"));
+        assert!(store.remove("rm-1").unwrap());
         assert_eq!(store.list().len(), 0);
-        assert!(!store.remove("rm-1")); // already gone
+        assert!(!store.remove("rm-1").unwrap()); // already gone
     }
 
     #[test]
@@ -642,5 +703,137 @@ mod tests {
         let json = serde_json::to_string(&every).unwrap();
         let back: CronSchedule = serde_json::from_str(&json).unwrap();
         assert_eq!(back.compute_next_run(3000), Some(5000));
+    }
+
+    // ---------------------------------------------------------------
+    // Cloud strict-path wiring
+    // ---------------------------------------------------------------
+
+    use crate::core::cloud::client::Result as ClientResult;
+    use crate::core::cloud::client::S3Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Same minimal fake the strict_put + replicator tests use. Tracks
+    /// puts; `fail_next_n` makes the next N PUTs fail without recording.
+    struct FakeStore {
+        puts: Mutex<Vec<(String, Vec<u8>)>>,
+        fail_for: AtomicUsize,
+    }
+    impl FakeStore {
+        fn new() -> Self {
+            Self { puts: Mutex::new(vec![]), fail_for: AtomicUsize::new(0) }
+        }
+        fn fail_next_n(&self, n: usize) {
+            self.fail_for.store(n, Ordering::SeqCst);
+        }
+        fn put_count(&self) -> usize {
+            self.puts.lock().unwrap().len()
+        }
+        fn last_put(&self) -> Option<(String, Vec<u8>)> {
+            self.puts.lock().unwrap().last().cloned()
+        }
+    }
+    impl ObjectStore for FakeStore {
+        fn put(&self, key: &str, bytes: &[u8]) -> ClientResult<()> {
+            if self.fail_for.load(Ordering::SeqCst) > 0 {
+                self.fail_for.fetch_sub(1, Ordering::SeqCst);
+                return Err(S3Error("fake".to_string()));
+            }
+            self.puts.lock().unwrap().push((key.to_string(), bytes.to_vec()));
+            Ok(())
+        }
+        fn get(&self, _: &str) -> ClientResult<Vec<u8>> { unimplemented!() }
+        fn delete(&self, _: &str) -> ClientResult<()> { Ok(()) }
+        fn head(&self, _: &str) -> ClientResult<Option<u64>> { Ok(None) }
+    }
+
+    fn sample_job(id: &str) -> CronJob {
+        CronJob {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            enabled: true,
+            delete_after_run: false,
+            schedule: CronSchedule::at(99_999_999),
+            payload: CronPayload::AgentTurn { text: "hi".into() },
+            delivery: CronDelivery::default(),
+            state: CronJobState::default(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    fn cloud_handles(fake: Arc<FakeStore>) -> CronCloudHandles {
+        CronCloudHandles {
+            cache: CloudCache::new(),
+            store: fake as Arc<dyn ObjectStore>,
+            retry_max: 0,
+            backoff_cap_secs: 1,
+        }
+    }
+
+    #[test]
+    fn cloud_save_writes_to_strict_put_and_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let fake = Arc::new(FakeStore::new());
+        let cache = CloudCache::new();
+        let mut store = CronStore::new(path.to_string_lossy().to_string()).with_cloud(
+            CronCloudHandles {
+                cache: cache.clone(),
+                store: fake.clone() as Arc<dyn ObjectStore>,
+                retry_max: 0,
+                backoff_cap_secs: 1,
+            },
+        );
+
+        store.add(sample_job("job-1")).expect("add succeeds");
+
+        // Strict PUT happened to the canonical key.
+        assert_eq!(fake.put_count(), 1);
+        let (key, bytes) = fake.last_put().unwrap();
+        assert_eq!(key, CRON_CLOUD_KEY);
+        // Cache is populated with the same bytes.
+        let cached = cache.get(CRON_CLOUD_KEY).expect("cache hit");
+        assert_eq!(cached, bytes);
+        // Local file was also written (snapshot fallback).
+        assert!(path.exists(), "local snapshot must exist");
+    }
+
+    #[test]
+    fn cloud_save_failure_rolls_back_in_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let fake = Arc::new(FakeStore::new());
+        fake.fail_next_n(5); // exceeds retry_max=0 (1 attempt total)
+
+        let mut store = CronStore::new(path.to_string_lossy().to_string())
+            .with_cloud(cloud_handles(fake.clone()));
+
+        let err = store.add(sample_job("job-1")).expect_err("strict_put must fail");
+        assert!(err.to_string().contains("fake"));
+        // Roll back: the job is *not* in the in-memory store.
+        assert_eq!(store.list().len(), 0);
+        // No local file on failure (we bail before fs::write).
+        assert!(!path.exists(), "local file must not appear on cloud failure");
+    }
+
+    #[test]
+    fn cloud_remove_failure_restores_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.json");
+        let fake = Arc::new(FakeStore::new());
+
+        let mut store = CronStore::new(path.to_string_lossy().to_string())
+            .with_cloud(cloud_handles(fake.clone()));
+        store.add(sample_job("keep-me")).expect("seed add");
+
+        // Now make the next PUT fail.
+        fake.fail_next_n(5);
+        let err = store.remove("keep-me").expect_err("remove must fail");
+        assert!(err.to_string().contains("fake"));
+        // Job is back in the store.
+        assert!(store.get("keep-me").is_some(), "rollback must restore the job");
     }
 }

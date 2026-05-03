@@ -48,30 +48,36 @@ const connectedName = computed(() => {
     </div>
 
     <div class="grid gap-4 sm:grid-cols-2">
-      <UCard>
-        <div class="space-y-3">
-          <div class="flex items-center gap-2">
-            <UIcon name="i-lucide-plus-circle" class="text-primary" />
-            <h3 class="font-semibold">Provision a new device</h3>
+      <UCard class="h-full" :ui="{ body: 'h-full' }">
+        <div class="flex h-full flex-col gap-3">
+          <div class="flex-1 space-y-3">
+            <div class="flex items-center gap-2">
+              <UIcon name="i-lucide-plus-circle" class="text-primary" />
+              <h3 class="font-semibold">Provision a new device</h3>
+            </div>
+            <p class="text-sm text-muted">
+              Flash firmware and configure a new ESP32-S3 or ESP32-P4 from your
+              browser using Web Serial.
+            </p>
           </div>
-          <p class="text-sm text-muted">
-            Flash firmware and configure a new ESP32-S3 or ESP32-P4 from your
-            browser using Web Serial.
-          </p>
-          <UButton to="/provision" label="Get Started" icon="i-lucide-arrow-right" trailing />
+          <div>
+            <UButton to="/provision" label="Get Started" icon="i-lucide-arrow-right" trailing />
+          </div>
         </div>
       </UCard>
 
-      <UCard>
-        <div v-if="state.networkConnected" class="space-y-3">
-          <div class="flex items-center gap-2">
-            <UIcon name="i-lucide-plug-zap" class="text-green-400" />
-            <h3 class="font-semibold">Connected</h3>
+      <UCard class="h-full" :ui="{ body: 'h-full' }">
+        <div v-if="state.networkConnected" class="flex h-full flex-col gap-3">
+          <div class="flex-1 space-y-3">
+            <div class="flex items-center gap-2">
+              <UIcon name="i-lucide-plug-zap" class="text-green-400" />
+              <h3 class="font-semibold">Connected</h3>
+            </div>
+            <p class="text-sm text-muted">
+              Talking to <span class="font-mono text-default">{{ connectedName }}</span>.
+              Disconnect to switch to another device.
+            </p>
           </div>
-          <p class="text-sm text-muted">
-            Talking to <span class="font-mono text-default">{{ connectedName }}</span>.
-            Disconnect to switch to another device.
-          </p>
           <div class="flex gap-2">
             <UButton
               to="/dashboard"
@@ -88,38 +94,42 @@ const connectedName = computed(() => {
             />
           </div>
         </div>
-        <div v-else class="space-y-3">
-          <div class="flex items-center gap-2">
-            <UIcon name="i-lucide-plug" class="text-primary" />
-            <h3 class="font-semibold">Connect to device</h3>
+        <div v-else class="flex h-full flex-col gap-3">
+          <div class="flex-1 space-y-3">
+            <div class="flex items-center gap-2">
+              <UIcon name="i-lucide-plug" class="text-primary" />
+              <h3 class="font-semibold">Connect to device</h3>
+            </div>
+            <p class="text-sm text-muted">
+              Enter your device hostname to connect over your local network.
+            </p>
           </div>
-          <p class="text-sm text-muted">
-            Enter your device hostname to connect over your local network.
-          </p>
-          <div class="flex gap-2">
-            <UInput
-              v-model="hostname"
-              placeholder="zenclaw-wild-crow"
-              :disabled="state.connecting"
-              class="flex-1"
-              @keydown.enter="connect"
-            >
-              <template v-if="!hostname.includes('.') && !hostname.includes(':')" #trailing>
-                <span class="text-xs text-dimmed">.local</span>
-              </template>
-            </UInput>
-            <UButton
-              :label="state.connecting ? undefined : 'Connect'"
-              :disabled="state.connecting || !hostname"
-              @click="connect"
-            >
-              <template #leading>
-                <UIcon v-if="state.connecting" name="i-lucide-loader-circle" class="animate-spin" />
-                <UIcon v-else name="i-lucide-plug" />
-              </template>
-            </UButton>
+          <div class="space-y-2">
+            <div class="flex gap-2">
+              <UInput
+                v-model="hostname"
+                placeholder="zenclaw-wild-crow"
+                :disabled="state.connecting"
+                class="flex-1"
+                @keydown.enter="connect"
+              >
+                <template v-if="!hostname.includes('.') && !hostname.includes(':')" #trailing>
+                  <span class="text-xs text-dimmed">.local</span>
+                </template>
+              </UInput>
+              <UButton
+                :label="state.connecting ? undefined : 'Connect'"
+                :disabled="state.connecting || !hostname"
+                @click="connect"
+              >
+                <template #leading>
+                  <UIcon v-if="state.connecting" name="i-lucide-loader-circle" class="animate-spin" />
+                  <UIcon v-else name="i-lucide-plug" />
+                </template>
+              </UButton>
+            </div>
+            <p v-if="state.error" class="text-xs text-red-400">{{ state.error }}</p>
           </div>
-          <p v-if="state.error" class="text-xs text-red-400">{{ state.error }}</p>
         </div>
       </UCard>
     </div>
