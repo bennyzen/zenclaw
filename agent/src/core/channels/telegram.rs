@@ -106,6 +106,45 @@ impl Poller {
 
         Ok(messages)
     }
+
+    /// Register the bot's command list with Telegram.
+    ///
+    /// Idempotent — calling on every boot with the same payload is fine.
+    /// Failures are non-fatal: caller should log and continue.
+    pub async fn set_my_commands(
+        &self,
+        http: &dyn HttpClient,
+        commands: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "https://api.telegram.org/bot{}/setMyCommands",
+            self.bot_token,
+        );
+        let payload = serde_json::json!({
+            "commands": commands
+                .iter()
+                .map(|(name, desc)| serde_json::json!({
+                    "command": name,
+                    "description": desc,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let body = serde_json::to_vec(&payload)?;
+
+        let mut headers = Headers::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+
+        let resp = http.post(&url, &headers, &body).await?;
+        if resp.status < 200 || resp.status >= 300 {
+            return Err(format!(
+                "Telegram setMyCommands HTTP {}: {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 pub struct TelegramChannel {
@@ -513,5 +552,42 @@ mod tests {
         let body = parse_body_json(&reqs[0]);
         assert_eq!(body["chat_id"], "99");
         assert_eq!(body["action"], "typing");
+    }
+
+    // ───────── Poller::set_my_commands tests ─────────
+
+    #[tokio::test]
+    async fn set_my_commands_posts_correct_url_and_body() {
+        let http = MockHttpClient::new();
+        http.push_response(200, r#"{"ok":true,"result":true}"#);
+
+        let p = Poller::new("TOKEN".to_string());
+        let cmds = &[
+            ("new",    "Start a fresh chat"),
+            ("clear",  "Wipe history"),
+        ];
+        p.set_my_commands(&http, cmds).await.unwrap();
+
+        let reqs = http.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert!(reqs[0].url.contains("/setMyCommands"),
+            "URL was: {}", reqs[0].url);
+
+        let body = parse_body_json(&reqs[0]);
+        let arr = body["commands"].as_array().expect("commands array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["command"], "new");
+        assert_eq!(arr[0]["description"], "Start a fresh chat");
+    }
+
+    #[tokio::test]
+    async fn set_my_commands_non_200_errors() {
+        let http = MockHttpClient::new();
+        http.push_response(429, r#"{"ok":false,"description":"Too Many Requests"}"#);
+
+        let p = Poller::new("TOKEN".to_string());
+        let result = p.set_my_commands(&http, &[("ping", "Test")]).await;
+        assert!(result.is_err(), "non-200 should bubble as Err");
     }
 }
