@@ -35,7 +35,7 @@ Four commands. Two of them are aliases for the same operation, kept because both
 | Command | Action |
 |---|---|
 | `/new` | Alias for `/clear`. |
-| `/clear` | Wipe `data/sessions/{chat_id}.jsonl`. Drop any cached message history in `SessionState`. **Preserve** `model_override` and other non-history settings on `SessionState` — the user's model fast-dial survives a clear. May require a new `SessionManager::clear_history(chat_id)` method that wipes JSONL + cached entries while leaving the rest of `SessionState` intact. |
+| `/clear` | Wipe the session for `chat_id`. **Preserves** `SessionState` (so `model_override` and the user's fast-dial survives). The existing `SessionManager::clear()` already preserves state — it only removes the JSONL file — but its current local-file-only impl silently no-ops in cloud mode. We extend it to also drop matching keys from `CloudCache` and (when `Some`) issue best-effort `ObjectStore::list_keys` + `delete` to wipe S3 too. |
 | `/status` | Render a markdown table of live device facts (hostname, IP, link, heap, RSSI, uptime, model, session size). Pulls from real platform sources, fixing the `platform: unknown` bug. |
 | `/help` | Static markdown bullet list of available commands and what they do. |
 
@@ -98,13 +98,26 @@ pub struct RuntimeFacts {
 
 A pure data struct — easy to populate in tests, easy to extend (add a field, both call sites either fill it or set `None`). The `platform` field replaces the broken `cfg!(target_os = ...)` ladder in `session_tools.rs::do_status` — that bug is the whole reason this design exists.
 
-Population sites:
+Stable fields (`agent_name`, `platform`) live in `RuntimeFacts` directly; live fields (`ip`, `link`, heaps, `uptime_secs`) come from a small trait so the platform-specific reads don't leak into `commands.rs` itself.
 
-- **ESP32 `main.rs`** — passes mDNS handle, NIC handle, hostname, IP into `Gateway`. New helper `Gateway::runtime_facts(chat_id)` reads them and adds session/model values it already owns. Heap via `esp_idf_svc::sys::esp_get_free_heap_size()` and `heap_caps_get_free_size(MALLOC_CAP_SPIRAM)` — same calls used by the existing `/api/status` handler.
-- **Desktop `run.rs`** — populates the same struct with desktop-shaped values: `link = LinkKind::Desktop`, heap fields = `None`, hostname from config or `"desktop"`.
-- **Tests** — populate directly. No IO needed.
+```rust
+pub trait HostFacts: Send + Sync {
+    fn hostname(&self) -> String;
+    fn ip(&self) -> Option<String>;
+    fn link(&self) -> LinkKind;
+    fn free_internal_heap(&self) -> Option<u32>;
+    fn free_psram(&self) -> Option<u32>;
+    fn uptime_secs(&self) -> u64;
+}
+```
 
-A trait-based alternative (`runtime_facts() -> impl RuntimeFactsProvider`) was considered and rejected — over-abstracted for one consumer.
+`Gateway` gains an `Arc<dyn HostFacts>` field, populated at construction by `main.rs` (ESP32) or `desktop/run.rs` (desktop). `Gateway::runtime_facts(chat_id)` calls into the trait and assembles the full `RuntimeFacts` using session size + model resolution it already owns.
+
+Backends:
+
+- `Esp32HostFacts` (in `main.rs`, gated `#[cfg(feature = "esp32")]`) — captures `Arc<EspMdns>` + `Arc<dyn Nic>` (or analogous handles) at boot and reads heap via `esp_get_free_heap_size()` / `heap_caps_get_free_size(MALLOC_CAP_SPIRAM)`. Same calls the existing `/api/status` handler uses.
+- `DesktopHostFacts` (in `desktop/host_facts.rs`) — `link = LinkKind::Desktop`, heaps = `None`, ip from a captured optional string.
+- `FakeHostFacts` (test-only, in `commands.rs::tests`) — canned values for unit tests of `execute()`.
 
 ### Hook point in `gateway.rs`
 
@@ -219,15 +232,17 @@ Reuse the recorded-HTTP-mock pattern at `telegram.rs:227+`. One new test asserti
 
 **New files:**
 - `agent/src/core/commands.rs`
-- (No new web/desktop frontend files — web UI changes are zero in v1.)
+- `agent/src/desktop/host_facts.rs` — `DesktopHostFacts` impl.
+- (No new web frontend files — web UI changes are zero in v1.)
 
 **Modified files:**
 - `agent/src/core/mod.rs` — add `pub mod commands;`
-- `agent/src/core/gateway.rs` — slash-command interception in `chat_with_events`; add `runtime_facts(chat_id)` helper.
-- `agent/src/core/sessions/...` — likely add `SessionManager::clear_history(chat_id)` (wipes JSONL + cached entries, preserves `model_override` and other `SessionState` fields).
+- `agent/src/core/gateway.rs` — add `host_facts: Arc<dyn HostFacts>` field; slash-command interception in `chat_with_events`; add `runtime_facts(chat_id)` helper.
+- `agent/src/core/sessions/mod.rs` — extend `clear()` to handle cloud mode (cache key wipe + best-effort S3 delete).
 - `agent/src/core/channels/telegram.rs` — add `Poller::set_my_commands` + tests.
-- `agent/src/desktop/run.rs` — call `set_my_commands` on poller startup.
-- `agent/src/main.rs` — call `set_my_commands` on ESP32 telegram thread startup; populate `RuntimeFacts` source values into `Gateway` at construction.
+- `agent/src/desktop/mod.rs` — add `pub mod host_facts;`.
+- `agent/src/desktop/run.rs` — build `DesktopHostFacts`; pass into `Gateway`; call `set_my_commands` on poller startup.
+- `agent/src/main.rs` — implement `Esp32HostFacts`; pass into `Gateway`; call `set_my_commands` on ESP32 telegram thread startup.
 
 ## Out of v1 Scope (Tracked Follow-ups)
 
