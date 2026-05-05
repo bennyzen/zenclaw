@@ -32,6 +32,8 @@ Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome
 2. **Flash** — The browser flashes the firmware image and an NVS partition (device hostname + WiFi creds) in one shot via Web Serial. No CLI tools, no manual file copying
 3. **Connect** — The device boots, joins the network (WiFi for S3, Ethernet for P4), and appears at `<devicename>.local`. The wizard pushes the LLM provider config automatically
 
+> **Privacy**: Everything you type in the wizard stays between your browser and your ESP32. The wizard is a static page on GitHub Pages — no analytics, no telemetry, no third-party servers. WiFi credentials are flashed directly over the USB cable into the device's NVS partition; the API key is POSTed only to the device on your local network. The single outbound request the wizard makes is to `openrouter.ai/api/v1/models` to populate the model-name dropdown, and it carries no user data. Safe to paste your real API key.
+
 Done. The device is running at `http://<devicename>.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
 
 For developers building from source, see [`agent/`](agent/) and [`CLAUDE.md`](CLAUDE.md) for board manifests, build commands, and Rust architecture.
