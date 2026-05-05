@@ -6,11 +6,11 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path as AxumPath, Query, State,
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -52,6 +52,12 @@ pub async fn start_api_server(state: AppState, port: u16) {
         .route("/api/chat", post(api_chat))
         .route("/api/chat/cancel", post(api_chat_cancel))
         .route("/api/chat/history", get(api_chat_history))
+        // Sessions (multi-conversation sidebar)
+        .route("/api/sessions", get(api_sessions_list).post(api_sessions_create))
+        .route(
+            "/api/sessions/:id",
+            patch(api_sessions_patch).delete(api_sessions_delete),
+        )
         // Config & WiFi
         .route("/api/config", get(api_config_get).put(api_config_put))
         .route("/api/wifi", get(api_wifi_get).put(api_wifi_put))
@@ -639,6 +645,77 @@ async fn api_files_upload(
             Json(json!({"error": format!("Cannot upload file: {}", e)})),
         )
             .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions (multi-conversation sidebar)
+// ---------------------------------------------------------------------------
+
+async fn api_sessions_list(State(state): State<AppState>) -> Response {
+    let mut sessions = state.gateway.sessions.list_with_meta();
+    sessions.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+    Json(sessions).into_response()
+}
+
+async fn api_sessions_create(State(state): State<AppState>) -> Response {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let chat_id = format!("chat-{}", now_ms);
+    let meta =
+        crate::core::sessions::meta::SessionMeta::synthesize_default(&chat_id, now_ms, None);
+    if let Err(e) = state.gateway.sessions.set_meta(&chat_id, &meta) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("set_meta: {}", e),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"chatId": chat_id, "meta": meta})),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PatchSessionBody {
+    title: String,
+}
+
+async fn api_sessions_patch(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PatchSessionBody>,
+) -> Response {
+    match state.gateway.sessions.rename(&id, &body.title) {
+        Ok(meta) => Json(meta).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, format!("not found: {}", id)).into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn api_sessions_delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let result = match state.gateway.cloud_store.as_ref() {
+        Some(s) => state
+            .gateway
+            .sessions
+            .delete_with_store(&id, s.as_ref() as &dyn crate::core::cloud::client::ObjectStore),
+        None => state.gateway.sessions.delete(&id),
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
