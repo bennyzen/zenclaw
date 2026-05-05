@@ -55,7 +55,7 @@ pub async fn start_api_server(state: AppState, port: u16) {
         // Sessions (multi-conversation sidebar)
         .route("/api/sessions", get(api_sessions_list).post(api_sessions_create))
         .route(
-            "/api/sessions/:id",
+            "/api/sessions/{id}",
             patch(api_sessions_patch).delete(api_sessions_delete),
         )
         // Config & WiFi
@@ -673,6 +673,7 @@ async fn api_sessions_create(State(state): State<AppState>) -> Response {
         )
             .into_response();
     }
+    tracing::info!(chat_id = %chat_id, "Session created");
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"chatId": chat_id, "meta": meta})),
@@ -691,7 +692,10 @@ async fn api_sessions_patch(
     Json(body): Json<PatchSessionBody>,
 ) -> Response {
     match state.gateway.sessions.rename(&id, &body.title) {
-        Ok(meta) => Json(meta).into_response(),
+        Ok(meta) => {
+            tracing::info!(chat_id = %id, title = %body.title, "Session renamed");
+            Json(meta).into_response()
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, format!("not found: {}", id)).into_response()
         }
@@ -714,7 +718,10 @@ async fn api_sessions_delete(
         None => state.gateway.sessions.delete(&id),
     };
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            tracing::info!(chat_id = %id, "Session deleted");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
