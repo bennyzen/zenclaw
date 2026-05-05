@@ -4,6 +4,8 @@
 
 # ZenClaw
 
+> **Runs on 0.5 watts. Always on. Always yours.**
+
 A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) is designed to protect your data from flash wear and reflashes (transparent replication is on the [Roadmap](#roadmap); the S3 client and signer ship today). Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
 
 ## Features
