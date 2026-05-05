@@ -202,6 +202,49 @@ impl SessionManager {
         }
     }
 
+    /// Write the metadata sidecar. In cloud mode: PSRAM cache update +
+    /// eager-drainer enqueue (matches `append_via_cloud`). Always
+    /// writes the local sidecar file. Cloud failures don't propagate
+    /// here — the drainer's dead-letter queue surfaces persistent
+    /// problems; this call returns once the cache + local fs are
+    /// updated.
+    ///
+    /// Returns Err on serialization failure or local fs.write failure
+    /// when cloud is NOT enabled (in cloud mode, local-fs failure logs
+    /// a warning and returns Ok — the cache is the source of truth and
+    /// boot-restore re-syncs from S3).
+    pub fn set_meta(
+        &self,
+        chat_id: &str,
+        meta: &crate::core::sessions::meta::SessionMeta,
+    ) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if let (Some(cache), Some(replicator)) = (&self.cache, &self.replicator) {
+            let key = Self::cloud_sidecar_key(chat_id);
+            cache.put(&key, bytes.clone());
+            replicator.enqueue(key, bytes.clone());
+        }
+
+        let path = self.meta_path(chat_id);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) if self.cache.is_some() => {
+                tracing::warn!(
+                    "set_meta local write failed for {}: {} (cloud is canonical)",
+                    chat_id,
+                    e
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// On-disk byte size of the session JSONL, or None if it doesn't exist.
     /// In cloud mode, returns the sum of `base.jsonl` plus all unabsorbed
     /// `log-NN.jsonl` bytes for this chat — i.e. the materialized view.
@@ -258,6 +301,13 @@ impl SessionManager {
 
     fn cloud_meta_key(chat_id: &str) -> String {
         format!("{}base.meta.json", Self::cloud_prefix(chat_id))
+    }
+
+    /// Per-session metadata sidecar key (`sys/sessions/<id>/meta.json`).
+    /// Distinct from `cloud_meta_key` which targets the JSONL-base
+    /// compaction marker (`base.meta.json`).
+    fn cloud_sidecar_key(chat_id: &str) -> String {
+        format!("{}meta.json", Self::cloud_prefix(chat_id))
     }
 
     fn cloud_log_key(chat_id: &str, idx: u32) -> String {
@@ -1161,6 +1211,29 @@ mod tests {
         let mgr = SessionManager::new(dir.path().to_str().unwrap());
         let loaded = mgr.meta("chat-1").unwrap().unwrap();
         assert_eq!(loaded, m);
+    }
+
+    #[test]
+    fn set_meta_writes_local_when_no_cloud() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let m = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &m).unwrap();
+        assert_eq!(mgr.meta("chat-1").unwrap().unwrap(), m);
+    }
+
+    #[test]
+    fn set_meta_overwrites_existing_sidecar() {
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let mut m = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &m).unwrap();
+        m.title = "Renamed".into();
+        m.title_source = TitleSource::User;
+        mgr.set_meta("chat-1", &m).unwrap();
+        assert_eq!(mgr.meta("chat-1").unwrap().unwrap().title, "Renamed");
     }
 
     #[test]
