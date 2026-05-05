@@ -369,6 +369,16 @@ impl Gateway {
 
         try_send(events, ChatEvent::Done);
 
+        // Sidebar maintenance: update lastActivityMs and lastMessagePreview
+        // so the conversations list reflects this turn on the next refresh.
+        // Best-effort — bump_activity logs but doesn't propagate failures;
+        // the user's reply has already gone out.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.sessions.bump_activity(chat_id, &result, now_ms);
+
         Ok(result)
     }
 
