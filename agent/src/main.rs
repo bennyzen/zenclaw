@@ -510,6 +510,7 @@ fn bootstrap_cloud(
         log_compaction_bytes: storage.log_compaction_bytes,
         device_id: hostname.to_string(),
         heartbeat_stale_secs: 3600,
+        sessions_dir: Some(format!("{}/sessions", data_dir)),
     };
     match boot_restore(&store, &cache, &boot_cfg) {
         Ok(result) => {

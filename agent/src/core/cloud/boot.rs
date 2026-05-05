@@ -64,6 +64,13 @@ pub struct BootConfig {
     /// Heartbeat staleness window. A heartbeat from a *different* device
     /// is treated as a conflict only if newer than `now - this`.
     pub heartbeat_stale_secs: i64,
+    /// Local sessions directory (e.g. `/data/sessions`). When set, the
+    /// boot-restore materializes each chat's `base.jsonl` and `meta.json`
+    /// from the cache to local disk so `SessionManager::list_with_meta`
+    /// (which walks the directory for `*.jsonl`) finds the restored
+    /// chats. None disables materialization (used by tests that don't
+    /// care about the local fs side).
+    pub sessions_dir: Option<String>,
 }
 
 impl Default for BootConfig {
@@ -73,6 +80,7 @@ impl Default for BootConfig {
             log_compaction_bytes: 16_384,
             device_id: "unknown".to_string(),
             heartbeat_stale_secs: 3600,
+            sessions_dir: None,
         }
     }
 }
@@ -116,6 +124,45 @@ pub fn boot_restore(
     for key in ["sys/SOUL.md", "sys/AGENTS.md"] {
         if let Ok(bytes) = store.get(key) {
             cache.put(key, bytes);
+        }
+    }
+
+    // Step 8b: Materialize session keys from cache to local fs.
+    // In cloud mode, append_via_cloud only updates the cache, so the local
+    // sessions_dir would be empty after a fresh boot — list_with_meta walks
+    // it for *.jsonl files and would find nothing. We write base.jsonl +
+    // meta.json (only those two — log-NN.jsonl is in-cache and folds into
+    // base on next compaction; the local files are a sidebar-rendering
+    // snapshot, not a complete replica of session state).
+    if let Some(sessions_dir) = &cfg.sessions_dir {
+        let _ = std::fs::create_dir_all(sessions_dir);
+        for key in cache.keys_with_prefix("sys/sessions/") {
+            let Some(rest) = key.strip_prefix("sys/sessions/") else {
+                continue;
+            };
+            // Split into <chat_id>/<filename>.
+            let mut parts = rest.splitn(2, '/');
+            let chat_id = match parts.next() {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let suffix = parts.next().unwrap_or("");
+            let local_filename = match suffix {
+                "base.jsonl" => format!("{}.jsonl", chat_id),
+                "meta.json" => format!("{}.meta.json", chat_id),
+                _ => continue, // skip log-NN.jsonl, .quarantine/*, base.meta.json compaction marker
+            };
+            let local_path = format!("{}/{}", sessions_dir, local_filename);
+            if let Some(bytes) = cache.get(&key) {
+                if let Err(e) = std::fs::write(&local_path, &bytes) {
+                    tracing::warn!(
+                        "boot_restore: materialize {} -> {} failed: {}",
+                        key,
+                        local_path,
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -439,6 +486,7 @@ mod tests {
             log_compaction_bytes: 64,
             device_id: "device-aaaaaa".to_string(),
             heartbeat_stale_secs: 3600,
+            sessions_dir: None,
         }
     }
 
@@ -621,5 +669,59 @@ mod tests {
         ];
         let ids = unique_chat_ids(&keys);
         assert_eq!(ids, vec!["telegram-1".to_string(), "web".to_string()]);
+    }
+
+    #[test]
+    fn materializes_base_and_meta_to_local_fs_when_sessions_dir_set() {
+        let fake = FakeStore::new();
+        let base = format!("{}\n{}\n", jsonl_line("m1"), jsonl_line("m2"));
+        let meta = br#"{"chatId":"web","kind":"web","title":"T","titleSource":"user","createdAtMs":1,"lastActivityMs":2,"lastMessagePreview":"","version":1}"#.to_vec();
+        let log = format!("{}\n", jsonl_line("m3"));
+        fake.seed("sys/sessions/web/base.jsonl", base.into_bytes());
+        fake.seed("sys/sessions/web/meta.json", meta);
+        fake.seed("sys/sessions/web/log-00.jsonl", log.into_bytes());
+
+        let store: Arc<dyn ObjectStore> = Arc::new(fake);
+        let cache = CloudCache::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bc = cfg();
+        bc.sessions_dir = Some(dir.path().to_str().unwrap().to_string());
+
+        let result = boot_restore(&store, &cache, &bc).unwrap();
+        assert!(result.warnings.is_empty());
+
+        // Materialized: base.jsonl and meta.json in standard local fs form.
+        let base_local = dir.path().join("web.jsonl");
+        let meta_local = dir.path().join("web.meta.json");
+        assert!(base_local.exists(), "expected web.jsonl materialized");
+        assert!(meta_local.exists(), "expected web.meta.json materialized");
+
+        // Content matches.
+        let base_bytes = std::fs::read(&base_local).unwrap();
+        assert!(String::from_utf8_lossy(&base_bytes).contains("m1"));
+        let meta_bytes = std::fs::read(&meta_local).unwrap();
+        assert!(String::from_utf8_lossy(&meta_bytes).contains("\"chatId\":\"web\""));
+
+        // log-NN.jsonl is intentionally NOT materialized — only base + meta.
+        assert!(!dir.path().join("web.log-00.jsonl").exists());
+    }
+
+    #[test]
+    fn no_materialization_when_sessions_dir_none() {
+        let fake = FakeStore::new();
+        let base = format!("{}\n", jsonl_line("m1"));
+        fake.seed("sys/sessions/web/base.jsonl", base.into_bytes());
+
+        let store: Arc<dyn ObjectStore> = Arc::new(fake);
+        let cache = CloudCache::new();
+
+        // cfg() defaults sessions_dir to None.
+        let result = boot_restore(&store, &cache, &cfg()).unwrap();
+        assert!(result.warnings.is_empty());
+
+        // Cache populated as before.
+        assert!(cache.get("sys/sessions/web/base.jsonl").is_some());
+        // No local fs materialization happened — there's no sessions_dir to check.
     }
 }
