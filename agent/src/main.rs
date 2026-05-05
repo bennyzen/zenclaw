@@ -990,6 +990,7 @@ fn start_http_server(
         "/api/status", "/api/chat", "/api/chat/history", "/api/config", "/api/wifi",
         "/api/files", "/api/files/read", "/api/files/write", "/api/files/mkdir",
         "/api/files/upload", "/api/restart", "/api/cloud/files", "/api/cloud/sign",
+        "/api/sessions",
     ] {
         server.fn_handler::<anyhow::Error, _>(path, Method::Options, |req| {
             let mut resp = req.into_response(204, None, &[
@@ -1683,6 +1684,142 @@ a{{color:#60a5fa;text-decoration:none}}
             unsafe { esp_idf_svc::sys::esp_restart(); }
         });
         Ok(())
+    }).unwrap();
+
+    // --- /api/sessions (GET) — list all sessions sorted by last_activity_ms desc ---
+    let gw_sessions_list = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions", Method::Get, move |req| {
+        let mut sessions = gw_sessions_list.sessions.list_with_meta();
+        sessions.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+        let body = serde_json::to_vec(&sessions)?;
+        let mut resp = req.into_response(200, Some("OK"), CORS_HEADERS)?;
+        resp.write_all(&body)?;
+        Ok(())
+    }).unwrap();
+
+    // --- /api/sessions (POST) — create a new session ---
+    let gw_sessions_create = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions", Method::Post, move |req| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let chat_id = format!("chat-{}", now_ms);
+        let meta = zenclaw_agent::core::sessions::meta::SessionMeta::synthesize_default(
+            &chat_id, now_ms, None,
+        );
+        if let Err(e) = gw_sessions_create.sessions.set_meta(&chat_id, &meta) {
+            log::warn!("api_sessions_create: set_meta failed for {}: {}", chat_id, e);
+            let mut resp = req.into_response(500, Some("Internal Server Error"), &[])?;
+            resp.write_all(format!("set_meta: {}", e).as_bytes())?;
+            return Ok(());
+        }
+        let body = serde_json::to_vec(&serde_json::json!({"chatId": chat_id, "meta": meta}))?;
+        log::info!("Session created: {}", chat_id);
+        let mut resp = req.into_response(201, Some("Created"), CORS_HEADERS)?;
+        resp.write_all(&body)?;
+        Ok(())
+    }).unwrap();
+
+    // --- /api/sessions/* (PATCH) — rename a session ---
+    // The wildcard path "/api/sessions/*" is supported by esp-idf's httpd_uri_t
+    // (same underlying mechanism as other wildcard URIs). The chat_id is parsed
+    // from the URI segment after "/api/sessions/".
+    let gw_sessions_patch = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions/*", Method::Patch, move |mut req| {
+        let uri = req.uri().to_string();
+        let chat_id = uri
+            .strip_prefix("/api/sessions/")
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if chat_id.is_empty() {
+            let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
+            resp.write_all(b"missing chat id")?;
+            return Ok(());
+        }
+
+        let mut body = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = req.read(&mut buf)?;
+            if n == 0 { break; }
+            body.extend_from_slice(&buf[..n]);
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PatchBody { title: String }
+
+        let parsed: PatchBody = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
+                resp.write_all(format!("invalid body: {}", e).as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        match gw_sessions_patch.sessions.rename(&chat_id, &parsed.title) {
+            Ok(meta) => {
+                log::info!("Session renamed: {} -> {}", chat_id, parsed.title);
+                let body = serde_json::to_vec(&meta)?;
+                let mut resp = req.into_response(200, Some("OK"), CORS_HEADERS)?;
+                resp.write_all(&body)?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut resp = req.into_response(404, Some("Not Found"), &[])?;
+                resp.write_all(format!("not found: {}", chat_id).as_bytes())?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
+                resp.write_all(e.to_string().as_bytes())?;
+                Ok(())
+            }
+            Err(e) => {
+                let mut resp = req.into_response(500, Some("Internal Server Error"), &[])?;
+                resp.write_all(e.to_string().as_bytes())?;
+                Ok(())
+            }
+        }
+    }).unwrap();
+
+    // --- /api/sessions/* (DELETE) — delete a session ---
+    let gw_sessions_delete = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions/*", Method::Delete, move |req| {
+        let uri = req.uri().to_string();
+        let chat_id = uri
+            .strip_prefix("/api/sessions/")
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if chat_id.is_empty() {
+            let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
+            resp.write_all(b"missing chat id")?;
+            return Ok(());
+        }
+
+        let result = match gw_sessions_delete.cloud_store.as_ref() {
+            Some(s) => gw_sessions_delete.sessions.delete_with_store(
+                &chat_id,
+                s.as_ref() as &dyn zenclaw_agent::core::cloud::client::ObjectStore,
+            ),
+            None => gw_sessions_delete.sessions.delete(&chat_id),
+        };
+        match result {
+            Ok(()) => {
+                log::info!("Session deleted: {}", chat_id);
+                let mut resp = req.into_response(204, Some("No Content"), &[])?;
+                resp.write_all(b"")?;
+                Ok(())
+            }
+            Err(e) => {
+                let mut resp = req.into_response(500, Some("Internal Server Error"), &[])?;
+                resp.write_all(e.to_string().as_bytes())?;
+                Ok(())
+            }
+        }
     }).unwrap();
 
     // --- WS /ws/stats (live stats stream) ---
