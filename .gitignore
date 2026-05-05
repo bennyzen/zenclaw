@@ -1,4 +1,5 @@
 .venv/
+.worktrees/
 
 # Desktop runtime data + secrets. agent/config.json holds provider API keys
 # and is typically a symlink into the user's local desktop env (see README).
