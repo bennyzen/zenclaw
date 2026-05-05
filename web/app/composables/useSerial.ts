@@ -256,17 +256,31 @@ export function useSerial() {
           onProgress({ stage: 'flashing', percent: pct, message: `${written}/${total} bytes` })
         },
       })
-      // Reset path is chip-specific:
-      // - ESP32-S3 native USB has no DTR/RTS line → use the RTC watchdog
-      //   (ported from Python esptool: esptool/targets/esp32s3.py watchdog_reset).
-      // - ESP32-P4 (and others reached over USB-UART) → DTR/RTS pulse via
-      //   esptool-js's hard_reset.
+      // Reset path is chip-specific. Native USB-Serial-JTAG chips (S3,
+      // P4, …) have no physical EN/IO0 lines, so we trip the RTC/LP
+      // watchdog directly via writeReg — the same sequence Python
+      // esptool's watchdog_reset() uses, just at the chip's own
+      // register addresses. UART-bridge chips (or anything else) fall
+      // through to a normal hard_reset DTR/RTS pulse.
       log('Resetting device...')
       try {
         if (detectedChip === 'ESP32-S3') {
+          // From esptool/targets/esp32s3.py — RTC_CNTL base 0x60008000
           const WDT_WPROTECT = 0x600080B0
           const WDT_CONFIG0  = 0x60008098
           const WDT_CONFIG1  = 0x6000809C
+          const WDT_WKEY     = 0x50D83AA1
+          await loader.writeReg(WDT_WPROTECT, WDT_WKEY)
+          await loader.writeReg(WDT_CONFIG1, 2000)
+          await loader.writeReg(WDT_CONFIG0, (1 << 31) | (5 << 28) | (1 << 8) | 2)
+          await loader.writeReg(WDT_WPROTECT, 0)
+          await new Promise(r => setTimeout(r, 500))
+          log('Watchdog reset triggered — device is rebooting.')
+        } else if (detectedChip === 'ESP32-P4') {
+          // From esptool/targets/esp32p4.py — LP_WDT base 0x50116000
+          const WDT_CONFIG0  = 0x50116000
+          const WDT_CONFIG1  = 0x50116004
+          const WDT_WPROTECT = 0x50116018
           const WDT_WKEY     = 0x50D83AA1
           await loader.writeReg(WDT_WPROTECT, WDT_WKEY)
           await loader.writeReg(WDT_CONFIG1, 2000)
