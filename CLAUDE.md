@@ -37,7 +37,7 @@ The board profile MUST match the hardware. Flashing a PSRAM-enabled build onto a
 | Board | Manifest | Hardware | Key Config |
 |-------|----------|----------|------------|
 | **devkitc** | `boards/devkitc.toml` | ESP32-S3-DevKitC (2x USB, 8MB PSRAM) | `CONFIG_SPIRAM=y`, UART console, USB Host enabled |
-| **guition-p4** | `boards/guition-p4.toml` | Guition JC-ESP32P4-M3-DEV (Ethernet, 32MB PSRAM) | RISC-V target, IP101 PHY, no WiFi provisioning needed |
+| **guition-p4** | `boards/guition-p4.toml` | Guition JC-ESP32P4-M3-DEV (Ethernet, 32MB PSRAM, microSD slot) | RISC-V target, IP101 PHY, FATFS + SDMMC via on-chip LDO_VO4, no WiFi provisioning needed |
 
 **CRITICAL**: When switching board profiles, the esp-idf-sys build cache may retain the old sdkconfig. If the board doesn't boot, clean and rebuild:
 ```bash
@@ -87,6 +87,21 @@ description = "ESP32-S3-DevKitC (PSRAM, USB Host capable)"
 - **Workflow**: `just build guition-p4 && just flash guition-p4 /dev/ttyACM0`
 - **Discovery**: mDNS `zenclaw.local` works identically to S3 builds; boot to agent-ready in ~5s
 - **Config**: provision via `/api/config` POST after Ethernet comes up (same as S3)
+- **microSD slot** (`sdcard` feature, default-on for this board):
+  - **Driver**: SDMMC peripheral, slot 0 IO_MUX path, 4-bit @ 20 MHz default-speed (1-bit fallback if 4-bit fails)
+  - **Pinmap** (P4 IO_MUX defaults; the Guition wires the slot to these):
+    | Signal | GPIO |
+    |--------|------|
+    | CLK    | 43 |
+    | CMD    | 44 |
+    | D0     | 39 |
+    | D1     | 40 |
+    | D2     | 41 |
+    | D3     | 42 |
+  - **Bus power**: on-chip LDO_VO4 (channel 4) — without `sd_pwr_ctrl_new_on_chip_ldo()` every CMD times out (`ESP_ERR_TIMEOUT 0x107`). See Common Pitfalls.
+  - **Mount**: `/sdcard` (LittleFS still owns `/data`). `format_if_mount_failed: false` — never auto-format user data.
+  - **Implementation**: `agent/components/zenclaw_sd/` (local IDF C component wrapping `SDMMC_HOST_DEFAULT()` + `esp_vfs_fat_sdmmc_mount()`) + `agent/src/sdcard.rs` (Rust wrapper). The C wrapper avoids hand-mirroring the 17 function pointers + anonymous union of `sdmmc_host_t` in Rust.
+  - **API surface**: `/api/status.sdcard` reports `{mounted, path, total_kb, free_kb, type, bus_width}`; `/api/files*` accepts `/sdcard/...` paths (jail enforced via `jail_filesystem_path`); web file UI shows an SD tab when `mounted: true`.
 - **C6 WiFi co-processor**: the onboard ESP32-C6 is held in reset; WiFi deferred to v2
 
 ### Provisioning
@@ -151,10 +166,11 @@ curl -sf "http://$HOST/api/chat/history?chat_id=web" | python3 -m json.tool
 
 ```
 agent/src/
-  main.rs                     ESP32 entry: WiFi, mDNS, LittleFS, HTTP server, Telegram poller
+  main.rs                     ESP32 entry: WiFi, mDNS, LittleFS, SD card (P4), HTTP server, Telegram poller
   lib.rs                      Feature-gated module exports
   config.rs                   Config structs (serde, mirrors `/api/config` JSON shape)
   usb_storage.rs              USB Host MSC FFI wrapper (feature: usb_storage)
+  sdcard.rs                   FATFS-on-SDMMC driver wrapper (feature: sdcard)
 
   core/                       Shared agent logic
     gateway.rs                Core orchestrator, chat() entry point
@@ -191,11 +207,11 @@ agent/src/
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Landing page (agent name, IP, heap, version) |
-| GET | `/api/status` | System status (memory, WiFi, storage, temp, channels, provider, USB) |
+| GET | `/api/status` | System status (memory, WiFi, storage, temp, channels, provider, USB, sdcard) |
 | POST | `/api/chat` | Send message `{"message":"...", "chat_id":"web"}` |
 | GET | `/api/chat/history?chat_id=` | Conversation history for chat_id |
 | GET/POST | `/api/config` | Read/write config (POST triggers reboot) |
-| GET | `/api/files?path=` | List directory |
+| GET | `/api/files?path=` | List directory (path under `/data` or, when mounted, `/sdcard`) |
 | GET | `/api/files/read?path=` | Read file content |
 | POST | `/api/files/write` | Write file `{"path":"...", "content":"..."}` |
 | POST | `/api/files/mkdir` | Create directory `{"path":"..."}` |
@@ -215,6 +231,7 @@ agent/src/
 | `nic-wifi-hosted` | WiFi via esp_hosted (C6/C5 SDIO co-proc) — v2, not yet implemented |
 | `nic-eth` | Internal EMAC + external PHY (P4); enabled by guition-p4 board manifest |
 | `usb_storage` | USB Host MSC support (requires `esp32`, DevKitC board + powered USB hub) |
+| `sdcard` | microSD via FATFS+SDMMC; enabled by guition-p4 board manifest. P4 boards need on-chip LDO_VO4 (handled in `components/zenclaw_sd/`). |
 | `hnsw` | HNSW vector index via usearch |
 
 ### Partition Table
@@ -237,6 +254,8 @@ storage   0x410000 8MB    — LittleFS (sessions, memory, data files)
 - **USB Host VBUS**: DevKitC USB-C port doesn't supply 5V in host mode. USB devices need a powered hub.
 - **Main thread must not block**: The main thread parks in `loop { sleep(60s) }` after spawning HTTP server and Telegram poller threads. HTTP server runs in esp-idf's httpd thread pool.
 - **S3 Xtensa LLVM bug (1.94.0.0–1.95.0.0)**: `xtensa-esp32s3-espidf` builds fail with `XtensaISD::PCREL_WRAPPER` LLVM ICE in `serde_json::Vec` deserialization on every `esp-rs/rust` release from 1.94.0.0 through 1.95.0.0 (tracked at [esp-rs/rust#277](https://github.com/esp-rs/rust/issues/277), regression introduced by the LLVM 20→21 bump). Workaround — pin the toolchain to 1.93.0.0: `espup install --toolchain-version 1.93.0.0`. P4 (RISC-V) is unaffected and uses the standard toolchain.
+- **ESP32-P4 SDMMC needs the on-chip LDO**: P4's SDMMC peripheral does not internally power its IO bus — the chip exposes `VDDPST_5` and expects external power. Every P4 board (Espressif EV-Board, Guition, etc.) wires this to on-chip `LDO_VO4` and depends on firmware to enable it. Without `sd_pwr_ctrl_new_on_chip_ldo({.ldo_chan_id = 4})` + `host.pwr_ctrl_handle = ...`, every CMD times out: `sdmmc_init_ocr: send_op_cond (1) returned 0x107`. LDO channels 1 (flash) and 2 (PSRAM) are reserved; channel 4 is the SDMMC default. Wrap in `#if SOC_SDMMC_IO_POWER_EXTERNAL` for chip portability — S3 doesn't need it. Confirmed against upstream micropython issue [#18984](https://github.com/micropython/micropython/issues/18984).
+- **C-component edits don't always trigger ESP-IDF rebuild**: editing a C file inside `agent/components/<name>/` may leave the .obj timestamp stale despite a successful `cargo build` — the binary then lacks the change. Symptom: `just build` finishes in ~20s, but `strings target/.../zenclaw-agent | grep <new-log-message>` returns nothing. Fix: `just clean <board>` between iterations on C-component code. Same rule that applies to sdkconfig/`extra_components` additions, just stated more generally.
 
 ### Memory subsystem
 
@@ -301,10 +320,13 @@ zenclaw/
     partitions.csv            Flash partition layout (NVS + 4MB app + 8MB LittleFS)
     sdkconfig.defaults        Shared ESP-IDF config (flash size, TLS, HTTP server)
     sdkconfig.board.devkitc   DevKitC profile (PSRAM, UART console, USB Host)
-    sdkconfig.board.guition-p4  Guition P4 profile (EMAC, RISC-V, 32MB PSRAM)
+    sdkconfig.board.guition-p4  Guition P4 profile (EMAC, RISC-V, 32MB PSRAM, FATFS LFN)
     bindings_usb_msc.h        Bindgen header for USB Host MSC component
     bindings_led_strip.h      Bindgen header for LED strip component
+    bindings.h                Top-level bindings (esp_chip_info, FATFS+SDMMC, zenclaw_sd helper)
     src/                      Rust source (see Architecture above)
+    components/               Local IDF components built unconditionally; LTO strips unused
+      zenclaw_sd/             SDMMC + FATFS + on-chip LDO glue for the SD slot
 
   agent-smoke/              Minimal reference crate for porting to new chips
 

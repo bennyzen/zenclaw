@@ -18,8 +18,9 @@ A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use
 - **Heartbeat**: Autonomous loop with cron scheduling and reflection turns
 - **Multi-channel**: Web UI, Telegram (voice, photos, typing indicator), HTTP API
 - **Cloud persistence**: Write-through S3-compatible sync — sessions, memory, cron jobs, and user files automatically backed up to cloud storage (Cloudflare R2 free tier, Backblaze B2, AWS S3) and restored on boot
+- **Three-tier storage**: 8 MB on-device LittleFS for sessions/memory/configs, microSD card via FATFS for datasets and large blobs (Guition P4 today; gated by board), and S3-compatible cloud — all surfaced through one file manager UI
 - **Web UI**: Nuxt PWA — dashboard, config editor, file manager, browser-based device provisioning via Web Serial
-- **Multi-board**: ESP32-S3 (DevKitC) and ESP32-P4 (Guition); WiFi or Ethernet; multiple devices coexist on one network via mDNS
+- **Multi-board**: ESP32-S3 (DevKitC) and ESP32-P4 (Guition + microSD); WiFi or Ethernet; multiple devices coexist on one network via mDNS
 
 ## Quick Start
 
@@ -37,7 +38,8 @@ For developers building from source, see [`agent/`](agent/) and [`CLAUDE.md`](CL
 
 ```
 agent/src/
-  main.rs                 ESP32 entry: NIC bring-up, mDNS, SPIFFS, HTTP server, Telegram poller
+  main.rs                 ESP32 entry: NIC bring-up, mDNS, LittleFS, SD card (P4), HTTP server, Telegram poller
+  sdcard.rs               microSD via FATFS (gated by `sdcard` cargo feature)
   core/                   Shared agent logic
     gateway.rs            Core orchestrator, chat() entry point
     agent_loop.rs         LLM <-> tool execution loop
@@ -53,6 +55,8 @@ agent/src/
   net/                    NIC abstraction (WiFi for S3, Ethernet for P4)
   esp32/                  ESP32 HTTP runner (esp-idf-svc)
   desktop/                Desktop HTTP server + client (axum + reqwest)
+agent/components/
+  zenclaw_sd/             Local IDF component wrapping SDMMC + FATFS for the SD driver
 ```
 
 See [`CLAUDE.md`](CLAUDE.md) for the full architecture, board profiles, and build workflow.
