@@ -245,6 +245,87 @@ impl SessionManager {
         }
     }
 
+    /// Walk the sessions directory and return one `SessionMeta` per
+    /// `<id>.jsonl`. When the matching `.meta.json` is missing or
+    /// corrupt, synthesize a default (peeking at the first user-turn
+    /// in the JSONL for a `FirstMessage`-source title when content
+    /// exists) and persist it back to disk so subsequent calls skip
+    /// the synthesis path. Orphan `<id>.meta.json` files (no matching
+    /// JSONL) are skipped. Per-session errors are logged + skipped;
+    /// never aborts the whole list.
+    pub fn list_with_meta(&self) -> Vec<crate::core::sessions::meta::SessionMeta> {
+        let mut out = Vec::new();
+        let dir = match fs::read_dir(&self.sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(stripped) = name.strip_suffix(".jsonl") else { continue };
+            let chat_id = stripped.to_string();
+
+            let meta = match self.meta(&chat_id) {
+                Ok(Some(m)) => m,
+                _ => {
+                    // Synthesize: peek at the first user-turn from the
+                    // JSONL when the file has content, so legacy chats
+                    // get a meaningful title rather than a placeholder.
+                    let first_msg = self.peek_first_user_message(&chat_id);
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let synth = crate::core::sessions::meta::SessionMeta::synthesize_default(
+                        &chat_id,
+                        mtime,
+                        first_msg.as_deref(),
+                    );
+                    // Persist so future calls skip synthesis. Best-effort:
+                    // logged but does not abort.
+                    if let Err(e) = self.set_meta(&chat_id, &synth) {
+                        tracing::warn!(
+                            "list_with_meta: persist synthesized meta failed for {}: {}",
+                            chat_id,
+                            e
+                        );
+                    }
+                    synth
+                }
+            };
+            out.push(meta);
+        }
+        out
+    }
+
+    /// Peek at the first user-role entry in a session's JSONL file
+    /// and return its `content` text, or `None` if the file is empty,
+    /// unreadable, or contains no user messages. Best-effort; failures
+    /// are silent (callers fall back to the `New chat` placeholder).
+    fn peek_first_user_message(&self, chat_id: &str) -> Option<String> {
+        let path = self.session_path(chat_id);
+        let content = std::fs::read_to_string(&path).ok()?;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Use the typed deserializer rather than a JSON-path scan —
+            // matches the actual SessionEntry serde shape (#[serde(tag = "type")]
+            // with content as a flat field on the Message variant).
+            if let Ok(SessionEntry::Message {
+                role: Role::User,
+                content,
+                ..
+            }) = serde_json::from_str::<SessionEntry>(line)
+            {
+                return Some(content);
+            }
+        }
+        None
+    }
+
     /// On-disk byte size of the session JSONL, or None if it doesn't exist.
     /// In cloud mode, returns the sum of `base.jsonl` plus all unabsorbed
     /// `log-NN.jsonl` bytes for this chat — i.e. the materialized view.
@@ -1234,6 +1315,69 @@ mod tests {
         m.title_source = TitleSource::User;
         mgr.set_meta("chat-1", &m).unwrap();
         assert_eq!(mgr.meta("chat-1").unwrap().unwrap().title, "Renamed");
+    }
+
+    #[test]
+    fn list_with_meta_returns_sidecar_when_present() {
+        use crate::core::sessions::meta::{SessionMeta, SessionKind, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        // Seed a JSONL + a sidecar.
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"").unwrap();
+        let m = SessionMeta {
+            chat_id: "chat-1".into(),
+            kind: SessionKind::Web,
+            title: "Tomatoes".into(),
+            title_source: TitleSource::User,
+            created_at_ms: 100,
+            last_activity_ms: 200,
+            last_message_preview: "p".into(),
+            version: 1,
+        };
+        std::fs::write(
+            dir.path().join("chat-1.meta.json"),
+            serde_json::to_vec(&m).unwrap(),
+        ).unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], m);
+    }
+
+    #[test]
+    fn list_with_meta_synthesizes_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat_id, "chat-1");
+        assert_eq!(listed[0].title, "New chat");
+        // Synthesized meta is persisted so subsequent calls don't re-synthesize.
+        assert!(dir.path().join("chat-1.meta.json").exists());
+    }
+
+    #[test]
+    fn list_with_meta_skips_orphan_meta_without_jsonl() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SessionMeta::synthesize_default("orphan", 1, None);
+        std::fs::write(
+            dir.path().join("orphan.meta.json"),
+            serde_json::to_vec(&m).unwrap(),
+        ).unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        assert_eq!(mgr.list_with_meta().len(), 0);
+    }
+
+    #[test]
+    fn list_with_meta_falls_back_to_default_on_corrupt_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"").unwrap();
+        std::fs::write(dir.path().join("chat-1.meta.json"), b"not-valid-json").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "New chat");
     }
 
     #[test]
