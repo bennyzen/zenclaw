@@ -14,3 +14,4 @@ pub mod types;
 pub mod workspace;
 
 pub mod runner;
+pub mod title_gen;

@@ -379,6 +379,16 @@ impl Gateway {
             .unwrap_or(0);
         self.sessions.bump_activity(chat_id, &result, now_ms);
 
+        // Title generation: rare path (only first turn of a new chat,
+        // only when title_source is Default or FirstMessage). Adds the
+        // LLM round-trip to the function-return on the first turn; WS
+        // users already received the reply via ChatEvent::Done above.
+        crate::core::title_gen::maybe_generate_title(
+            chat_id,
+            self.sessions.as_ref(),
+            self.runner.as_ref(),
+        ).await;
+
         Ok(result)
     }
 
