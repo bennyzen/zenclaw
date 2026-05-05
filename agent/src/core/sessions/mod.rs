@@ -179,6 +179,29 @@ impl SessionManager {
         format!("{}/{}.jsonl", self.sessions_dir, safe_chat_id(chat_id))
     }
 
+    /// Path to the per-session metadata sidecar (`<chat_id>.meta.json`)
+    /// on local disk. Mirrors `session_path`'s sanitization rules.
+    fn meta_path(&self, chat_id: &str) -> String {
+        format!("{}/{}.meta.json", self.sessions_dir, safe_chat_id(chat_id))
+    }
+
+    /// Read this session's metadata sidecar from local disk. `None` if
+    /// no sidecar exists; the caller may synthesize a default via
+    /// `SessionMeta::synthesize_default`. Cloud lookups happen at boot
+    /// (cloud/boot.rs), not here — this is the hot path for the
+    /// sidebar list.
+    pub fn meta(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<crate::core::sessions::meta::SessionMeta>, Box<dyn std::error::Error>> {
+        let path = self.meta_path(chat_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// On-disk byte size of the session JSONL, or None if it doesn't exist.
     /// In cloud mode, returns the sum of `base.jsonl` plus all unabsorbed
     /// `log-NN.jsonl` bytes for this chat — i.e. the materialized view.
@@ -1109,6 +1132,35 @@ mod tests {
         mgr.clear("abc").unwrap();
 
         assert!(!path.exists(), "session file should be deleted");
+    }
+
+    #[test]
+    fn meta_returns_none_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        assert!(mgr.meta("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn meta_reads_existing_sidecar() {
+        use crate::core::sessions::meta::{SessionKind, SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let m = SessionMeta {
+            chat_id: "chat-1".into(),
+            kind: SessionKind::Web,
+            title: "Persisted".into(),
+            title_source: TitleSource::User,
+            created_at_ms: 1,
+            last_activity_ms: 2,
+            last_message_preview: "p".into(),
+            version: 1,
+        };
+        let path = dir.path().join("chat-1.meta.json");
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let loaded = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(loaded, m);
     }
 
     #[test]
