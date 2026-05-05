@@ -6,7 +6,6 @@ const sessions = ref<SessionMeta[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
 
-let pollHandle: ReturnType<typeof setInterval> | null = null
 let focusHandlerAttached = false
 
 async function refresh() {
@@ -93,7 +92,7 @@ export function useSessions() {
   if (!focusHandlerAttached && typeof window !== 'undefined') {
     focusHandlerAttached = true
     window.addEventListener('focus', refresh)
-    pollHandle = setInterval(refresh, 30_000)
+    setInterval(refresh, 30_000)
   }
   return { sessions, loading, error, refresh, create, rename, remove, bumpLocal }
 }
