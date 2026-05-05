@@ -39,16 +39,21 @@ async function create(): Promise<SessionMeta> {
 async function rename(id: string, title: string) {
   const idx = sessions.value.findIndex((s) => s.chatId === id)
   if (idx < 0) return
-  const snapshot = sessions.value[idx].title
+  const current = sessions.value[idx]
+  if (!current) return // type-narrowing guard for noUncheckedIndexedAccess
+  const snapshot = current.title
   // Optimistic mutate.
-  sessions.value[idx] = { ...sessions.value[idx], title }
+  sessions.value[idx] = { ...current, title }
   try {
     const conn = useConnection()
     const updated = await conn.renameSession(id, title)
     sessions.value[idx] = updated
   } catch (e) {
-    // Roll back.
-    sessions.value[idx] = { ...sessions.value[idx], title: snapshot }
+    // Roll back — read again because the try may have mutated; restore snapshot title.
+    const after = sessions.value[idx]
+    if (after) {
+      sessions.value[idx] = { ...after, title: snapshot }
+    }
     throw e
   }
 }
@@ -57,6 +62,7 @@ async function remove(id: string) {
   const idx = sessions.value.findIndex((s) => s.chatId === id)
   if (idx < 0) return
   const snapshot = sessions.value[idx]
+  if (!snapshot) return // type-narrowing guard for noUncheckedIndexedAccess
   sessions.value.splice(idx, 1)
   try {
     const conn = useConnection()
@@ -70,8 +76,10 @@ async function remove(id: string) {
 function bumpLocal(id: string, preview: string) {
   const idx = sessions.value.findIndex((s) => s.chatId === id)
   if (idx < 0) return
+  const current = sessions.value[idx]
+  if (!current) return // type-narrowing guard for noUncheckedIndexedAccess
   const updated: SessionMeta = {
-    ...sessions.value[idx],
+    ...current,
     lastActivityMs: Date.now(),
     lastMessagePreview: preview.slice(0, 120),
   }
