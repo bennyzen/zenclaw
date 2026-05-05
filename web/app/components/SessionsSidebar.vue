@@ -1,13 +1,14 @@
 <script setup lang="ts">
 const route = useRoute()
 const router = useRouter()
+const toast = useToast()
 
 const { sessions, loading, error, refresh, create, rename, remove } = useSessions()
 
 const query = ref('')
 const renamingId = ref<string | null>(null)
 const renameDraft = ref('')
-const renameInput = ref<HTMLInputElement | null>(null)
+const renameInputEl = ref<HTMLInputElement | null>(null)
 const confirmOpen = ref(false)
 const pendingDelete = ref<string | null>(null)
 
@@ -45,7 +46,11 @@ async function onNewChat() {
     const meta = await create()
     router.push(`/chat/${encodeURIComponent(meta.chatId)}`)
   } catch (e: any) {
-    console.error('Create failed:', e?.message || e)
+    toast.add({
+      title: 'Could not create chat',
+      description: e?.message || 'Try again.',
+      color: 'error',
+    })
   }
 }
 
@@ -58,7 +63,7 @@ function rowMenu(session: { chatId: string; title: string }) {
     },
     {
       label: 'Delete',
-      icon: 'i-lucide-trash',
+      icon: 'i-lucide-trash-2',
       color: 'error' as const,
       onSelect: () => {
         pendingDelete.value = session.chatId
@@ -72,8 +77,8 @@ async function beginRename(id: string, current: string) {
   renamingId.value = id
   renameDraft.value = current
   await nextTick()
-  renameInput.value?.focus()
-  renameInput.value?.select()
+  renameInputEl.value?.focus()
+  renameInputEl.value?.select()
 }
 
 async function commitRename(id: string) {
@@ -83,7 +88,11 @@ async function commitRename(id: string) {
   try {
     await rename(id, newTitle)
   } catch (e: any) {
-    console.error('Rename failed:', e?.message || e)
+    toast.add({
+      title: 'Rename failed',
+      description: e?.message || 'Could not save the new title.',
+      color: 'error',
+    })
   }
 }
 
@@ -96,7 +105,11 @@ async function confirmDelete() {
     if (route.params.id === id) router.push('/chat')
     await remove(id)
   } catch (e: any) {
-    console.error('Delete failed:', e?.message || e)
+    toast.add({
+      title: 'Delete failed',
+      description: e?.message || 'Could not delete the conversation.',
+      color: 'error',
+    })
   }
 }
 </script>
@@ -137,7 +150,7 @@ async function confirmDelete() {
           <UIcon :name="kindIcon(session.kind)" class="text-muted shrink-0" />
           <input
             v-if="renamingId === session.chatId"
-            ref="renameInput"
+            :ref="(el) => { if (renamingId === session.chatId) renameInputEl = el as HTMLInputElement | null }"
             v-model="renameDraft"
             class="flex-1 bg-transparent border-b border-primary outline-none text-sm"
             @blur="commitRename(session.chatId)"
