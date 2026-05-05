@@ -263,6 +263,52 @@ impl SessionManager {
         }
     }
 
+    /// User-driven rename. Validates `1..=80` characters after trim,
+    /// sets `TitleSource::User`, persists. Returns the updated meta.
+    pub fn rename(
+        &self,
+        chat_id: &str,
+        title: &str,
+    ) -> std::io::Result<crate::core::sessions::meta::SessionMeta> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 80 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "title length must be 1..=80 characters after trim",
+            ));
+        }
+        self.rename_internal(
+            chat_id,
+            trimmed,
+            crate::core::sessions::meta::TitleSource::User,
+        )
+    }
+
+    /// Bypass-validation rename for internal callers (e.g., the LLM
+    /// title-generation background task in T12). Caller is responsible
+    /// for checking `title_source != User` before invoking, otherwise
+    /// a User-renamed title will be clobbered.
+    pub fn rename_internal(
+        &self,
+        chat_id: &str,
+        title: &str,
+        source: crate::core::sessions::meta::TitleSource,
+    ) -> std::io::Result<crate::core::sessions::meta::SessionMeta> {
+        let mut meta = self
+            .meta(chat_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("chat not found: {}", chat_id),
+                )
+            })?;
+        meta.title = title.to_string();
+        meta.title_source = source;
+        self.set_meta(chat_id, &meta)?;
+        Ok(meta)
+    }
+
     /// Walk the sessions directory and return one `SessionMeta` per
     /// `<id>.jsonl`. When the matching `.meta.json` is missing or
     /// corrupt, synthesize a default (peeking at the first user-turn
@@ -1446,6 +1492,80 @@ mod tests {
         let mgr = SessionManager::new("/nonexistent/path");
         // Should not panic.
         mgr.bump_activity("chat-1", "anything", 100);
+    }
+
+    #[test]
+    fn rename_sets_title_and_user_source() {
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        let updated = mgr.rename("chat-1", "Custom title").unwrap();
+        assert_eq!(updated.title, "Custom title");
+        assert_eq!(updated.title_source, TitleSource::User);
+    }
+
+    #[test]
+    fn rename_validates_empty_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta(
+            "chat-1",
+            &crate::core::sessions::meta::SessionMeta::synthesize_default("chat-1", 100, None),
+        ).unwrap();
+
+        assert!(mgr.rename("chat-1", "").is_err());
+        assert!(mgr.rename("chat-1", "   ").is_err());
+    }
+
+    #[test]
+    fn rename_validates_oversize_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta(
+            "chat-1",
+            &crate::core::sessions::meta::SessionMeta::synthesize_default("chat-1", 100, None),
+        ).unwrap();
+
+        let too_long = "a".repeat(81);
+        assert!(mgr.rename("chat-1", &too_long).is_err());
+    }
+
+    #[test]
+    fn rename_returns_not_found_for_missing_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        // No meta + no jsonl
+        let err = mgr.rename("missing", "x").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn rename_internal_accepts_llm_source() {
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        mgr.rename_internal("chat-1", "Tomato propagation", TitleSource::Llm).unwrap();
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.title_source, TitleSource::Llm);
+        assert_eq!(m.title, "Tomato propagation");
+    }
+
+    #[test]
+    fn rename_internal_does_not_validate_length() {
+        // The bypass-validation variant accepts long titles. Caller is
+        // responsible for sanity-checking.
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        let long = "a".repeat(150);
+        // Should succeed even though >80 chars
+        mgr.rename_internal("chat-1", &long, TitleSource::Llm).unwrap();
     }
 
     #[test]
