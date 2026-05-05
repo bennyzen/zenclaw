@@ -90,10 +90,19 @@ web/app/
   composables/useSessions.ts      ← NEW: reactive sidebar state, optimistic updates
   components/SessionsSidebar.vue  ← NEW: list, search, new-chat, kebab menu
   layouts/chat.vue                ← NEW: two-column shell (sidebar + slot)
-  pages/chat/[id].vue             ← NEW: dynamic route, replaces hard-coded chat.vue logic
-  pages/chats.vue                 ← NEW: index/empty-state at /chats (also at /chat with no id)
-  pages/chat.vue                  ← REMOVED or REPURPOSED: redirect to most-recent chat
+  pages/chat/[id].vue             ← NEW: dynamic route, contents lifted from current chat.vue
+  pages/chat/index.vue            ← NEW: bare /chat — redirects to most-recent chat,
+                                          or shows empty pane if none exist
+  pages/chat.vue                  ← REMOVED (logic moved to pages/chat/[id].vue)
 ```
+
+Routing:
+
+| URL | Page | Behavior |
+|---|---|---|
+| `/chat/<id>` | `pages/chat/[id].vue` | Render the chat with that id; sidebar highlights matching row |
+| `/chat` | `pages/chat/index.vue` | If sessions exist, redirect to the most-recent (highest `lastActivityMs`); else show empty pane with "Click 'New chat' to start" |
+| `/` | (existing `pages/index.vue`, unchanged) | Landing page |
 
 ## Components
 
@@ -128,28 +137,39 @@ impl SessionMeta {
     pub fn detect_kind(chat_id: &str) -> SessionKind { /* ... */ }
 
     /// Build a sensible default for a chat that has no sidecar yet.
-    pub fn synthesize_default(chat_id: &str, now_ms: u64) -> Self { /* ... */ }
+    /// Optionally peeks at the first JSONL entry to derive a title for
+    /// chats that already have content (e.g., the legacy `'web'` chat
+    /// the first time this code ships, or any chat whose meta sidecar
+    /// was lost). When no JSONL is provided, falls back to a plain
+    /// "New chat" placeholder with `TitleSource::Default`.
+    pub fn synthesize_default(
+        chat_id: &str,
+        now_ms: u64,
+        first_user_message: Option<&str>,
+    ) -> Self { /* ... */ }
 }
 
 fn default_version() -> u32 { 1 }
 ```
 
-`detect_kind` rules:
+`detect_kind` rules. The function must accept both the *canonical* chat_id (e.g., `cron:job-abc:run-1`) and the *sanitized* form (e.g., `cron_job-abc_run-1`) because `safe_chat_id` at `sessions/mod.rs:93-95` translates `:` → `_` on disk. When a session's meta is missing and `list_with_meta()` synthesizes from the directory listing, only the sanitized form is available.
 
 | Pattern | Kind |
 |---|---|
 | `chat_id == "web"` or `chat_id.starts_with("chat-")` | `Web` |
 | `chat_id` parses as a positive integer | `Telegram` |
-| `chat_id.starts_with("cron:")` | `Cron` |
+| `chat_id.starts_with("cron:")` or `chat_id.starts_with("cron_")` | `Cron` |
 | Anything else | `Other` |
+
+Sub-project B will define its canonical cron chat_id format. For Sub-project A, this rule is forward-compat insurance — web (`chat-{ts}`, `web`) and Telegram (numeric) chat_ids contain no special characters, so sanitization is a no-op and the canonical form survives the round-trip.
 
 ### `agent/src/core/sessions/mod.rs` (extended)
 
 | New method | Behavior | Errors |
 |---|---|---|
-| `meta(chat_id) -> Option<SessionMeta>` | Read sidecar from local FS first; missing returns `None` (caller may synthesize) | IO error → `Err` |
+| `meta(chat_id) -> Option<SessionMeta>` | Read sidecar from local FS first; missing returns `None` (caller may synthesize via `synthesize_default`, optionally passing the first user-turn from the JSONL for a `FirstMessage`-source title) | IO error → `Err` |
 | `set_meta(chat_id, meta) -> io::Result<()>` | Cloud-aware: `cache.put` → `strict_put(sys/sessions/<id>/meta.json)` → local fs write. Same pattern as `core/cron.rs:264-288` | Strict-put failure returns `Err`; no in-memory state to roll back |
-| `list_with_meta() -> Vec<SessionMeta>` | Walk `sessions_dir`, for each `<id>.jsonl` load or synthesize meta. Skip `<id>.meta.json` orphans (no matching JSONL). | Per-session errors logged + skipped; never aborts whole list |
+| `list_with_meta() -> Vec<SessionMeta>` | Walk `sessions_dir`. For each `<id>.jsonl`: read sidecar if present; otherwise read the first JSONL entry, extract the user-turn text, pass to `synthesize_default(chat_id, mtime, Some(first_msg))`, persist the synthesized meta back to disk. Orphan `<id>.meta.json` files (no matching JSONL) are skipped. | Per-session errors logged + skipped; never aborts whole list |
 | `bump_activity(chat_id, preview)` | Read meta (synthesize if missing) → set `last_activity_ms = now`, `last_message_preview = truncate(preview, 120)` → write | Best-effort; logged but does not fail the chat turn |
 | `rename(chat_id, title)` | Validate `1 <= len(title) <= 80` after trim. Read meta → set `title`, `title_source = User` → write | Returns `Err(InvalidInput)` on validation; `Err` on IO/cloud failure |
 | `rename_internal(chat_id, title, source)` | Same as `rename` but bypasses validation and accepts any `TitleSource`. Used by the LLM title task. | IO/cloud failure → `Err` |
@@ -230,16 +250,17 @@ export const useSessions = () => {
 - Watches `route.params.id` to swap conversations on click
 - Calls `useSessions().bumpLocal(id, preview)` after each send and reply
 
-**`pages/chats.vue`** — fallback when URL has no id:
+**`pages/chat/index.vue`** — bare `/chat`:
 
-- Renders sidebar + an empty pane with "Select a chat or start a new one"
-- On mount, if any sessions exist, redirect to most-recent chat; otherwise show empty pane (user can click "New chat")
+- On mount, if any sessions exist, redirect to the most-recent chat (`router.replace(\`/chat/${mostRecent.chatId}\`)`)
+- Otherwise show an empty pane with "Click 'New chat' to start"
+- Renders inside the `chat.vue` layout, so the sidebar is visible regardless
 
 **`layouts/chat.vue`** — two-column flex shell:
 
 - Sidebar left (300px desktop, collapsible drawer on mobile)
 - `<NuxtPage />` right
-- Used by both `pages/chats.vue` and `pages/chat/[id].vue`
+- Used by both `pages/chat/index.vue` and `pages/chat/[id].vue`
 
 ## Data Flow
 
@@ -263,8 +284,8 @@ Device powers on
 User clicks "New chat"
  ├─ POST /api/sessions
  │   ├─ chat_id = "chat-{epoch_ms()}"
- │   ├─ meta = synthesize_default(chat_id, now): kind=Web, title="New chat",
- │   │       titleSource=Default, lastActivityMs=now, preview=""
+ │   ├─ meta = synthesize_default(chat_id, now, None): kind=Web,
+ │   │       title="New chat", titleSource=Default, lastActivityMs=now, preview=""
  │   ├─ set_meta() — cache → strict_put → fs.write
  │   └─ 201 {chatId, meta}
  ├─ optimistic prepend to sessions.value
@@ -317,7 +338,7 @@ User opens kebab → "Delete chat" → UModal confirm
 Telegram user sends "/ping"
  ├─ agent_thread polls Telegram → message with chat_id = "987654321"
  ├─ Gateway::chat("987654321", "/ping", "telegram")
- │   ├─ if no meta exists: set_meta(synthesize_default(chat_id, now))
+ │   ├─ if no meta exists: set_meta(synthesize_default(chat_id, now, None))
  │   │      kind=Telegram, title="Telegram 987654321"
  │   ├─ run turn, append entries
  │   └─ bump_activity("987654321", preview)
@@ -375,14 +396,19 @@ A `PATCH` rename and a Telegram-arrived-message `bump_activity` can race the sam
 
 **`agent/src/core/sessions/meta.rs`** — inline `#[cfg(test)] mod tests`:
 
-- `detect_kind` exhaustive matrix: `web`, `chat-1714914000000`, `987654321`, `cron:job-abc:run-1`, `custom-thing` → expected kinds
-- `synthesize_default` field correctness
+- `detect_kind` exhaustive matrix:
+  - canonical: `web`, `chat-1714914000000`, `987654321`, `cron:job-abc:run-1`, `custom-thing`
+  - sanitized: `cron_job-abc_run-1` (after `:` → `_`) → still `Cron`
+- `synthesize_default_with_first_message` — title derived from truncated user turn, `titleSource = FirstMessage`
+- `synthesize_default_without_first_message` — title is "New chat", `titleSource = Default`
 - `meta_serde_roundtrip` — serialize, deserialize, equal
 - `version_field_round_trips` — schema-evolution insurance
 
 **`agent/src/core/sessions/mod.rs`** — extends existing inline tests:
 
-- `list_with_meta_synthesizes_when_missing`
+- `list_with_meta_synthesizes_when_missing` — meta absent; chat_id reflected, default title
+- `list_with_meta_synthesizes_from_first_message_when_jsonl_has_content` — non-empty JSONL produces a `FirstMessage` title
+- `list_with_meta_persists_synthesized_meta` — first call writes the synthesized meta to disk so subsequent calls are O(1)
 - `list_with_meta_skips_orphan_meta`
 - `bump_activity_updates_last_activity_and_preview`
 - `bump_activity_truncates_preview_to_120_chars`
