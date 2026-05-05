@@ -240,7 +240,7 @@ storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
 
 ### Memory subsystem
 
-Memory is a single text file at `data/MEMORY.md` with `## [id] timestamp (tags: ...)` blocks, edited via six flat tools (`memory_save`, `memory_search`, `memory_list`, `memory_get`, `memory_edit`, `memory_delete`) implemented in `agent/src/core/tools/memory_tools.rs`. Caps: 64 KB total, 200 entries — enforced loudly (errors propagate to the LLM). Nothing is auto-injected into the system prompt; the agent fetches on demand. Each save/edit/delete returns a capacity footer; at >=70% the agent surfaces this to the user and proposes a compaction plan rather than grooming silently. Vectors / embeddings are intentionally not used — see commit history if revisiting.
+Memory is a single text file at `data/MEMORY.md` with `## [id] timestamp (tags: ...)` blocks, edited via one action-dispatched tool (`memory` with `action=save|search|list|get|edit|delete`) implemented in `agent/src/core/tools/memory_tools.rs`. Caps: 64 KB total, 200 entries — enforced loudly (errors propagate to the LLM). Nothing is auto-injected into the system prompt; the agent fetches on demand. Each save/edit/delete returns a capacity footer; at >=70% the agent surfaces this to the user and proposes a compaction plan rather than grooming silently. Vectors / embeddings are intentionally not used — see commit history if revisiting.
 
 ## Shared Concepts
 

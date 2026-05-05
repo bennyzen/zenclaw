@@ -28,8 +28,8 @@ const SOUL_FILENAMES: &[&str] = &[
 ///
 /// MEMORY.md is intentionally NOT loaded here. It used to be dumped verbatim
 /// into the system prompt on every turn — a token-cost and attention-pollution
-/// disaster. Memory is retrievable on demand via memory_search / memory_list /
-/// memory_get tools.
+/// disaster. Memory is retrievable on demand via the `memory` tool
+/// (action=search|list|get).
 pub fn load_bootstrap_files(data_dir: &str) -> Vec<ContextFile> {
     let mut results = Vec::new();
 

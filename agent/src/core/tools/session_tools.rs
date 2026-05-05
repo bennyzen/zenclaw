@@ -89,7 +89,7 @@ fn do_list(ctx: &ToolContext) -> ToolResult {
 }
 
 /// Per-entry content cap when serving session history. Without this,
-/// a single 491 KB web_fetch tool result inside the recent window would
+/// a single 491 KB web-fetch tool result inside the recent window would
 /// be returned verbatim, feeding the model its own bloat (the 612 KB
 /// self-DoS observed on the baseline 50-turn synthetic test, turn 42).
 /// Tuned to fit typical chat messages and short tool results while

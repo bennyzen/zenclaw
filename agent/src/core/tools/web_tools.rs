@@ -52,6 +52,7 @@ fn esp_http_get_with_headers(url: &str, headers: &[(&str, &str)], max_length: us
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
+#[cfg(feature = "esp32")]
 fn refusal_message(cap: usize) -> String {
     format!(
         "Response body exceeded the {}-byte fetch cap. Re-run with a larger \
@@ -60,85 +61,99 @@ fn refusal_message(cap: usize) -> String {
     )
 }
 
-/// Fetches content from a URL.
-pub struct WebFetchTool;
+pub struct WebTool;
 
 #[async_trait]
-impl Tool for WebFetchTool {
+impl Tool for WebTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "web_fetch".to_string(),
-            description: "Fetch content from a URL. Oversized bodies are refused with an actionable error rather than truncated.".to_string(),
+            name: "web".to_string(),
+            description: "Web access. Actions:\n\
+                - fetch: get content from a URL. Oversized bodies are refused with an actionable error rather than truncated.\n\
+                - search: web search via Brave Search API. Requires search.brave_api_key in config.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "url": {
+                    "action": {
                         "type": "string",
-                        "description": "URL to fetch"
+                        "enum": ["fetch", "search"],
+                        "description": "Operation to perform"
                     },
-                    "max_length": {
-                        "type": "integer",
-                        "description": "Maximum response body bytes. If the response exceeds this, the fetch returns an actionable error instead of a truncated body. Default suits typical pages on the current platform."
-                    }
+                    "url":        { "type": "string",  "description": "URL to fetch (action=fetch)." },
+                    "max_length": { "type": "integer", "description": "Maximum response body bytes (fetch). Oversized bodies are refused, not truncated. Default suits typical pages on the current platform." },
+                    "query":      { "type": "string",  "description": "Search query (action=search)." },
+                    "count":      { "type": "integer", "description": "Number of search results (search; default 5, max 20)." }
                 },
-                "required": ["url"]
+                "required": ["action"]
             }),
         }
     }
 
-    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
-        let url = match args["url"].as_str() {
-            Some(u) => u,
-            None => return ToolResult::Error("Missing 'url'".to_string()),
-        };
-        // Defaults: desktop is generous (real pages flow through unchanged),
-        // ESP32 caps at 32KB which fits comfortably in PSRAM heap and covers
-        // most useful HTML/text resources.
-        #[cfg(feature = "desktop")]
-        let default_max = 10 * 1024 * 1024;
-        #[cfg(feature = "esp32")]
-        let default_max = 32 * 1024;
-        #[cfg(not(any(feature = "desktop", feature = "esp32")))]
-        let default_max = 8 * 1024;
-        let max_length = args["max_length"].as_u64().unwrap_or(default_max as u64) as usize;
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let action = args["action"].as_str().unwrap_or("");
+        match action {
+            "fetch"  => do_fetch(&args).await,
+            "search" => do_search(&args, ctx).await,
+            "" => ToolResult::Error("web: 'action' is required".into()),
+            other => ToolResult::Error(format!("web: unknown action '{}'", other)),
+        }
+    }
+}
 
-        #[cfg(feature = "desktop")]
-        {
-            match reqwest::get(url).await {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    match resp.bytes().await {
-                        Ok(bytes) => {
-                            if bytes.len() > max_length {
-                                return ToolResult::Text(format!(
-                                    "HTTP {} — {}",
-                                    status,
-                                    refusal_message_desktop(bytes.len(), max_length),
-                                ));
-                            }
-                            let body = String::from_utf8_lossy(&bytes).into_owned();
-                            ToolResult::Text(format!("HTTP {} — {}", status, body))
+// --- per-action implementations ---
+
+async fn do_fetch(args: &serde_json::Value) -> ToolResult {
+    let url = match args["url"].as_str() {
+        Some(u) => u,
+        None => return ToolResult::Error("web(fetch): 'url' is required".into()),
+    };
+    // Defaults: desktop is generous (real pages flow through unchanged),
+    // ESP32 caps at 32KB which fits comfortably in PSRAM heap and covers
+    // most useful HTML/text resources.
+    #[cfg(feature = "desktop")]
+    let default_max = 10 * 1024 * 1024;
+    #[cfg(feature = "esp32")]
+    let default_max = 32 * 1024;
+    #[cfg(not(any(feature = "desktop", feature = "esp32")))]
+    let default_max = 8 * 1024;
+    let max_length = args["max_length"].as_u64().unwrap_or(default_max as u64) as usize;
+
+    #[cfg(feature = "desktop")]
+    {
+        match reqwest::get(url).await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        if bytes.len() > max_length {
+                            return ToolResult::Text(format!(
+                                "HTTP {} — {}",
+                                status,
+                                refusal_message_desktop(bytes.len(), max_length),
+                            ));
                         }
-                        Err(e) => ToolResult::Error(format!("Failed to read body: {}", e)),
+                        let body = String::from_utf8_lossy(&bytes).into_owned();
+                        ToolResult::Text(format!("HTTP {} — {}", status, body))
                     }
+                    Err(e) => ToolResult::Error(format!("Failed to read body: {}", e)),
                 }
-                Err(e) => ToolResult::Error(format!("Fetch failed: {}", e)),
             }
+            Err(e) => ToolResult::Error(format!("Fetch failed: {}", e)),
         }
+    }
 
-        #[cfg(feature = "esp32")]
-        {
-            match esp_http_get(url, max_length) {
-                Ok((status, body)) => ToolResult::Text(format!("HTTP {} — {}", status, body)),
-                Err(e) => ToolResult::Error(format!("Fetch failed: {}", e)),
-            }
+    #[cfg(feature = "esp32")]
+    {
+        match esp_http_get(url, max_length) {
+            Ok((status, body)) => ToolResult::Text(format!("HTTP {} — {}", status, body)),
+            Err(e) => ToolResult::Error(format!("Fetch failed: {}", e)),
         }
+    }
 
-        #[cfg(not(any(feature = "desktop", feature = "esp32")))]
-        {
-            let _ = (url, max_length);
-            ToolResult::Error("web_fetch not available on this platform".to_string())
-        }
+    #[cfg(not(any(feature = "desktop", feature = "esp32")))]
+    {
+        let _ = (url, max_length);
+        ToolResult::Error("web(fetch) not available on this platform".into())
     }
 }
 
@@ -154,6 +169,147 @@ fn refusal_message_desktop(actual: usize, cap: usize) -> String {
     )
 }
 
+async fn do_search(args: &serde_json::Value, ctx: &ToolContext) -> ToolResult {
+    let query = match args["query"].as_str() {
+        Some(q) if !q.is_empty() => q,
+        _ => return ToolResult::Error("web(search): 'query' is required".into()),
+    };
+    let count = args["count"].as_u64().unwrap_or(5).min(20) as usize;
+
+    let api_key = ctx.config.search.brave_api_key.clone();
+
+    #[cfg(feature = "desktop")]
+    {
+        let api_key = match api_key {
+            Some(k) if !k.is_empty() => k,
+            _ => {
+                return ToolResult::Text(
+                    "Web search not configured. Set search.brave_api_key in config. \
+                     You can still use web(action=fetch) to read URLs, or rely on Gemini's built-in Google Search grounding."
+                        .to_string(),
+                )
+            }
+        };
+
+        let encoded = urlencode_query(query);
+
+        let url = format!(
+            "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+            encoded, count
+        );
+
+        let client = reqwest::Client::new();
+        let resp = match client
+            .get(&url)
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", &api_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::Error(format!("Search failed: {}", e)),
+        };
+
+        if !resp.status().is_success() {
+            return ToolResult::Error(format!("Search API HTTP {}", resp.status().as_u16()));
+        }
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(j) => j,
+            Err(e) => return ToolResult::Error(format!("Parse error: {}", e)),
+        };
+
+        format_brave_results(&body, query, count)
+    }
+
+    #[cfg(feature = "esp32")]
+    {
+        let api_key = match api_key {
+            Some(k) if !k.is_empty() => k,
+            _ => {
+                return ToolResult::Text(
+                    "Web search not configured. Set search.brave_api_key in config."
+                        .to_string(),
+                )
+            }
+        };
+
+        let encoded = urlencode_query(query);
+
+        let url = format!(
+            "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+            encoded, count
+        );
+
+        // Brave responses are typically 5-30KB; 64KB leaves headroom
+        // for verbose result sets without forcing a refusal.
+        match esp_http_get_with_headers(&url, &[
+            ("Accept", "application/json"),
+            ("X-Subscription-Token", &api_key),
+        ], 64 * 1024) {
+            Ok((_status, body)) => {
+                let data: serde_json::Value = match serde_json::from_str(&body) {
+                    Ok(j) => j,
+                    Err(e) => return ToolResult::Error(format!("Parse error: {}", e)),
+                };
+                format_brave_results(&data, query, count)
+            }
+            Err(e) => ToolResult::Error(format!("Search failed: {}", e)),
+        }
+    }
+
+    #[cfg(not(any(feature = "desktop", feature = "esp32")))]
+    {
+        let _ = (query, count, api_key);
+        ToolResult::Error("web(search) not available on this platform".into())
+    }
+}
+
+#[cfg(any(feature = "desktop", feature = "esp32"))]
+fn urlencode_query(q: &str) -> String {
+    q.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "+".to_string(),
+            _ => {
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf);
+                buf[..c.len_utf8()]
+                    .iter()
+                    .map(|b| format!("%{:02X}", b))
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "desktop", feature = "esp32"))]
+fn format_brave_results(body: &serde_json::Value, query: &str, count: usize) -> ToolResult {
+    let results = body
+        .pointer("/web/results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let formatted: Vec<String> = results
+        .iter()
+        .take(count)
+        .enumerate()
+        .map(|(i, r)| {
+            let title = r["title"].as_str().unwrap_or("(no title)");
+            let url = r["url"].as_str().unwrap_or("");
+            let desc = r["description"].as_str().unwrap_or("");
+            format!("{}. [{}]({})\n   {}", i + 1, title, url, desc)
+        })
+        .collect();
+
+    if formatted.is_empty() {
+        ToolResult::Text(format!("No results found for '{}'", query))
+    } else {
+        ToolResult::Text(formatted.join("\n\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -165,193 +321,5 @@ mod tests {
         assert!(msg.contains("larger max_length"));
         // No original bytes leaked.
         assert!(!msg.contains("xxx"));
-    }
-}
-
-/// Web search using Brave Search API.
-pub struct WebSearchTool;
-
-#[async_trait]
-impl Tool for WebSearchTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "web_search".to_string(),
-            description: "Search the web.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query"
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "Number of results (default 5, max 20)"
-                    }
-                },
-                "required": ["query"]
-            }),
-        }
-    }
-
-    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let query = match args["query"].as_str() {
-            Some(q) if !q.is_empty() => q,
-            _ => return ToolResult::Error("Missing 'query'".to_string()),
-        };
-        let count = args["count"].as_u64().unwrap_or(5).min(20) as usize;
-
-        let api_key = ctx
-            .config
-            .providers
-            .entries
-            .get("brave")
-            .and_then(|e| e.api_key.clone());
-
-        #[cfg(feature = "desktop")]
-        {
-            let api_key = match api_key {
-                Some(k) if !k.is_empty() => k,
-                _ => {
-                    return ToolResult::Text(
-                        "Web search not configured. Add a 'brave' provider with your Brave Search API key in config. \
-                         You can still use web_fetch to read URLs, or rely on Gemini's built-in Google Search grounding."
-                            .to_string(),
-                    )
-                }
-            };
-
-            let encoded: String = query.chars().map(|c| match c {
-                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-                ' ' => "+".to_string(),
-                _ => {
-                    let mut buf = [0u8; 4];
-                    c.encode_utf8(&mut buf);
-                    buf[..c.len_utf8()]
-                        .iter()
-                        .map(|b| format!("%{:02X}", b))
-                        .collect()
-                }
-            }).collect();
-
-            let url = format!(
-                "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
-                encoded, count
-            );
-
-            let client = reqwest::Client::new();
-            let resp = match client
-                .get(&url)
-                .header("Accept", "application/json")
-                .header("X-Subscription-Token", &api_key)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return ToolResult::Error(format!("Search failed: {}", e)),
-            };
-
-            if !resp.status().is_success() {
-                return ToolResult::Error(format!("Search API HTTP {}", resp.status().as_u16()));
-            }
-
-            let body: serde_json::Value = match resp.json().await {
-                Ok(j) => j,
-                Err(e) => return ToolResult::Error(format!("Parse error: {}", e)),
-            };
-
-            let results = body
-                .pointer("/web/results")
-                .and_then(|r| r.as_array())
-                .cloned()
-                .unwrap_or_default();
-
-            let formatted: Vec<String> = results
-                .iter()
-                .take(count)
-                .enumerate()
-                .map(|(i, r)| {
-                    let title = r["title"].as_str().unwrap_or("(no title)");
-                    let url = r["url"].as_str().unwrap_or("");
-                    let desc = r["description"].as_str().unwrap_or("");
-                    format!("{}. [{}]({})\n   {}", i + 1, title, url, desc)
-                })
-                .collect();
-
-            if formatted.is_empty() {
-                ToolResult::Text(format!("No results found for '{}'", query))
-            } else {
-                ToolResult::Text(formatted.join("\n\n"))
-            }
-        }
-
-        #[cfg(feature = "esp32")]
-        {
-            let api_key = match api_key {
-                Some(k) if !k.is_empty() => k,
-                _ => {
-                    return ToolResult::Text(
-                        "Web search not configured. Add a 'brave' provider with your Brave Search API key in config."
-                            .to_string(),
-                    )
-                }
-            };
-
-            let encoded: String = query.chars().map(|c| match c {
-                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-                ' ' => "+".to_string(),
-                _ => {
-                    let mut buf = [0u8; 4];
-                    c.encode_utf8(&mut buf);
-                    buf[..c.len_utf8()]
-                        .iter()
-                        .map(|b| format!("%{:02X}", b))
-                        .collect()
-                }
-            }).collect();
-
-            let url = format!(
-                "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
-                encoded, count
-            );
-
-            // Brave responses are typically 5-30KB; 64KB leaves headroom
-            // for verbose result sets without forcing a refusal.
-            match esp_http_get_with_headers(&url, &[
-                ("Accept", "application/json"),
-                ("X-Subscription-Token", &api_key),
-            ], 64 * 1024) {
-                Ok((_status, body)) => {
-                    let data: serde_json::Value = match serde_json::from_str(&body) {
-                        Ok(j) => j,
-                        Err(e) => return ToolResult::Error(format!("Parse error: {}", e)),
-                    };
-                    let results = data.pointer("/web/results")
-                        .and_then(|r| r.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    let formatted: Vec<String> = results.iter().take(count).enumerate()
-                        .map(|(i, r)| {
-                            let title = r["title"].as_str().unwrap_or("(no title)");
-                            let url = r["url"].as_str().unwrap_or("");
-                            let desc = r["description"].as_str().unwrap_or("");
-                            format!("{}. [{}]({})\n   {}", i + 1, title, url, desc)
-                        })
-                        .collect();
-                    if formatted.is_empty() {
-                        ToolResult::Text(format!("No results found for '{}'", query))
-                    } else {
-                        ToolResult::Text(formatted.join("\n\n"))
-                    }
-                }
-                Err(e) => ToolResult::Error(format!("Search failed: {}", e)),
-            }
-        }
-
-        #[cfg(not(any(feature = "desktop", feature = "esp32")))]
-        {
-            let _ = (query, count, api_key);
-            ToolResult::Error("web_search not available on this platform".to_string())
-        }
     }
 }

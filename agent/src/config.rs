@@ -139,7 +139,7 @@ pub struct CompactionConfig {
     pub max_summary_bytes: usize,
     /// If a kept Message's content exceeds this, it is replaced with a
     /// short redaction marker during compaction. None disables the cap.
-    /// Default catches single huge tool results (e.g. a 491 KB web_fetch
+    /// Default catches single huge tool results (e.g. a 491 KB web-fetch
     /// body) sitting inside the keep_recent window — without it, the
     /// byte threshold can re-trip on subsequent turns until the message
     /// rotates out organically.
@@ -164,12 +164,15 @@ impl Default for CompactionConfig {
 pub struct SearchConfig {
     #[serde(default = "default_search_provider")]
     pub provider: String,
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             provider: default_search_provider(),
+            brave_api_key: None,
         }
     }
 }

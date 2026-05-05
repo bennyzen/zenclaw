@@ -35,7 +35,7 @@ impl std::fmt::Display for ToolResult {
 }
 
 /// Cloud handles available to tools that need to write through the
-/// strict path (memory_save, cron save) or read from the cache.
+/// strict path (memory save/edit/delete, cron save) or read from the cache.
 /// `None` on the outer field of [`ToolContext`] means cloud is
 /// disabled — tools fall back to local-file behavior.
 pub struct CloudToolHandles {
@@ -81,18 +81,12 @@ impl ToolRegistry {
     /// Register all built-in tools (schemas only — no persistent instances).
     pub fn register_defaults(&mut self) {
         self.register_lazy(|| Box::new(file_tools::FileTool));
-        self.register_lazy(|| Box::new(memory_tools::MemorySaveTool));
-        self.register_lazy(|| Box::new(memory_tools::MemorySearchTool));
-        self.register_lazy(|| Box::new(memory_tools::MemoryListTool));
-        self.register_lazy(|| Box::new(memory_tools::MemoryGetTool));
-        self.register_lazy(|| Box::new(memory_tools::MemoryEditTool));
-        self.register_lazy(|| Box::new(memory_tools::MemoryDeleteTool));
+        self.register_lazy(|| Box::new(memory_tools::MemoryTool));
         self.register_lazy(|| Box::new(session_tools::SessionTool));
         self.register_lazy(|| Box::new(gateway_tool::GatewayTool));
         self.register_lazy(|| Box::new(storage_tools::StorageTool));
         self.register_lazy(|| Box::new(cron_tools::CronTool));
-        self.register_lazy(|| Box::new(web_tools::WebFetchTool));
-        self.register_lazy(|| Box::new(web_tools::WebSearchTool));
+        self.register_lazy(|| Box::new(web_tools::WebTool));
         // message_send and subagent omitted — not viable on ESP32 hardware
     }
 
