@@ -966,6 +966,10 @@ fn start_http_server(
         // We register ~36 handlers (REST + OPTIONS preflights + WS). Leave
         // headroom for future routes; the per-handler memory cost is tiny.
         max_uri_handlers: 64,
+        // Required for /api/sessions/* and any future wildcard routes.
+        // Without this, ESP-IDF httpd uses exact string matching only, so
+        // the literal '*' in a pattern never matches a real URI segment.
+        uri_match_wildcard: true,
         ..Default::default()
     }).unwrap();
 
@@ -990,12 +994,12 @@ fn start_http_server(
         "/api/status", "/api/chat", "/api/chat/history", "/api/config", "/api/wifi",
         "/api/files", "/api/files/read", "/api/files/write", "/api/files/mkdir",
         "/api/files/upload", "/api/restart", "/api/cloud/files", "/api/cloud/sign",
-        "/api/sessions",
+        "/api/sessions", "/api/sessions/*",
     ] {
         server.fn_handler::<anyhow::Error, _>(path, Method::Options, |req| {
             let mut resp = req.into_response(204, None, &[
                 ("Access-Control-Allow-Origin", "*"),
-                ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
+                ("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
                 ("Access-Control-Allow-Headers", "Content-Type"),
                 ("Access-Control-Max-Age", "86400"),
             ])?;
@@ -1710,8 +1714,8 @@ a{{color:#60a5fa;text-decoration:none}}
         );
         if let Err(e) = gw_sessions_create.sessions.set_meta(&chat_id, &meta) {
             log::warn!("api_sessions_create: set_meta failed for {}: {}", chat_id, e);
-            let mut resp = req.into_response(500, Some("Internal Server Error"), &[])?;
-            resp.write_all(format!("set_meta: {}", e).as_bytes())?;
+            let mut resp = req.into_response(500, Some("Internal Server Error"), CORS_HEADERS)?;
+            resp.write_all(serde_json::json!({"error": format!("set_meta: {}", e)}).to_string().as_bytes())?;
             return Ok(());
         }
         let body = serde_json::to_vec(&serde_json::json!({"chatId": chat_id, "meta": meta}))?;
@@ -1722,9 +1726,9 @@ a{{color:#60a5fa;text-decoration:none}}
     }).unwrap();
 
     // --- /api/sessions/* (PATCH) — rename a session ---
-    // The wildcard path "/api/sessions/*" is supported by esp-idf's httpd_uri_t
-    // (same underlying mechanism as other wildcard URIs). The chat_id is parsed
-    // from the URI segment after "/api/sessions/".
+    // Wildcard URI matching is enabled via Configuration::uri_match_wildcard = true above.
+    // ESP-IDF httpd binds httpd_uri_match_wildcard, which matches /api/sessions/*
+    // against any suffix; we strip the prefix and split on '?' to extract the chat_id.
     let gw_sessions_patch = gateway.clone();
     server.fn_handler::<anyhow::Error, _>("/api/sessions/*", Method::Patch, move |mut req| {
         let uri = req.uri().to_string();
@@ -1734,8 +1738,8 @@ a{{color:#60a5fa;text-decoration:none}}
             .map(|s| s.to_string())
             .unwrap_or_default();
         if chat_id.is_empty() {
-            let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
-            resp.write_all(b"missing chat id")?;
+            let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+            resp.write_all(serde_json::json!({"error": "missing chat id"}).to_string().as_bytes())?;
             return Ok(());
         }
 
@@ -1753,8 +1757,8 @@ a{{color:#60a5fa;text-decoration:none}}
         let parsed: PatchBody = match serde_json::from_slice(&body) {
             Ok(p) => p,
             Err(e) => {
-                let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
-                resp.write_all(format!("invalid body: {}", e).as_bytes())?;
+                let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": format!("invalid body: {}", e)}).to_string().as_bytes())?;
                 return Ok(());
             }
         };
@@ -1768,18 +1772,18 @@ a{{color:#60a5fa;text-decoration:none}}
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut resp = req.into_response(404, Some("Not Found"), &[])?;
-                resp.write_all(format!("not found: {}", chat_id).as_bytes())?;
+                let mut resp = req.into_response(404, Some("Not Found"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": format!("not found: {}", chat_id)}).to_string().as_bytes())?;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
-                resp.write_all(e.to_string().as_bytes())?;
+                let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": e.to_string()}).to_string().as_bytes())?;
                 Ok(())
             }
             Err(e) => {
-                let mut resp = req.into_response(500, Some("Internal Server Error"), &[])?;
-                resp.write_all(e.to_string().as_bytes())?;
+                let mut resp = req.into_response(500, Some("Internal Server Error"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": e.to_string()}).to_string().as_bytes())?;
                 Ok(())
             }
         }
@@ -1795,8 +1799,8 @@ a{{color:#60a5fa;text-decoration:none}}
             .map(|s| s.to_string())
             .unwrap_or_default();
         if chat_id.is_empty() {
-            let mut resp = req.into_response(400, Some("Bad Request"), &[])?;
-            resp.write_all(b"missing chat id")?;
+            let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+            resp.write_all(serde_json::json!({"error": "missing chat id"}).to_string().as_bytes())?;
             return Ok(());
         }
 
@@ -1810,13 +1814,12 @@ a{{color:#60a5fa;text-decoration:none}}
         match result {
             Ok(()) => {
                 log::info!("Session deleted: {}", chat_id);
-                let mut resp = req.into_response(204, Some("No Content"), &[])?;
-                resp.write_all(b"")?;
+                let _resp = req.into_response(204, Some("No Content"), CORS_HEADERS)?;
                 Ok(())
             }
             Err(e) => {
-                let mut resp = req.into_response(500, Some("Internal Server Error"), &[])?;
-                resp.write_all(e.to_string().as_bytes())?;
+                let mut resp = req.into_response(500, Some("Internal Server Error"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": e.to_string()}).to_string().as_bytes())?;
                 Ok(())
             }
         }
