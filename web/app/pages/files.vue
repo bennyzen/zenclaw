@@ -24,9 +24,18 @@ const {
 } = useConnection()
 
 // Storage mode
-const storageMode = ref<'device' | 'cloud'>('device')
+type StorageMode = 'device' | 'sdcard' | 'cloud'
+const storageMode = ref<StorageMode>('device')
 const isCloud = computed(() => storageMode.value === 'cloud')
+const isSdcard = computed(() => storageMode.value === 'sdcard')
 const cloudConfigured = computed(() => state.lastStatus?.cloudStorage?.configured ?? false)
+const sdcardMounted = computed(() => state.lastStatus?.sdcard?.mounted === true)
+
+function rootForMode(mode: StorageMode): string {
+  if (mode === 'cloud') return ''
+  if (mode === 'sdcard') return '/sdcard'
+  return '/data'
+}
 
 const currentPath = ref('/data')
 const entries = ref<FileEntry[]>([])
@@ -57,7 +66,7 @@ const deleting = ref(false)
 // Upload
 const uploadInput = ref<HTMLInputElement | null>(null)
 
-function switchMode(mode: 'device' | 'cloud') {
+function switchMode(mode: StorageMode) {
   if (storageMode.value === mode) return
   storageMode.value = mode
   selectedFile.value = null
@@ -65,7 +74,7 @@ function switchMode(mode: 'device' | 'cloud') {
   editorDirty.value = false
   saveMsg.value = null
   error.value = null
-  currentPath.value = mode === 'cloud' ? '' : '/data'
+  currentPath.value = rootForMode(mode)
   loadDir(currentPath.value)
 }
 
@@ -96,6 +105,7 @@ function goUp() {
     const parent = slash >= 0 ? trimmed.substring(0, slash + 1) : ''
     loadDir(parent)
   } else {
+    // Device + sdcard: don't climb above the mount root
     const parts = currentPath.value.split('/').filter(Boolean)
     if (parts.length <= 1) return
     parts.pop()
@@ -218,6 +228,10 @@ async function handleUpload(event: Event) {
     if (isCloud.value) {
       const key = currentPath.value + file.name
       await uploadCloudFile(key, data)
+    } else if (isSdcard.value) {
+      // SD card has plenty of space; never silently bounce to cloud.
+      // If the SD upload fails the user sees the actual error.
+      await uploadFile(`${currentPath.value}/${file.name}`, data)
     } else {
       const path = `${currentPath.value}/${file.name}`
       try {
@@ -271,7 +285,7 @@ function formatSize(size: number | null): string {
 
 const canGoUp = computed(() => {
   if (isCloud.value) return currentPath.value !== ''
-  return currentPath.value !== '/data'
+  return currentPath.value !== rootForMode(storageMode.value)
 })
 
 const displayPath = computed(() => {
@@ -282,12 +296,21 @@ const displayPath = computed(() => {
 // Load root on mount
 onMounted(() => {
   if (state.networkConnected) {
-    loadDir('/data')
+    loadDir(rootForMode(storageMode.value))
   }
 })
 
 watch(() => state.networkConnected, (connected) => {
-  if (connected) loadDir(storageMode.value === 'cloud' ? '' : '/data')
+  if (connected) loadDir(rootForMode(storageMode.value))
+})
+
+// If the current mode loses its backing (e.g. user popped the SD card and
+// the next status poll says mounted=false) drop back to device mode rather
+// than staring at "sdcard not mounted" errors.
+watch(sdcardMounted, (mounted) => {
+  if (!mounted && storageMode.value === 'sdcard') {
+    switchMode('device')
+  }
 })
 </script>
 
@@ -307,6 +330,16 @@ watch(() => state.networkConnected, (connected) => {
             @click="switchMode('device')"
           />
         </UTooltip>
+        <UTooltip v-if="sdcardMounted" text="microSD card mounted at /sdcard. Plenty of room for large files.">
+          <UButton
+            icon="i-lucide-card-sim"
+            :label="'SD'"
+            size="xs"
+            :variant="storageMode === 'sdcard' ? 'soft' : 'ghost'"
+            :color="storageMode === 'sdcard' ? 'primary' : 'neutral'"
+            @click="switchMode('sdcard')"
+          />
+        </UTooltip>
         <UTooltip text="Cloud storage (R2). Large files go here automatically.">
           <UButton
             icon="i-lucide-cloud"
@@ -321,7 +354,13 @@ watch(() => state.networkConnected, (connected) => {
       </div>
     </div>
 
-    <p class="text-sm text-dimmed">
+    <p v-if="isSdcard" class="text-sm text-dimmed">
+      microSD card storage. Plenty of room for datasets, model files, and large blobs. Mount point: <code>/sdcard</code>.
+      <span v-if="state.lastStatus?.sdcard?.totalKb">
+        — {{ Math.round((state.lastStatus.sdcard.freeKb ?? 0) / 1024) }}MB free of {{ Math.round(state.lastStatus.sdcard.totalKb / 1024) }}MB ({{ state.lastStatus.sdcard.type ?? 'SD' }}, {{ state.lastStatus.sdcard.busWidth ?? 1 }}-bit).
+      </span>
+    </p>
+    <p v-else class="text-sm text-dimmed">
       Files up to 256 KB are stored on the device. Larger files are automatically uploaded to cloud storage and won't use device space. The agent can read and search cloud files of any size.
     </p>
 
@@ -465,43 +504,50 @@ watch(() => state.networkConnected, (connected) => {
     </template>
 
     <!-- Create modal -->
-    <UModal v-model:open="createOpen">
-      <template #content>
-        <div class="space-y-4 p-4">
-          <h3 class="text-lg font-semibold">
-            {{ isCloud ? 'Create File' : `Create ${createType === 'dir' ? 'Directory' : 'File'}` }}
-          </h3>
-          <UFormField label="Name">
-            <UInput v-model="createName" :placeholder="isCloud ? 'new-file.txt' : (createType === 'dir' ? 'new-folder' : 'new-file.txt')" />
-          </UFormField>
-          <div class="flex justify-end gap-2">
-            <UButton label="Cancel" variant="ghost" color="neutral" @click="createOpen = false" />
-            <UButton :label="creating ? 'Creating...' : 'Create'" :disabled="creating" @click="doCreate">
-              <template v-if="creating" #leading>
-                <UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" />
-              </template>
-            </UButton>
-          </div>
+    <UModal
+      v-model:open="createOpen"
+      :title="isCloud ? 'Create File' : `Create ${createType === 'dir' ? 'Directory' : 'File'}`"
+    >
+      <template #body>
+        <UFormField label="Name" class="w-full">
+          <UInput
+            v-model="createName"
+            class="w-full"
+            :placeholder="isCloud ? 'new-file.txt' : (createType === 'dir' ? 'new-folder' : 'new-file.txt')"
+            @keydown.enter="doCreate"
+          />
+        </UFormField>
+      </template>
+      <template #footer>
+        <div class="flex w-full justify-end gap-2">
+          <UButton label="Cancel" variant="ghost" color="neutral" @click="createOpen = false" />
+          <UButton :label="creating ? 'Creating...' : 'Create'" :disabled="creating" @click="doCreate">
+            <template v-if="creating" #leading>
+              <UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" />
+            </template>
+          </UButton>
         </div>
       </template>
     </UModal>
 
     <!-- Delete confirmation modal -->
-    <UModal v-model:open="deleteOpen">
-      <template #content>
-        <div class="space-y-4 p-4">
-          <h3 class="text-lg font-semibold">Delete {{ deleteTarget?.isDir ? 'Directory' : 'File' }}</h3>
-          <p class="text-sm text-muted">
-            Are you sure you want to delete <strong>{{ deleteTarget?.name }}</strong>?
-          </p>
-          <div class="flex justify-end gap-2">
-            <UButton label="Cancel" variant="ghost" color="neutral" @click="deleteOpen = false" />
-            <UButton :label="deleting ? 'Deleting...' : 'Delete'" color="error" :disabled="deleting" @click="doDelete">
-              <template v-if="deleting" #leading>
-                <UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" />
-              </template>
-            </UButton>
-          </div>
+    <UModal
+      v-model:open="deleteOpen"
+      :title="`Delete ${deleteTarget?.isDir ? 'Directory' : 'File'}`"
+    >
+      <template #body>
+        <p class="text-sm text-muted">
+          Are you sure you want to delete <strong>{{ deleteTarget?.name }}</strong>?
+        </p>
+      </template>
+      <template #footer>
+        <div class="flex w-full justify-end gap-2">
+          <UButton label="Cancel" variant="ghost" color="neutral" @click="deleteOpen = false" />
+          <UButton :label="deleting ? 'Deleting...' : 'Delete'" color="error" :disabled="deleting" @click="doDelete">
+            <template v-if="deleting" #leading>
+              <UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" />
+            </template>
+          </UButton>
         </div>
       </template>
     </UModal>

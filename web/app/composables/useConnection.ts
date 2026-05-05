@@ -116,6 +116,16 @@ function mapStatus(raw: Record<string, any>): DeviceStatus {
           error: raw.cloud_storage.error,
         }
       : null,
+    sdcard: raw.sdcard
+      ? {
+          mounted: raw.sdcard.mounted ?? false,
+          path: raw.sdcard.path,
+          totalKb: raw.sdcard.total_kb,
+          freeKb: raw.sdcard.free_kb,
+          type: raw.sdcard.type,
+          busWidth: raw.sdcard.bus_width,
+        }
+      : null,
     provider: raw.provider || null,
     model: raw.model || null,
     uptimeS: raw.uptime_s ?? null,

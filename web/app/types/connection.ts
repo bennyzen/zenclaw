@@ -11,6 +11,7 @@ export interface DeviceStatus {
   wifi: { connected: boolean; ip: string | null; rssi: number | null } | null
   storage: { totalKb: number; freeKb: number } | null
   cloudStorage: { configured: boolean; provider?: string; bucket?: string; objects?: number; totalBytes?: number; error?: string } | null
+  sdcard: { mounted: boolean; path?: string; totalKb?: number; freeKb?: number; type?: string; busWidth?: number } | null
   provider: string | null
   model: string | null
   uptimeS: number | null

@@ -104,6 +104,25 @@ const tooltipUi = {
         </template>
       </UTooltip>
 
+      <UTooltip v-if="state.lastStatus?.sdcard?.mounted" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
+        <span class="cell">
+          <UIcon name="i-lucide-card-sim" class="size-3 text-dimmed" />
+          {{ prettyBytes((state.lastStatus.sdcard.freeKb ?? 0) * 1024) }}
+        </span>
+        <template #content>
+          <div class="tooltip-rows">
+            <div class="flex items-center gap-1.5 font-semibold text-[13px]">
+              <UIcon name="i-lucide-card-sim" class="size-4" /> SD card
+            </div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Mount</span><span>{{ state.lastStatus!.sdcard!.path ?? '/sdcard' }}</span></div>
+            <div v-if="state.lastStatus!.sdcard!.type" class="flex justify-between gap-4"><span class="text-dimmed">Type</span><span>{{ state.lastStatus!.sdcard!.type }}</span></div>
+            <div v-if="state.lastStatus!.sdcard!.busWidth" class="flex justify-between gap-4"><span class="text-dimmed">Bus</span><span>{{ state.lastStatus!.sdcard!.busWidth }}-bit</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Free</span><span>{{ prettyBytes((state.lastStatus!.sdcard!.freeKb ?? 0) * 1024) }}</span></div>
+            <div class="flex justify-between gap-4"><span class="text-dimmed">Total</span><span>{{ prettyBytes((state.lastStatus!.sdcard!.totalKb ?? 0) * 1024) }}</span></div>
+          </div>
+        </template>
+      </UTooltip>
+
       <UTooltip v-if="state.lastStatus?.cloudStorage?.configured" :ui="tooltipUi" :content="{ side: 'top', sideOffset: 8 }">
         <span class="cell">
           <UIcon name="i-lucide-cloud" class="size-3 text-green-400" />

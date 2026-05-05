@@ -26,3 +26,9 @@ CONFIG_ETH_USE_OPENETH=n
 
 # Flash
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# FATFS — long filenames on heap (default LFN_NONE limits to 8.3 DOS names,
+# unusable for cross-platform SD card content).
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y

@@ -259,6 +259,13 @@ fn main() {
     #[cfg(feature = "usb_storage")]
     zenclaw_agent::usb_storage::init();
 
+    // --- SD card (optional, P4 only today) ---
+    // Failure is non-fatal: /sdcard simply remains unavailable and the
+    // status payload reports `sdcard.mounted: false` so the web UI can
+    // hide its tab.
+    #[cfg(feature = "sdcard")]
+    zenclaw_agent::sdcard::init();
+
     // --- Create gateway ---
     let data_dir = "/data";
     let _ = std::fs::create_dir_all(format!("{}/sessions", data_dir));
@@ -596,26 +603,53 @@ fn get_query_param(uri: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Confine `/api/files*` to the LittleFS partition. Empty input maps to
-/// `/data` so that a path-less `GET /api/files` lists the root of the
-/// partition. Anything else must already start with `/data` and contain
-/// no `..` segments — matching the relative-to-data-root jail that the
-/// desktop server enforces via `safe_join`.
+/// Confine `/api/files*` to the supported writable mounts: `/data`
+/// (LittleFS, always present) and — when the board has the `sdcard`
+/// feature enabled and a card actually mounted — `/sdcard` (FATFS).
+///
+/// Empty input maps to `/data` so a path-less `GET /api/files` lists the
+/// LittleFS root (back-compat with the original device-mode contract).
+/// Any explicit path must already start with one of the mount roots and
+/// contain no `..` segments — matching the relative-to-data-root jail
+/// that the desktop server enforces via `safe_join`.
+///
+/// `/sdcard` requests are rejected (with a distinct error) when the SD
+/// is unmounted so the web UI can surface the cause to the user.
 #[cfg(feature = "esp32")]
-fn jail_data_path(input: &str) -> Result<String, &'static str> {
+fn jail_filesystem_path(input: &str) -> Result<String, &'static str> {
     let candidate = if input.is_empty() || input == "/" {
         "/data"
     } else {
         input
     };
     if candidate.split('/').any(|seg| seg == "..") {
-        return Err("path escapes /data");
+        return Err("path escapes mount root");
     }
     if candidate == "/data" || candidate.starts_with("/data/") {
-        Ok(candidate.to_string())
-    } else {
-        Err("path must be under /data")
+        return Ok(candidate.to_string());
     }
+    if candidate == "/sdcard" || candidate.starts_with("/sdcard/") {
+        #[cfg(feature = "sdcard")]
+        {
+            if zenclaw_agent::sdcard::is_mounted() {
+                return Ok(candidate.to_string());
+            }
+            return Err("sdcard not mounted");
+        }
+        #[cfg(not(feature = "sdcard"))]
+        {
+            return Err("sdcard not supported on this board");
+        }
+    }
+    Err("path must be under /data or /sdcard")
+}
+
+/// True when `path` points at the root of a writable mount. Used by file
+/// handlers that refuse to act on a bare mount root (empty path was a
+/// likely client bug, and deleting a mount root would be catastrophic).
+#[cfg(feature = "esp32")]
+fn is_mount_root(path: &str) -> bool {
+    path == "/data" || path == "/sdcard"
 }
 
 /// Cache for the `/api/status.cloud_storage` block. R2 LIST is rate-
@@ -788,6 +822,7 @@ fn build_status_payload(
             "total_kb": fs_total / 1024,
             "free_kb": fs_total.saturating_sub(fs_used) / 1024,
         },
+        "sdcard": sdcard_status_block(),
         "channels": {
             "telegram": {
                 "configured": gw.config.channels.telegram.is_some(),
@@ -843,6 +878,28 @@ fn sync_block(gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>) -> ser
             "last_error": e.last_error_msg,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// `/api/status.sdcard` block. Always present so the JSON shape is the
+/// same across boards — boards without the `sdcard` feature (DevKitC)
+/// just report `mounted: false` and the web UI hides its tab.
+#[cfg(feature = "esp32")]
+fn sdcard_status_block() -> serde_json::Value {
+    #[cfg(feature = "sdcard")]
+    {
+        if zenclaw_agent::sdcard::is_mounted() {
+            let (total, free) = zenclaw_agent::sdcard::info().unwrap_or((0, 0));
+            return serde_json::json!({
+                "mounted": true,
+                "path": "/sdcard",
+                "total_kb": total / 1024,
+                "free_kb": free / 1024,
+                "type": zenclaw_agent::sdcard::type_str(),
+                "bus_width": zenclaw_agent::sdcard::bus_width(),
+            });
+        }
+    }
+    serde_json::json!({ "mounted": false })
 }
 
 /// Boot warnings + heartbeat conflict captured at startup. Stable for
@@ -1399,7 +1456,7 @@ a{{color:#60a5fa;text-decoration:none}}
     server.fn_handler::<anyhow::Error, _>("/api/files", Method::Get, |req| {
         let uri = req.uri().to_string();
         let raw = get_query_param(&uri, "path").unwrap_or_default();
-        let path = match jail_data_path(&raw) {
+        let path = match jail_filesystem_path(&raw) {
             Ok(p) => p,
             Err(msg) => {
                 let err = serde_json::json!({"error": msg}).to_string();
@@ -1429,9 +1486,9 @@ a{{color:#60a5fa;text-decoration:none}}
     server.fn_handler::<anyhow::Error, _>("/api/files", Method::Delete, |req| {
         let uri = req.uri().to_string();
         let raw = get_query_param(&uri, "path").unwrap_or_default();
-        let path = match jail_data_path(&raw) {
-            Ok(p) if p == "/data" => {
-                let err = serde_json::json!({"error": "refusing to delete /data root"}).to_string();
+        let path = match jail_filesystem_path(&raw) {
+            Ok(p) if is_mount_root(&p) => {
+                let err = serde_json::json!({"error": format!("refusing to delete mount root {}", p)}).to_string();
                 let mut resp = req.into_response(400, None, CORS_HEADERS)?;
                 resp.write_all(err.as_bytes())?;
                 return Ok(());
@@ -1468,7 +1525,7 @@ a{{color:#60a5fa;text-decoration:none}}
     server.fn_handler::<anyhow::Error, _>("/api/files/read", Method::Get, |req| {
         let uri = req.uri().to_string();
         let raw = get_query_param(&uri, "path").unwrap_or_default();
-        let path = match jail_data_path(&raw) {
+        let path = match jail_filesystem_path(&raw) {
             Ok(p) => p,
             Err(msg) => {
                 let err = serde_json::json!({"error": msg}).to_string();
@@ -1504,8 +1561,8 @@ a{{color:#60a5fa;text-decoration:none}}
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         let raw = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
         let content = parsed.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let path = match jail_data_path(raw) {
-            Ok(p) if p == "/data" => {
+        let path = match jail_filesystem_path(raw) {
+            Ok(p) if is_mount_root(&p) => {
                 let err = serde_json::json!({"error": "path required"}).to_string();
                 let mut resp = req.into_response(400, None, CORS_HEADERS)?;
                 resp.write_all(err.as_bytes())?;
@@ -1548,8 +1605,8 @@ a{{color:#60a5fa;text-decoration:none}}
         }
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         let raw = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        let path = match jail_data_path(raw) {
-            Ok(p) if p == "/data" => {
+        let path = match jail_filesystem_path(raw) {
+            Ok(p) if is_mount_root(&p) => {
                 let err = serde_json::json!({"error": "path required"}).to_string();
                 let mut resp = req.into_response(400, None, CORS_HEADERS)?;
                 resp.write_all(err.as_bytes())?;
@@ -1582,8 +1639,8 @@ a{{color:#60a5fa;text-decoration:none}}
     server.fn_handler::<anyhow::Error, _>("/api/files/upload", Method::Post, |mut req| {
         let uri = req.uri().to_string();
         let raw = get_query_param(&uri, "path").unwrap_or_default();
-        let path = match jail_data_path(&raw) {
-            Ok(p) if p == "/data" => {
+        let path = match jail_filesystem_path(&raw) {
+            Ok(p) if is_mount_root(&p) => {
                 let err = serde_json::json!({"error": "path required"}).to_string();
                 let mut resp = req.into_response(400, None, CORS_HEADERS)?;
                 resp.write_all(err.as_bytes())?;

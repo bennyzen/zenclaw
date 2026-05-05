@@ -15,6 +15,10 @@ nic-eth           = ["esp32"]   # Internal EMAC + external PHY (P4)
 
 usb_storage = ["esp32"]
 
+# SD card (FATFS over SDMMC peripheral). Adds ~30 KB to the binary so it's
+# off by default; enabled by board manifests where the slot exists.
+sdcard = ["esp32"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -90,3 +94,12 @@ bindings_header = "bindings_led_strip.h"
 # component is enough to expose the FFI.
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "joltwallet/littlefs", version = "1.21.1" }
+
+# Local C component that wraps SDMMC_HOST_DEFAULT() + esp_vfs_fat_sdmmc_mount
+# behind a flat C API. We do this in C rather than hand-mirroring the macro
+# in Rust because the macro fills 17 function-pointer fields plus an
+# anonymous union on sdmmc_host_t — fragile to reproduce against bindgen
+# output drift. Always built; Rust callers gate on the `sdcard` feature so
+# DevKitC builds don't pay a runtime cost (LTO strips the unused symbols).
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components/zenclaw_sd"]
