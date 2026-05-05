@@ -788,6 +788,63 @@ impl SessionManager {
         self.clear(chat_id)
     }
 
+    /// Hard-delete this chat: remove the JSONL and the meta sidecar
+    /// locally; wipe matching keys from the in-memory cache. Does NOT
+    /// touch S3 — callers with store access should use
+    /// `delete_with_store` for full cleanup.
+    ///
+    /// Idempotent: missing files are not an error.
+    pub fn delete(&self, chat_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Cache wipe (in-memory tier-1) — same pattern as clear().
+        if let Some(cache) = &self.cache {
+            let prefix = Self::cloud_prefix(chat_id);
+            for key in cache.keys_with_prefix(&prefix) {
+                cache.delete(&key);
+            }
+        }
+
+        // Local file removals.
+        let jsonl = self.session_path(chat_id);
+        match std::fs::remove_file(&jsonl) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let meta = self.meta_path(chat_id);
+        match std::fs::remove_file(&meta) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    /// As `delete`, but also walks the cloud `sys/sessions/<id>/` prefix
+    /// and deletes each key. Errors from individual cloud deletes log a
+    /// warning but do not abort — the local cleanup must complete so the
+    /// chat disappears from the UI; cloud orphans surface in dead-letter
+    /// telemetry and can be GC'd later.
+    pub fn delete_with_store(
+        &self,
+        chat_id: &str,
+        store: &dyn crate::core::cloud::client::ObjectStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prefix = Self::cloud_prefix(chat_id);
+        match store.list_keys(&prefix) {
+            Ok(keys) => {
+                for k in keys {
+                    if let Err(e) = store.delete(&k) {
+                        tracing::warn!(error = %e, key = %k, "delete: S3 delete failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, prefix = %prefix, "delete: S3 list_keys failed");
+            }
+        }
+        self.delete(chat_id)
+    }
+
     /// List all session chat_ids (derived from .jsonl filenames).
     pub fn list(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut ids = Vec::new();
@@ -1582,5 +1639,95 @@ mod tests {
         assert_eq!(mgr.session_size_bytes("web"), Some(log_len));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_jsonl_and_meta_locally() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"x").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        mgr.delete("chat-1").unwrap();
+
+        assert!(!dir.path().join("chat-1.jsonl").exists());
+        assert!(!dir.path().join("chat-1.meta.json").exists());
+        assert_eq!(mgr.list_with_meta().len(), 0);
+    }
+
+    #[test]
+    fn delete_is_idempotent_when_files_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        // Should not error
+        mgr.delete("never-existed").unwrap();
+    }
+
+    #[test]
+    fn delete_with_store_removes_local_and_cloud_keys() {
+        // Reuses the existing FakeStore pattern from clear_with_store tests.
+        // Build a fake store with seeded keys, run delete_with_store, verify
+        // both local files removed AND store.delete called for each prefix key.
+        use crate::core::cloud::client::ObjectStore;
+        use crate::core::sessions::meta::SessionMeta;
+
+        // Inline minimal FakeStore that records delete calls.
+        struct FakeStore {
+            keys: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+            deleted: std::sync::Mutex<Vec<String>>,
+        }
+        impl ObjectStore for FakeStore {
+            fn put(&self, key: &str, bytes: &[u8]) -> crate::core::cloud::client::Result<()> {
+                self.keys.lock().unwrap().insert(key.to_string(), bytes.to_vec());
+                Ok(())
+            }
+            fn get(&self, key: &str) -> crate::core::cloud::client::Result<Vec<u8>> {
+                self.keys.lock().unwrap().get(key).cloned()
+                    .ok_or_else(|| crate::core::cloud::client::S3Error(format!("not found: {}", key)))
+            }
+            fn head(&self, key: &str) -> crate::core::cloud::client::Result<Option<u64>> {
+                Ok(self.keys.lock().unwrap().get(key).map(|v| v.len() as u64))
+            }
+            fn delete(&self, key: &str) -> crate::core::cloud::client::Result<()> {
+                self.deleted.lock().unwrap().push(key.to_string());
+                self.keys.lock().unwrap().remove(key);
+                Ok(())
+            }
+            fn list_keys(&self, prefix: &str) -> crate::core::cloud::client::Result<Vec<String>> {
+                Ok(self.keys.lock().unwrap().keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned().collect())
+            }
+        }
+
+        let store = FakeStore {
+            keys: std::sync::Mutex::new(std::collections::HashMap::from([
+                ("sys/sessions/chat-1/base.jsonl".to_string(), b"x".to_vec()),
+                ("sys/sessions/chat-1/meta.json".to_string(), b"y".to_vec()),
+                ("sys/sessions/chat-1/log-00.jsonl".to_string(), b"z".to_vec()),
+                ("sys/sessions/other/base.jsonl".to_string(), b"keep".to_vec()),
+            ])),
+            deleted: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"x").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        mgr.delete_with_store("chat-1", &store).unwrap();
+
+        // Local removed.
+        assert!(!dir.path().join("chat-1.jsonl").exists());
+        assert!(!dir.path().join("chat-1.meta.json").exists());
+
+        // Cloud: chat-1's three keys deleted; "other" untouched.
+        let deleted = store.deleted.lock().unwrap();
+        assert_eq!(deleted.len(), 3, "expected 3 cloud deletes, got {:?}", *deleted);
+        for d in deleted.iter() {
+            assert!(d.starts_with("sys/sessions/chat-1/"), "unexpected delete: {}", d);
+        }
+        assert!(store.keys.lock().unwrap().contains_key("sys/sessions/other/base.jsonl"));
     }
 }
