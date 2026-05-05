@@ -7,6 +7,8 @@ use std::sync::Arc;
 use crate::core::cloud::{CloudCache, Replicator};
 use crate::core::types::{Role, ToolCall};
 
+pub mod meta;
+
 // ---------------------------------------------------------------------------
 // Session entry types
 // ---------------------------------------------------------------------------
