@@ -59,6 +59,35 @@ impl SessionMeta {
             SessionKind::Other
         }
     }
+
+    /// Build a sensible default for a chat that has no sidecar yet.
+    /// When `first_user_message` is `Some(non-empty after trim)`,
+    /// derive a title by truncating to 40 characters with
+    /// `TitleSource::FirstMessage`. Otherwise fall back to "New chat"
+    /// + `TitleSource::Default`.
+    pub fn synthesize_default(
+        chat_id: &str,
+        now_ms: u64,
+        first_user_message: Option<&str>,
+    ) -> Self {
+        let (title, title_source) = match first_user_message {
+            Some(msg) if !msg.trim().is_empty() => {
+                let title: String = msg.trim().chars().take(40).collect();
+                (title, TitleSource::FirstMessage)
+            }
+            _ => ("New chat".to_string(), TitleSource::Default),
+        };
+        Self {
+            chat_id: chat_id.to_string(),
+            kind: Self::detect_kind(chat_id),
+            title,
+            title_source,
+            created_at_ms: now_ms,
+            last_activity_ms: now_ms,
+            last_message_preview: String::new(),
+            version: 1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +159,44 @@ mod tests {
     #[test]
     fn detect_kind_other_fallback() {
         assert_eq!(SessionMeta::detect_kind("custom-thing"), SessionKind::Other);
+    }
+
+    #[test]
+    fn synthesize_default_without_first_message() {
+        let m = SessionMeta::synthesize_default("chat-100", 100, None);
+        assert_eq!(m.chat_id, "chat-100");
+        assert_eq!(m.kind, SessionKind::Web);
+        assert_eq!(m.title, "New chat");
+        assert_eq!(m.title_source, TitleSource::Default);
+        assert_eq!(m.created_at_ms, 100);
+        assert_eq!(m.last_activity_ms, 100);
+        assert_eq!(m.last_message_preview, "");
+        assert_eq!(m.version, 1);
+    }
+
+    #[test]
+    fn synthesize_default_with_first_message() {
+        let m = SessionMeta::synthesize_default(
+            "chat-100",
+            100,
+            Some("How do I propagate tomatoes from cuttings?"),
+        );
+        assert_eq!(m.title, "How do I propagate tomatoes from cutting");
+        assert_eq!(m.title.chars().count(), 40);
+        assert_eq!(m.title_source, TitleSource::FirstMessage);
+    }
+
+    #[test]
+    fn synthesize_default_first_message_short_no_truncation() {
+        let m = SessionMeta::synthesize_default("chat-100", 100, Some("hi"));
+        assert_eq!(m.title, "hi");
+        assert_eq!(m.title_source, TitleSource::FirstMessage);
+    }
+
+    #[test]
+    fn synthesize_default_empty_first_message_falls_back() {
+        let m = SessionMeta::synthesize_default("chat-100", 100, Some("   "));
+        assert_eq!(m.title, "New chat");
+        assert_eq!(m.title_source, TitleSource::Default);
     }
 }
