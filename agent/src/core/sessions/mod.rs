@@ -245,6 +245,24 @@ impl SessionManager {
         }
     }
 
+    /// Update last-activity-ms and last-message-preview after a
+    /// successful chat turn. Best-effort — failures are logged but
+    /// do not propagate (the user already received their reply;
+    /// sidebar staleness is non-critical). Synthesizes a fresh meta
+    /// if none exists, so newly-active legacy or Telegram chats get
+    /// a sidecar on first sight.
+    pub fn bump_activity(&self, chat_id: &str, preview: &str, now_ms: u64) {
+        let mut meta = match self.meta(chat_id) {
+            Ok(Some(m)) => m,
+            _ => crate::core::sessions::meta::SessionMeta::synthesize_default(chat_id, now_ms, None),
+        };
+        meta.last_activity_ms = now_ms;
+        meta.last_message_preview = preview.chars().take(120).collect();
+        if let Err(e) = self.set_meta(chat_id, &meta) {
+            tracing::warn!("bump_activity for {}: {}", chat_id, e);
+        }
+    }
+
     /// Walk the sessions directory and return one `SessionMeta` per
     /// `<id>.jsonl`. When the matching `.meta.json` is missing or
     /// corrupt, synthesize a default (peeking at the first user-turn
@@ -1378,6 +1396,56 @@ mod tests {
         let listed = mgr.list_with_meta();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "New chat");
+    }
+
+    #[test]
+    fn bump_activity_updates_last_activity_and_preview() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let initial = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &initial).unwrap();
+
+        mgr.bump_activity("chat-1", "tomato sounds tasty", 200);
+
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.last_activity_ms, 200);
+        assert_eq!(m.last_message_preview, "tomato sounds tasty");
+    }
+
+    #[test]
+    fn bump_activity_truncates_preview_to_120_chars() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let initial = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &initial).unwrap();
+
+        let long = "a".repeat(200);
+        mgr.bump_activity("chat-1", &long, 200);
+
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.last_message_preview.chars().count(), 120);
+    }
+
+    #[test]
+    fn bump_activity_synthesizes_meta_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+
+        mgr.bump_activity("chat-1", "first contact", 500);
+
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.last_activity_ms, 500);
+        assert_eq!(m.last_message_preview, "first contact");
+    }
+
+    #[test]
+    fn bump_activity_does_not_panic_on_unwriteable_path() {
+        // Best-effort: a write failure logs but doesn't propagate.
+        let mgr = SessionManager::new("/nonexistent/path");
+        // Should not panic.
+        mgr.bump_activity("chat-1", "anything", 100);
     }
 
     #[test]
