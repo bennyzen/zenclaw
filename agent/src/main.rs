@@ -1495,10 +1495,23 @@ a{{color:#60a5fa;text-decoration:none}}
             resp.write_all(err.as_bytes())?;
             return Ok(());
         }
-        let _ = std::fs::create_dir_all(path);
-        let resp_body = serde_json::json!({"path": path}).to_string();
-        let mut resp = req.into_response(200, None, CORS_HEADERS)?;
-        resp.write_all(resp_body.as_bytes())?;
+        // SPIFFS is a flat key-value store — directories don't exist
+        // as first-class entities and `mkdir` returns ENOTSUP. Write
+        // an empty `.keep` sentinel so the prefix shows up in listings
+        // and the user gets the folder they asked for.
+        let keep = format!("{}/.keep", path.trim_end_matches('/'));
+        match std::fs::write(&keep, b"") {
+            Ok(()) => {
+                let resp_body = serde_json::json!({"path": path}).to_string();
+                let mut resp = req.into_response(200, None, CORS_HEADERS)?;
+                resp.write_all(resp_body.as_bytes())?;
+            }
+            Err(e) => {
+                let err = serde_json::json!({"error": format!("Cannot create directory: {}", e)}).to_string();
+                let mut resp = req.into_response(500, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+            }
+        }
         Ok(())
     }).unwrap();
 
