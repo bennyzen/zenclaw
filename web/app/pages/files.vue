@@ -28,7 +28,7 @@ const storageMode = ref<'device' | 'cloud'>('device')
 const isCloud = computed(() => storageMode.value === 'cloud')
 const cloudConfigured = computed(() => state.lastStatus?.cloudStorage?.configured ?? false)
 
-const currentPath = ref('/')
+const currentPath = ref('/data')
 const entries = ref<FileEntry[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
@@ -65,7 +65,7 @@ function switchMode(mode: 'device' | 'cloud') {
   editorDirty.value = false
   saveMsg.value = null
   error.value = null
-  currentPath.value = mode === 'cloud' ? '' : '/'
+  currentPath.value = mode === 'cloud' ? '' : '/data'
   loadDir(currentPath.value)
 }
 
@@ -97,9 +97,9 @@ function goUp() {
     loadDir(parent)
   } else {
     const parts = currentPath.value.split('/').filter(Boolean)
+    if (parts.length <= 1) return
     parts.pop()
-    const parent = '/' + parts.join('/')
-    loadDir(parent)
+    loadDir('/' + parts.join('/'))
   }
 }
 
@@ -190,9 +190,7 @@ async function doCreate() {
       const key = currentPath.value + name
       await writeCloudFile(key, '')
     } else {
-      const path = currentPath.value === '/'
-        ? `/${name}`
-        : `${currentPath.value}/${name}`
+      const path = `${currentPath.value}/${name}`
       if (createType.value === 'dir') {
         await createDir(path)
       } else {
@@ -221,16 +219,12 @@ async function handleUpload(event: Event) {
       const key = currentPath.value + file.name
       await uploadCloudFile(key, data)
     } else {
-      const path = currentPath.value === '/'
-        ? `/${file.name}`
-        : `${currentPath.value}/${file.name}`
+      const path = `${currentPath.value}/${file.name}`
       try {
         await uploadFile(path, data)
       } catch (e: any) {
         if (data.byteLength > 256 * 1024 || e.message?.includes('too large')) {
-          const key = currentPath.value === '/'
-            ? file.name
-            : `${currentPath.value}/${file.name}`
+          const key = `${currentPath.value}/${file.name}`.replace(/^\/+/, '')
           await uploadCloudFile(key, data)
           storageMode.value = 'cloud'
           currentPath.value = ''
@@ -277,7 +271,7 @@ function formatSize(size: number | null): string {
 
 const canGoUp = computed(() => {
   if (isCloud.value) return currentPath.value !== ''
-  return currentPath.value !== '/'
+  return currentPath.value !== '/data'
 })
 
 const displayPath = computed(() => {
@@ -288,12 +282,12 @@ const displayPath = computed(() => {
 // Load root on mount
 onMounted(() => {
   if (state.networkConnected) {
-    loadDir('/')
+    loadDir('/data')
   }
 })
 
 watch(() => state.networkConnected, (connected) => {
-  if (connected) loadDir(storageMode.value === 'cloud' ? '' : '/')
+  if (connected) loadDir(storageMode.value === 'cloud' ? '' : '/data')
 })
 </script>
 

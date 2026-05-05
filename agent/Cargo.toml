@@ -82,3 +82,11 @@ bindings_header = "bindings_usb_msc.h"
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "espressif/led_strip", version = "2" }
 bindings_header = "bindings_led_strip.h"
+
+# LittleFS for the /data partition. Replaces SPIFFS (which is flat, can't do
+# directories, and hangs the VFS on certain readdir paths). The esp_littlefs.h
+# header is already included transitively by the default esp-idf-sys bindings
+# when ESP_IDF_COMP_JOLTWALLET__LITTLEFS_ENABLED is defined — pulling the
+# component is enough to expose the FFI.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "joltwallet/littlefs", version = "1.21.1" }

@@ -151,7 +151,7 @@ curl -sf "http://$HOST/api/chat/history?chat_id=web" | python3 -m json.tool
 
 ```
 agent/src/
-  main.rs                     ESP32 entry: WiFi, mDNS, SPIFFS, HTTP server, Telegram poller
+  main.rs                     ESP32 entry: WiFi, mDNS, LittleFS, HTTP server, Telegram poller
   lib.rs                      Feature-gated module exports
   config.rs                   Config structs (serde, mirrors `/api/config` JSON shape)
   usb_storage.rs              USB Host MSC FFI wrapper (feature: usb_storage)
@@ -223,7 +223,7 @@ agent/src/
 nvs       0x9000   24KB   — WiFi creds, config JSON, settings
 phy_init  0xf000   4KB    — RF calibration
 factory   0x10000  4MB    — Application binary
-storage   0x410000 8MB    — SPIFFS (sessions, memory, data files)
+storage   0x410000 8MB    — LittleFS (sessions, memory, data files)
 ```
 
 ### Common Pitfalls (Rust)
@@ -298,7 +298,7 @@ zenclaw/
     bootloaders/              Vendored bootloaders (esp32s3.bin, esp32p4.bin)
     scripts/board-env.sh      Reads a board manifest and exports build env vars
     Cargo.toml                Dependencies, features, ESP-IDF components
-    partitions.csv            Flash partition layout (NVS + 4MB app + 8MB SPIFFS)
+    partitions.csv            Flash partition layout (NVS + 4MB app + 8MB LittleFS)
     sdkconfig.defaults        Shared ESP-IDF config (flash size, TLS, HTTP server)
     sdkconfig.board.devkitc   DevKitC profile (PSRAM, UART console, USB Host)
     sdkconfig.board.guition-p4  Guition P4 profile (EMAC, RISC-V, 32MB PSRAM)

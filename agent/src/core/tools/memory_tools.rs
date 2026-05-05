@@ -403,7 +403,6 @@ fn write_memory_file(ctx: &ToolContext, content: &str) -> std::io::Result<()> {
     }
     let path = memory_path(ctx);
     if let Some(parent) = std::path::Path::new(&path).parent() {
-        // SPIFFS rejects mkdir with ENOTSUP on flat filesystems; ignore.
         let _ = std::fs::create_dir_all(parent);
     }
     std::fs::write(&path, content)

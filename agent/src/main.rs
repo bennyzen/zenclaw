@@ -229,27 +229,30 @@ fn main() {
     let config = load_config(&nvs);
     log::info!("Config: agent={}, provider={}", config.agent_name, config.providers.default);
 
-    // --- Mount SPIFFS ---
-    let spiffs_conf = esp_idf_svc::sys::esp_vfs_spiffs_conf_t {
-        base_path: b"/data\0".as_ptr() as *const core::ffi::c_char,
-        partition_label: b"storage\0".as_ptr() as *const core::ffi::c_char,
-        max_files: 8,
-        format_if_mount_failed: true,
-    };
-    let ret = unsafe { esp_idf_svc::sys::esp_vfs_spiffs_register(&spiffs_conf) };
+    // --- Mount LittleFS at /data ---
+    // (Replaces SPIFFS — directories work, no readdir-on-empty-path hangs.)
+    // Bitfield init via zeroed() + setter is bindgen-version-stable; the
+    // alternative struct-literal form depends on internal `_bitfield_1`
+    // field naming.
+    let mut littlefs_conf: esp_idf_svc::sys::esp_vfs_littlefs_conf_t =
+        unsafe { core::mem::zeroed() };
+    littlefs_conf.base_path = b"/data\0".as_ptr() as *const core::ffi::c_char;
+    littlefs_conf.partition_label = b"storage\0".as_ptr() as *const core::ffi::c_char;
+    littlefs_conf.set_format_if_mount_failed(1);
+    let ret = unsafe { esp_idf_svc::sys::esp_vfs_littlefs_register(&littlefs_conf) };
     if ret != 0 {
-        log::error!("SPIFFS mount failed: err={}", ret);
+        log::error!("LittleFS mount failed: err={}", ret);
     } else {
         let mut total: usize = 0;
         let mut used: usize = 0;
         unsafe {
-            esp_idf_svc::sys::esp_spiffs_info(
+            esp_idf_svc::sys::esp_littlefs_info(
                 b"storage\0".as_ptr() as *const core::ffi::c_char,
                 &mut total,
                 &mut used,
             );
         }
-        log::info!("SPIFFS mounted at /data ({}KB total, {}KB used)", total / 1024, used / 1024);
+        log::info!("LittleFS mounted at /data ({}KB total, {}KB used)", total / 1024, used / 1024);
     }
 
     // --- USB mass storage (optional) ---
@@ -593,6 +596,28 @@ fn get_query_param(uri: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Confine `/api/files*` to the LittleFS partition. Empty input maps to
+/// `/data` so that a path-less `GET /api/files` lists the root of the
+/// partition. Anything else must already start with `/data` and contain
+/// no `..` segments — matching the relative-to-data-root jail that the
+/// desktop server enforces via `safe_join`.
+#[cfg(feature = "esp32")]
+fn jail_data_path(input: &str) -> Result<String, &'static str> {
+    let candidate = if input.is_empty() || input == "/" {
+        "/data"
+    } else {
+        input
+    };
+    if candidate.split('/').any(|seg| seg == "..") {
+        return Err("path escapes /data");
+    }
+    if candidate == "/data" || candidate.starts_with("/data/") {
+        Ok(candidate.to_string())
+    } else {
+        Err("path must be under /data")
+    }
+}
+
 /// Cache for the `/api/status.cloud_storage` block. R2 LIST is rate-
 /// metered and we don't want to hit it on every status poll; the
 /// MicroPython side caches this for 60s and we match.
@@ -712,13 +737,13 @@ fn build_status_payload(
     let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
     let heap_total = unsafe { esp_idf_svc::sys::heap_caps_get_total_size(4096) }; // MALLOC_CAP_DEFAULT
     let uptime_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
-    let mut spiffs_total: usize = 0;
-    let mut spiffs_used: usize = 0;
+    let mut fs_total: usize = 0;
+    let mut fs_used: usize = 0;
     unsafe {
-        esp_idf_svc::sys::esp_spiffs_info(
+        esp_idf_svc::sys::esp_littlefs_info(
             b"storage\0".as_ptr() as *const core::ffi::c_char,
-            &mut spiffs_total,
-            &mut spiffs_used,
+            &mut fs_total,
+            &mut fs_used,
         );
     }
     let info = nic.ip_info();
@@ -760,8 +785,8 @@ fn build_status_payload(
             "driver": zenclaw_agent::net::wifi_ui::driver_label(),
         },
         "storage": {
-            "total_kb": spiffs_total / 1024,
-            "free_kb": (spiffs_total - spiffs_used) / 1024,
+            "total_kb": fs_total / 1024,
+            "free_kb": fs_total.saturating_sub(fs_used) / 1024,
         },
         "channels": {
             "telegram": {
@@ -1373,11 +1398,18 @@ a{{color:#60a5fa;text-decoration:none}}
     // --- GET /api/files (list directory) ---
     server.fn_handler::<anyhow::Error, _>("/api/files", Method::Get, |req| {
         let uri = req.uri().to_string();
-        let path = get_query_param(&uri, "path").unwrap_or_else(|| "/".to_string());
+        let raw = get_query_param(&uri, "path").unwrap_or_default();
+        let path = match jail_data_path(&raw) {
+            Ok(p) => p,
+            Err(msg) => {
+                let err = serde_json::json!({"error": msg}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+        };
         let mut entries = Vec::new();
-        if path == "/" {
-            entries.push(serde_json::json!({"name": "data", "path": "/data", "is_dir": true, "size": null}));
-        } else if let Ok(dir) = std::fs::read_dir(&path) {
+        if let Ok(dir) = std::fs::read_dir(&path) {
             for entry in dir.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let full = format!("{}/{}", path.trim_end_matches('/'), name);
@@ -1396,13 +1428,22 @@ a{{color:#60a5fa;text-decoration:none}}
     // --- DELETE /api/files ---
     server.fn_handler::<anyhow::Error, _>("/api/files", Method::Delete, |req| {
         let uri = req.uri().to_string();
-        let path = get_query_param(&uri, "path").unwrap_or_default();
-        if path.is_empty() {
-            let err = serde_json::json!({"error": "path required"}).to_string();
-            let mut resp = req.into_response(400, None, CORS_HEADERS)?;
-            resp.write_all(err.as_bytes())?;
-            return Ok(());
-        }
+        let raw = get_query_param(&uri, "path").unwrap_or_default();
+        let path = match jail_data_path(&raw) {
+            Ok(p) if p == "/data" => {
+                let err = serde_json::json!({"error": "refusing to delete /data root"}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+            Ok(p) => p,
+            Err(msg) => {
+                let err = serde_json::json!({"error": msg}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+        };
         let result = if std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
             std::fs::remove_dir_all(&path)
         } else {
@@ -1426,7 +1467,16 @@ a{{color:#60a5fa;text-decoration:none}}
     // --- GET /api/files/read ---
     server.fn_handler::<anyhow::Error, _>("/api/files/read", Method::Get, |req| {
         let uri = req.uri().to_string();
-        let path = get_query_param(&uri, "path").unwrap_or_default();
+        let raw = get_query_param(&uri, "path").unwrap_or_default();
+        let path = match jail_data_path(&raw) {
+            Ok(p) => p,
+            Err(msg) => {
+                let err = serde_json::json!({"error": msg}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+        };
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let body = serde_json::json!({"path": path, "content": content}).to_string();
@@ -1452,18 +1502,27 @@ a{{color:#60a5fa;text-decoration:none}}
             body.extend_from_slice(&buf[..n]);
         }
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-        let path = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let raw = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
         let content = parsed.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        if path.is_empty() {
-            let err = serde_json::json!({"error": "path required"}).to_string();
-            let mut resp = req.into_response(400, None, CORS_HEADERS)?;
-            resp.write_all(err.as_bytes())?;
-            return Ok(());
-        }
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let path = match jail_data_path(raw) {
+            Ok(p) if p == "/data" => {
+                let err = serde_json::json!({"error": "path required"}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+            Ok(p) => p,
+            Err(msg) => {
+                let err = serde_json::json!({"error": msg}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+        };
+        if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match std::fs::write(path, content.as_bytes()) {
+        match std::fs::write(&path, content.as_bytes()) {
             Ok(()) => {
                 let body = serde_json::json!({"path": path, "size": content.len()}).to_string();
                 let mut resp = req.into_response(200, None, CORS_HEADERS)?;
@@ -1488,40 +1547,60 @@ a{{color:#60a5fa;text-decoration:none}}
             body.extend_from_slice(&buf[..n]);
         }
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-        let path = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        if path.is_empty() {
-            let err = serde_json::json!({"error": "path required"}).to_string();
-            let mut resp = req.into_response(400, None, CORS_HEADERS)?;
-            resp.write_all(err.as_bytes())?;
-            return Ok(());
+        let raw = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let path = match jail_data_path(raw) {
+            Ok(p) if p == "/data" => {
+                let err = serde_json::json!({"error": "path required"}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+            Ok(p) => p,
+            Err(msg) => {
+                let err = serde_json::json!({"error": msg}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+        };
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => {
+                let body = serde_json::json!({"path": path}).to_string();
+                let mut resp = req.into_response(200, None, CORS_HEADERS)?;
+                resp.write_all(body.as_bytes())?;
+            }
+            Err(e) => {
+                let err = serde_json::json!({"error": e.to_string()}).to_string();
+                let mut resp = req.into_response(500, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+            }
         }
-        // SPIFFS is a flat key-value store — directories don't exist
-        // as first-class entities. `mkdir` returns ENOTSUP and there's
-        // no sentinel-file workaround (the VFS adapter rejects writes
-        // into a non-existent parent path with ENOENT). Surface the
-        // limitation cleanly instead of pretending it worked.
-        let err = serde_json::json!({
-            "error": "Directories are not supported on this device's filesystem (SPIFFS is flat). Use forward slashes inside file names instead."
-        }).to_string();
-        let mut resp = req.into_response(501, None, CORS_HEADERS)?;
-        resp.write_all(err.as_bytes())?;
         Ok(())
     }).unwrap();
 
     // --- POST /api/files/upload (binary stream to file) ---
     server.fn_handler::<anyhow::Error, _>("/api/files/upload", Method::Post, |mut req| {
         let uri = req.uri().to_string();
-        let path = get_query_param(&uri, "path").unwrap_or_default();
-        if path.is_empty() {
-            let err = serde_json::json!({"error": "path required"}).to_string();
-            let mut resp = req.into_response(400, None, CORS_HEADERS)?;
-            resp.write_all(err.as_bytes())?;
-            return Ok(());
-        }
-        if let Some(parent) = std::path::Path::new(&*path).parent() {
+        let raw = get_query_param(&uri, "path").unwrap_or_default();
+        let path = match jail_data_path(&raw) {
+            Ok(p) if p == "/data" => {
+                let err = serde_json::json!({"error": "path required"}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+            Ok(p) => p,
+            Err(msg) => {
+                let err = serde_json::json!({"error": msg}).to_string();
+                let mut resp = req.into_response(400, None, CORS_HEADERS)?;
+                resp.write_all(err.as_bytes())?;
+                return Ok(());
+            }
+        };
+        if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut file = std::fs::File::create(&*path)?;
+        let mut file = std::fs::File::create(&path)?;
         let mut buf = [0u8; 4096];
         let mut total = 0usize;
         loop {

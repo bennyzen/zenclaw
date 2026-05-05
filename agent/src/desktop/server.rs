@@ -35,7 +35,7 @@ pub struct AppState {
     /// Canonical root for /api/files. Every file handler resolves user paths
     /// through `safe_join(&data_root, ...)` — without this, `std::fs` hands
     /// the caller the entire host filesystem (ESP32 gets containment for
-    /// free via SPIFFS; desktop does not).
+    /// free via the partition mount; desktop does not).
     pub data_root: Arc<PathBuf>,
 }
 
@@ -90,7 +90,7 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// regardless of transport.
 ///
 /// Desktop has fewer real datapoints than ESP32 (no temperature sensor,
-/// no real wifi metrics, no SPIFFS, no USB) — those fields are returned
+/// no real wifi metrics, no on-flash storage info, no USB) — those fields are returned
 /// as `null` so the JSON shape matches and the consumer doesn't need
 /// per-platform branches.
 ///

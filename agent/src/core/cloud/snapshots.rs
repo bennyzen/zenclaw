@@ -11,7 +11,7 @@
 //!
 //! Format: tiny length-prefixed binary, NOT JSON.  serde_json encodes
 //! `Vec<u8>` as a JSON array of integers (4-5x bloat), which on an
-//! 8 MB SPIFFS partition is unacceptable when the cache itself is
+//! 8 MB on-flash partition is unacceptable when the cache itself is
 //! 1-2 MB. The format below is ~12 bytes overhead per entry plus the
 //! raw key + value bytes.
 
@@ -36,8 +36,8 @@ pub struct Snapshot {
     pub entries: HashMap<String, Vec<u8>>,
 }
 
-/// Write the cache to `path` atomically. Path's parent directory must
-/// already exist; SPIFFS doesn't auto-create directories.
+/// Write the cache to `path` atomically. Caller is responsible for
+/// ensuring the parent directory exists.
 pub fn write_to(cache: &CloudCache, path: &str) -> std::io::Result<()> {
     let entries = cache.snapshot();
     let bytes = encode(Utc::now().timestamp(), &entries);
