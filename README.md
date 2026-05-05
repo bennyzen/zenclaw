@@ -6,13 +6,13 @@
 
 > **Runs on 0.5 watts. Always on. Always yours.**
 
-A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) is designed to protect your data from flash wear and reflashes (transparent replication is on the [Roadmap](#roadmap); the S3 client and signer ship today). Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
+A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) protects your data from flash wear and reflashes via transparent write-through replication. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
 
 ## Features
 
 - **Multi-provider LLM support**: any OpenAI-compatible provider (OpenAI, Google Gemini via its OpenAI-compat endpoint, DeepSeek, Groq, zAI, Anthropic, local models via Ollama, etc.) — all spoken over `POST /chat/completions` with `Bearer` auth
 - **Tool-use agent loop**: Call LLM, execute tools, persist context, repeat
-- **Consolidated tool system**: 13 action-param tools on device (file I/O, memory, sessions, gateway, cron, web fetch/search, cloud storage). Each tool dispatches multiple actions, so the LLM sees many more operations than schemas. Sub-agents, MCP client, and Google Sheets exist in the codebase but are not wired on ESP32 yet — see [Roadmap](#roadmap)
+- **Consolidated tool system**: 13 action-param tools on device (file I/O, memory, sessions, gateway, cron, web fetch/search, cloud storage). Each tool dispatches multiple actions, so the LLM sees many more operations than schemas. Sub-agents exist in the codebase but are not yet wired on ESP32; an MCP client is on the [Roadmap](#roadmap).
 - **Circuit breaker**: Detects stuck loops, no-progress polling, ping-pong patterns
 - **Persistent memory**: Markdown-backed memory store with keyword search (vector embeddings deferred — see [`CLAUDE.md`](CLAUDE.md))
 - **Session management**: JSONL-persisted branching conversation trees
@@ -108,8 +108,6 @@ Multiple providers can be configured. The `default` key selects which one to use
 
 ## Cloud Persistence
 
-> **This section describes the target design.** Today, S3-compatible storage is exposed as a `storage` tool the agent can call (SigV4 signer + S3 client wired and verified end-to-end on Guition P4). Transparent file-system replication — the boot-restore + background-sync flow described below — is on the [Roadmap](#roadmap).
-
 The ESP32 has limited, wear-prone flash storage. Filesystem corruption from power loss, firmware reflashes, or flash wear is a real risk. ZenClaw mitigates this with automatic write-through replication to S3-compatible cloud storage.
 
 **How it works:**
@@ -146,23 +144,23 @@ The agent's personality and instructions live in `SOUL.md` on the device's files
 
 The following features are described in this README as part of the agent's design but are **not yet shipping in the on-device build**. They were either dropped during the no-PSRAM era and are being re-added now that the DevKitC (8MB PSRAM) is the floor, or are partially built and waiting on integration. Each item lists what exists today and what "shipped" means, so progress is measurable.
 
-### 1. Cloud persistence — automatic write-through replication
-
-- **Today**: `agent/src/core/cloud/` ships a SigV4 signer + S3 client. Exposed to the agent only via the `storage` tool (LLM calls `storage(action="put"/"get"/...)` explicitly). 3 endpoints verified end-to-end on Guition P4 against bucket `tinyclaw1`.
-- **Shipped when**: (a) on boot, missing local files under `data/sessions/`, `data/MEMORY.md`, and `data/cron.json` are restored from the bucket if present; (b) writes to those paths replicate asynchronously to the bucket without blocking the agent loop; (c) the `sys/` prefix split is enforced; (d) `/api/status.cloud_storage` reports last-sync timestamp + dirty-file count.
-- **Estimated effort**: medium. SigV4 + S3 plumbing is the hard part and it's done; the gap is a small replicator thread + a write-hook on the session/memory writers.
-
-### 2. Sub-agents on ESP32
+### 1. Sub-agents on ESP32
 
 - **Today**: `subagent_tools.rs` and `subagents.rs` exist and run on desktop. ESP32 explicitly omits them (`agent/src/core/tools/mod.rs`: *"message_send and subagent omitted — not viable on ESP32 hardware"*). Constraint inherited from the no-PSRAM era.
 - **Shipped when**: `register_defaults` registers `SubagentTool` on ESP32, the spawn path uses PSRAM heap explicitly, depth limits are enforced (default 2), and a memory-pressure smoke test on DevKitC survives 5 nested spawns without OOM.
 - **Estimated effort**: small-to-medium. The desktop implementation is a working reference; the surgery is mostly removing the gate + verifying memory headroom.
 
-### 3. Heartbeat loop on ESP32
+### 2. Heartbeat loop
 
-- **Today**: `HeartbeatConfig` is parsed from config (`agent/src/config.rs`) on both targets. The actual loop only runs on desktop (`agent/src/desktop/background/`). On ESP32 the field is inert.
-- **Shipped when**: a thread spawned from `main.rs` ticks every `heartbeat.every_secs` (default 300) when `enabled: true`, runs a reflection turn against the configured provider, and persists the result to a session named `heartbeat`. Off by default; verifiable via `/api/status` showing last-tick timestamp.
-- **Estimated effort**: small. Thread + cron-style scheduler exist; just needs to be wired from `main.rs` and budgeted for heap usage during reflection turns.
+- **Today**: `HeartbeatConfig` is parsed from config (`agent/src/config.rs`) on both targets. A scheduler skeleton in `agent/src/desktop/background/mod.rs` ticks a timer and emits `Heartbeat tick (stub)` log lines on desktop, but neither target actually runs a reflection turn — the desktop loop has a `// TODO: run heartbeat prompt through gateway` placeholder, and ESP32 has no spawned thread at all.
+- **Shipped when**: a thread runs every `heartbeat.every_secs` (default 300) when `enabled: true`, executes a reflection turn against the configured provider, and persists the result to a session named `heartbeat`. Off by default; verifiable via `/api/status` showing last-tick timestamp on both desktop and DevKitC.
+- **Estimated effort**: small. The scheduler tick is wired on desktop; the gap is the gateway call + session persistence, plus spawning the equivalent thread from `main.rs` on ESP32.
+
+### 3. Cron job execution
+
+- **Today**: `CronStore` and `CronService` parse and surface due jobs (`agent/src/core/cron.rs`); the desktop background runner detects them on every 60-second tick and emits `CRON: job due (execution via gateway not yet wired)` log lines, but no job has ever actually run. ESP32 has no cron tick at all.
+- **Shipped when**: due jobs dispatch through the gateway with the configured provider, results persist to a per-job session, and the next-run timestamp updates atomically. Surfaces in `/api/status` with last-execution time per job.
+- **Estimated effort**: small. The detection and storage layers exist; the gap is the `// TODO: dispatch job through gateway for actual execution` line in `desktop/background/mod.rs:38` plus an ESP32 thread to drive the same path.
 
 ### 4. Telegram voice messages
 
