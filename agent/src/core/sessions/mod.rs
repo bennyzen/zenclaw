@@ -314,26 +314,52 @@ impl SessionManager {
     /// corrupt, synthesize a default (peeking at the first user-turn
     /// in the JSONL for a `FirstMessage`-source title when content
     /// exists) and persist it back to disk so subsequent calls skip
-    /// the synthesis path. Orphan `<id>.meta.json` files (no matching
-    /// JSONL) are skipped. Per-session errors are logged + skipped;
-    /// never aborts the whole list.
+    /// the synthesis path. Sessions are discovered from BOTH `.jsonl`
+    /// and `.meta.json` files — a chat created via `POST /api/sessions`
+    /// has only a meta sidecar until the first message lands, and we
+    /// still want it to show up in the sidebar. Per-session errors are
+    /// logged + skipped; never aborts the whole list.
     pub fn list_with_meta(&self) -> Vec<crate::core::sessions::meta::SessionMeta> {
         let mut out = Vec::new();
         let dir = match fs::read_dir(&self.sessions_dir) {
             Ok(d) => d,
             Err(_) => return out,
         };
+
+        // First pass: collect unique chat_ids and remember a representative
+        // DirEntry per id (the JSONL entry preferred over the meta entry,
+        // since its mtime tracks message activity).
+        let mut entries: std::collections::HashMap<String, std::fs::DirEntry> =
+            std::collections::HashMap::new();
         for entry in dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(stripped) = name.strip_suffix(".jsonl") else { continue };
-            let chat_id = stripped.to_string();
+            let (chat_id, is_jsonl) = if let Some(s) = name.strip_suffix(".jsonl") {
+                (s.to_string(), true)
+            } else if let Some(s) = name.strip_suffix(".meta.json") {
+                (s.to_string(), false)
+            } else {
+                continue;
+            };
+            // Replace meta-only entry with jsonl entry when both exist.
+            match entries.entry(chat_id) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(entry);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) if is_jsonl => {
+                    o.insert(entry);
+                }
+                _ => {}
+            }
+        }
 
+        for (chat_id, entry) in entries {
             let meta = match self.meta(&chat_id) {
                 Ok(Some(m)) => m,
                 _ => {
                     // Synthesize: peek at the first user-turn from the
                     // JSONL when the file has content, so legacy chats
                     // get a meaningful title rather than a placeholder.
+                    // Meta-only entries (no JSONL) just get the default.
                     let first_msg = self.peek_first_user_message(&chat_id);
                     let mtime = entry
                         .metadata()
@@ -1478,16 +1504,21 @@ mod tests {
     }
 
     #[test]
-    fn list_with_meta_skips_orphan_meta_without_jsonl() {
+    fn list_with_meta_includes_meta_only_sessions() {
+        // A session created via POST /api/sessions has a meta sidecar but no
+        // JSONL until the first message is appended. The sidebar must still
+        // show it.
         use crate::core::sessions::meta::SessionMeta;
         let dir = tempfile::tempdir().unwrap();
-        let m = SessionMeta::synthesize_default("orphan", 1, None);
+        let m = SessionMeta::synthesize_default("just-created", 1, None);
         std::fs::write(
-            dir.path().join("orphan.meta.json"),
+            dir.path().join("just-created.meta.json"),
             serde_json::to_vec(&m).unwrap(),
         ).unwrap();
         let mgr = SessionManager::new(dir.path().to_str().unwrap());
-        assert_eq!(mgr.list_with_meta().len(), 0);
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat_id, "just-created");
     }
 
     #[test]
