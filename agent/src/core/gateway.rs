@@ -99,6 +99,7 @@ impl Gateway {
                     session_mgr = session_mgr.with_cloud(
                         h.cache.clone(),
                         h.replicator.clone(),
+                        Some(h.store.clone()),
                         h.log_compaction_bytes,
                     );
                     (

@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::core::cloud::{CloudCache, Replicator};
+use crate::core::cloud::{client::ObjectStore, CloudCache, Replicator};
 use crate::core::types::{Role, ToolCall};
 
 pub mod meta;
@@ -86,6 +86,10 @@ pub struct SessionManager {
     cache: Option<CloudCache>,
     /// Eager-path replicator. Always set together with `cache`.
     replicator: Option<Arc<Replicator>>,
+    /// S3-compatible store. Used as a lazy fallback when the cache is
+    /// empty for a chat (e.g. boot_restore failed, cross-reflash recovery,
+    /// or in the future when we evict cold entries).
+    store: Option<Arc<dyn ObjectStore>>,
     /// Threshold (bytes) at which the active log file gets folded into
     /// `base.jsonl` and a new log file starts. Mirrors
     /// [`crate::config::StorageConfig::log_compaction_bytes`].
@@ -109,21 +113,27 @@ impl SessionManager {
             states,
             cache: None,
             replicator: None,
+            store: None,
             log_compaction_bytes: 0,
         }
     }
 
     /// Enable cloud persistence. After this, `append` writes through the
     /// cache + replicator instead of the local filesystem, and `load`
-    /// reads from `base.jsonl` + unabsorbed `log-NN.jsonl` in the cache.
+    /// reads from `base.jsonl` + unabsorbed `log-NN.jsonl` in the cache
+    /// (with lazy fallback to `store` on cache miss when `store` is
+    /// provided — production always passes Some; tests that exercise
+    /// the cache hot path pass None).
     pub fn with_cloud(
         mut self,
         cache: CloudCache,
         replicator: Arc<Replicator>,
+        store: Option<Arc<dyn ObjectStore>>,
         log_compaction_bytes: usize,
     ) -> Self {
         self.cache = Some(cache);
         self.replicator = Some(replicator);
+        self.store = store;
         self.log_compaction_bytes = log_compaction_bytes;
         self
     }
@@ -508,6 +518,43 @@ impl SessionManager {
 
     /// Concat base.jsonl + all unabsorbed log-NN.jsonl in numeric order.
     fn cloud_load_text(&self, chat_id: &str, cache: &CloudCache) -> String {
+        // Try cache first (the hot path).
+        let out = self.read_chat_from_cache(chat_id, cache);
+        if !out.is_empty() {
+            return out;
+        }
+        // Cache miss: lazy hydrate from S3 if a store is wired up. This
+        // covers boot_restore failures, cross-reflash recovery (LittleFS
+        // persists the meta sidecar but PSRAM cache is volatile), and any
+        // future cache eviction. After hydration, re-read from cache.
+        if let Some(store) = &self.store {
+            let prefix = Self::cloud_prefix(chat_id);
+            let qprefix = format!("{}.quarantine/", prefix);
+            if let Ok(keys) = store.list_keys(&prefix) {
+                for key in keys {
+                    if key.starts_with(&qprefix) {
+                        continue;
+                    }
+                    // Skip keys already in cache (a concurrent writer may
+                    // have populated some — don't clobber freshness).
+                    if cache.get(&key).is_some() {
+                        continue;
+                    }
+                    if let Ok(bytes) = store.get(&key) {
+                        cache.put(&key, bytes);
+                    }
+                }
+                return self.read_chat_from_cache(chat_id, cache);
+            }
+        }
+        out
+    }
+
+    /// Read base.jsonl + unabsorbed log-NN.jsonl for `chat_id` from the
+    /// cache only. Returns empty string when the cache has no keys for
+    /// this chat. Split out from `cloud_load_text` so the lazy-hydrate
+    /// path can re-read after populating.
+    fn read_chat_from_cache(&self, chat_id: &str, cache: &CloudCache) -> String {
         let mut out = String::new();
         if let Some(base) = cache.get(&Self::cloud_base_key(chat_id)) {
             out.push_str(&String::from_utf8_lossy(&base));
@@ -1256,6 +1303,7 @@ mod tests {
         let mgr = SessionManager::new(&dir).with_cloud(
             cache.clone(),
             replicator.clone(),
+            None,
             log_compaction_bytes,
         );
         (mgr, cache, replicator, dir)
@@ -1388,7 +1436,7 @@ mod tests {
         let replicator = Arc::new(Replicator::new_for_test());
 
         let mgr = SessionManager::new(dir.path().to_str().unwrap())
-            .with_cloud(cache.clone(), replicator, 0);
+            .with_cloud(cache.clone(), replicator, None, 0);
 
         mgr.clear("abc").unwrap();
 
@@ -1693,6 +1741,73 @@ mod tests {
         let mgr = SessionManager::new(dir.path().to_str().unwrap());
         // Should not error
         mgr.delete("never-existed").unwrap();
+    }
+
+    #[test]
+    fn cloud_load_lazy_hydrates_from_store_when_cache_empty() {
+        // Simulates the cross-reflash recovery case: PSRAM cache is volatile,
+        // so after reboot it's empty. boot_restore may have failed (S3 LIST
+        // hiccup) or simply not yet run for this chat. The store has the
+        // data, and load() must surface it without waiting for boot_restore
+        // to retry. Without lazy-hydrate, get_branch returns empty and the
+        // UI shows a blank conversation even though S3 is healthy.
+        use crate::core::cloud::client::ObjectStore;
+
+        struct FakeStore {
+            keys: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        }
+        impl ObjectStore for FakeStore {
+            fn put(&self, key: &str, bytes: &[u8]) -> crate::core::cloud::client::Result<()> {
+                self.keys.lock().unwrap().insert(key.to_string(), bytes.to_vec());
+                Ok(())
+            }
+            fn get(&self, key: &str) -> crate::core::cloud::client::Result<Vec<u8>> {
+                self.keys.lock().unwrap().get(key).cloned()
+                    .ok_or_else(|| crate::core::cloud::client::S3Error(format!("not found: {}", key)))
+            }
+            fn head(&self, key: &str) -> crate::core::cloud::client::Result<Option<u64>> {
+                Ok(self.keys.lock().unwrap().get(key).map(|v| v.len() as u64))
+            }
+            fn delete(&self, _: &str) -> crate::core::cloud::client::Result<()> { Ok(()) }
+            fn list_keys(&self, prefix: &str) -> crate::core::cloud::client::Result<Vec<String>> {
+                Ok(self.keys.lock().unwrap().keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned().collect())
+            }
+        }
+
+        // Seed S3 with one user message + one session_info; cache empty.
+        let chat_id = "chat-restore-me";
+        let log_payload = format!(
+            "{{\"type\":\"message\",\"id\":\"u1\",\"parent\":null,\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {{\"type\":\"session_info\",\"leaf_id\":\"u1\"}}\n"
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(FakeStore {
+            keys: std::sync::Mutex::new(std::collections::HashMap::from([
+                (format!("sys/sessions/{}/log-00.jsonl", chat_id), log_payload.into_bytes()),
+            ])),
+        });
+
+        let dir = temp_dir();
+        let cache = CloudCache::new();
+        use crate::core::cloud::ReplicatorConfig;
+        let replicator = Arc::new(Replicator::new(ReplicatorConfig {
+            queue_max: 1, retry_max: 1, backoff_cap_secs: 1,
+        }));
+        let mgr = SessionManager::new(&dir).with_cloud(
+            cache.clone(), replicator, Some(store), 0,
+        );
+
+        let entries = mgr.load(chat_id).unwrap();
+        assert_eq!(entries.len(), 2, "lazy hydrate should pull both lines from S3");
+        // After the first read, the cache should hold the key — second read
+        // exercises the cache hot path.
+        assert!(cache.get(&format!("sys/sessions/{}/log-00.jsonl", chat_id)).is_some());
+
+        let branch = mgr.get_branch(chat_id).unwrap();
+        assert_eq!(branch.len(), 1, "single user-message turn");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
