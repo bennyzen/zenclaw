@@ -81,10 +81,12 @@ const menuItems = computed(() => [
             size="xs"
             @click="expanded = !expanded"
           />
-          <p
+          <div
             v-if="expanded"
-            class="mt-2 text-sm whitespace-pre-wrap leading-relaxed text-muted border-l-2 border-default pl-3"
-          >{{ block.content }}</p>
+            class="mt-2 text-sm leading-relaxed text-muted border-l-2 border-default pl-3"
+          >
+            <MDC :value="block.content" :cache-key="block.id" class="*:first:mt-0 *:last:mb-0" />
+          </div>
         </div>
       </div>
 
