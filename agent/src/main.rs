@@ -766,7 +766,6 @@ fn cloud_status_block(
 fn build_status_payload(
     gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
     nic: &std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
-    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
     temp_handle: usize,
 ) -> serde_json::Value {
     let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
@@ -812,10 +811,12 @@ fn build_status_payload(
         "wifi": {
             "connected": is_wifi && nic.link_up(),
             "ip": if is_wifi { info.map(|i| i.ip.to_string()) } else { None },
-            "ssid": nic.ssid().or_else(|| {
-                zenclaw_agent::net::wifi_ui::read_credentials(nvs)
-                    .map(|(s, _)| s)
-            }),
+            // SSID is whatever the NIC reports. WifiNic caches it at
+            // construction (no NVS read on the hot path); EthNic returns
+            // None (Ethernet has no SSID). Reading NVS here every status
+            // push was both useless on WiFi and misleading on Ethernet
+            // (would surface a phantom SSID from a prior wizard flash).
+            "ssid": nic.ssid(),
             "rssi": nic.rssi(),
             "driver": zenclaw_agent::net::wifi_ui::driver_label(),
         },
@@ -1056,10 +1057,9 @@ a{{color:#60a5fa;text-decoration:none}}
     // is identical. See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
     let gw = gateway.clone();
     let nic_for_status = nic.clone();
-    let nvs_for_status = nvs.clone();
     let th = temp_handle;
     server.fn_handler::<anyhow::Error, _>("/api/status", Method::Get, move |req| {
-        let body = build_status_payload(&gw, &nic_for_status, &nvs_for_status, th);
+        let body = build_status_payload(&gw, &nic_for_status, th);
         let body_str = body.to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(body_str.as_bytes())?;
@@ -1836,14 +1836,12 @@ a{{color:#60a5fa;text-decoration:none}}
         use embedded_svc::ws::FrameType;
         let gw_for_ws = gateway.clone();
         let nic_for_ws = nic.clone();
-        let nvs_for_ws = nvs.clone();
         let th = temp_handle;
         server.ws_handler::<_, anyhow::Error>("/ws/stats", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() {
                 let sender = ws.create_detached_sender()?;
                 let gw_clone = gw_for_ws.clone();
                 let nic_clone = nic_for_ws.clone();
-                let nvs_clone = nvs_for_ws.clone();
                 std::thread::Builder::new()
                     .name("ws-stats".into())
                     .stack_size(8192)
@@ -1851,7 +1849,7 @@ a{{color:#60a5fa;text-decoration:none}}
                         let mut sender = sender;
                         loop {
                             if sender.is_closed() { break; }
-                            let payload = build_status_payload(&gw_clone, &nic_clone, &nvs_clone, th);
+                            let payload = build_status_payload(&gw_clone, &nic_clone, th);
                             if sender.send(FrameType::Text(false), payload.to_string().as_bytes()).is_err() {
                                 break;
                             }
