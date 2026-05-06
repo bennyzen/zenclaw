@@ -37,6 +37,21 @@ export interface ConnectionState {
 }
 
 // ---------------------------------------------------------------------------
+// Session metadata (mirror of agent/src/core/sessions/mod.rs SessionMeta)
+// ---------------------------------------------------------------------------
+
+export interface SessionMeta {
+  chatId: string
+  kind: 'web' | 'telegram' | 'cron' | 'other'
+  title: string
+  titleSource: 'llm' | 'user' | 'firstMessage' | 'default'
+  createdAtMs: number
+  lastActivityMs: number
+  lastMessagePreview: string
+  version: number
+}
+
+// ---------------------------------------------------------------------------
 // Chat events (mirror of agent/src/core/chat_events.rs)
 // ---------------------------------------------------------------------------
 

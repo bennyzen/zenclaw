@@ -510,6 +510,7 @@ fn bootstrap_cloud(
         log_compaction_bytes: storage.log_compaction_bytes,
         device_id: hostname.to_string(),
         heartbeat_stale_secs: 3600,
+        sessions_dir: Some(format!("{}/sessions", data_dir)),
     };
     match boot_restore(&store, &cache, &boot_cfg) {
         Ok(result) => {
@@ -765,7 +766,6 @@ fn cloud_status_block(
 fn build_status_payload(
     gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
     nic: &std::sync::Arc<Box<dyn zenclaw_agent::net::Nic>>,
-    nvs: &esp_idf_svc::nvs::EspDefaultNvsPartition,
     temp_handle: usize,
 ) -> serde_json::Value {
     let heap_free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
@@ -811,10 +811,12 @@ fn build_status_payload(
         "wifi": {
             "connected": is_wifi && nic.link_up(),
             "ip": if is_wifi { info.map(|i| i.ip.to_string()) } else { None },
-            "ssid": nic.ssid().or_else(|| {
-                zenclaw_agent::net::wifi_ui::read_credentials(nvs)
-                    .map(|(s, _)| s)
-            }),
+            // SSID is whatever the NIC reports. WifiNic caches it at
+            // construction (no NVS read on the hot path); EthNic returns
+            // None (Ethernet has no SSID). Reading NVS here every status
+            // push was both useless on WiFi and misleading on Ethernet
+            // (would surface a phantom SSID from a prior wizard flash).
+            "ssid": nic.ssid(),
             "rssi": nic.rssi(),
             "driver": zenclaw_agent::net::wifi_ui::driver_label(),
         },
@@ -965,6 +967,10 @@ fn start_http_server(
         // We register ~36 handlers (REST + OPTIONS preflights + WS). Leave
         // headroom for future routes; the per-handler memory cost is tiny.
         max_uri_handlers: 64,
+        // Required for /api/sessions/* and any future wildcard routes.
+        // Without this, ESP-IDF httpd uses exact string matching only, so
+        // the literal '*' in a pattern never matches a real URI segment.
+        uri_match_wildcard: true,
         ..Default::default()
     }).unwrap();
 
@@ -989,11 +995,12 @@ fn start_http_server(
         "/api/status", "/api/chat", "/api/chat/history", "/api/config", "/api/wifi",
         "/api/files", "/api/files/read", "/api/files/write", "/api/files/mkdir",
         "/api/files/upload", "/api/restart", "/api/cloud/files", "/api/cloud/sign",
+        "/api/sessions", "/api/sessions/*",
     ] {
         server.fn_handler::<anyhow::Error, _>(path, Method::Options, |req| {
             let mut resp = req.into_response(204, None, &[
                 ("Access-Control-Allow-Origin", "*"),
-                ("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"),
+                ("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS"),
                 ("Access-Control-Allow-Headers", "Content-Type"),
                 ("Access-Control-Max-Age", "86400"),
             ])?;
@@ -1050,10 +1057,9 @@ a{{color:#60a5fa;text-decoration:none}}
     // is identical. See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
     let gw = gateway.clone();
     let nic_for_status = nic.clone();
-    let nvs_for_status = nvs.clone();
     let th = temp_handle;
     server.fn_handler::<anyhow::Error, _>("/api/status", Method::Get, move |req| {
-        let body = build_status_payload(&gw, &nic_for_status, &nvs_for_status, th);
+        let body = build_status_payload(&gw, &nic_for_status, th);
         let body_str = body.to_string();
         let mut resp = req.into_response(200, None, CORS_HEADERS)?;
         resp.write_all(body_str.as_bytes())?;
@@ -1684,6 +1690,141 @@ a{{color:#60a5fa;text-decoration:none}}
         Ok(())
     }).unwrap();
 
+    // --- /api/sessions (GET) — list all sessions sorted by last_activity_ms desc ---
+    let gw_sessions_list = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions", Method::Get, move |req| {
+        let mut sessions = gw_sessions_list.sessions.list_with_meta();
+        sessions.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+        let body = serde_json::to_vec(&sessions)?;
+        let mut resp = req.into_response(200, Some("OK"), CORS_HEADERS)?;
+        resp.write_all(&body)?;
+        Ok(())
+    }).unwrap();
+
+    // --- /api/sessions (POST) — create a new session ---
+    let gw_sessions_create = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions", Method::Post, move |req| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let chat_id = format!("chat-{}", now_ms);
+        let meta = zenclaw_agent::core::sessions::meta::SessionMeta::synthesize_default(
+            &chat_id, now_ms, None,
+        );
+        if let Err(e) = gw_sessions_create.sessions.set_meta(&chat_id, &meta) {
+            log::warn!("api_sessions_create: set_meta failed for {}: {}", chat_id, e);
+            let mut resp = req.into_response(500, Some("Internal Server Error"), CORS_HEADERS)?;
+            resp.write_all(serde_json::json!({"error": format!("set_meta: {}", e)}).to_string().as_bytes())?;
+            return Ok(());
+        }
+        let body = serde_json::to_vec(&serde_json::json!({"chatId": chat_id, "meta": meta}))?;
+        log::info!("Session created: {}", chat_id);
+        let mut resp = req.into_response(201, Some("Created"), CORS_HEADERS)?;
+        resp.write_all(&body)?;
+        Ok(())
+    }).unwrap();
+
+    // --- /api/sessions/* (PATCH) — rename a session ---
+    // Wildcard URI matching is enabled via Configuration::uri_match_wildcard = true above.
+    // ESP-IDF httpd binds httpd_uri_match_wildcard, which matches /api/sessions/*
+    // against any suffix; we strip the prefix and split on '?' to extract the chat_id.
+    let gw_sessions_patch = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions/*", Method::Patch, move |mut req| {
+        let uri = req.uri().to_string();
+        let chat_id = uri
+            .strip_prefix("/api/sessions/")
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if chat_id.is_empty() {
+            let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+            resp.write_all(serde_json::json!({"error": "missing chat id"}).to_string().as_bytes())?;
+            return Ok(());
+        }
+
+        let mut body = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = req.read(&mut buf)?;
+            if n == 0 { break; }
+            body.extend_from_slice(&buf[..n]);
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PatchBody { title: String }
+
+        let parsed: PatchBody = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": format!("invalid body: {}", e)}).to_string().as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        match gw_sessions_patch.sessions.rename(&chat_id, &parsed.title) {
+            Ok(meta) => {
+                log::info!("Session renamed: {} -> {}", chat_id, parsed.title);
+                let body = serde_json::to_vec(&meta)?;
+                let mut resp = req.into_response(200, Some("OK"), CORS_HEADERS)?;
+                resp.write_all(&body)?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut resp = req.into_response(404, Some("Not Found"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": format!("not found: {}", chat_id)}).to_string().as_bytes())?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": e.to_string()}).to_string().as_bytes())?;
+                Ok(())
+            }
+            Err(e) => {
+                let mut resp = req.into_response(500, Some("Internal Server Error"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": e.to_string()}).to_string().as_bytes())?;
+                Ok(())
+            }
+        }
+    }).unwrap();
+
+    // --- /api/sessions/* (DELETE) — delete a session ---
+    let gw_sessions_delete = gateway.clone();
+    server.fn_handler::<anyhow::Error, _>("/api/sessions/*", Method::Delete, move |req| {
+        let uri = req.uri().to_string();
+        let chat_id = uri
+            .strip_prefix("/api/sessions/")
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if chat_id.is_empty() {
+            let mut resp = req.into_response(400, Some("Bad Request"), CORS_HEADERS)?;
+            resp.write_all(serde_json::json!({"error": "missing chat id"}).to_string().as_bytes())?;
+            return Ok(());
+        }
+
+        let result = match gw_sessions_delete.cloud_store.as_ref() {
+            Some(s) => gw_sessions_delete.sessions.delete_with_store(
+                &chat_id,
+                s.as_ref() as &dyn zenclaw_agent::core::cloud::client::ObjectStore,
+            ),
+            None => gw_sessions_delete.sessions.delete(&chat_id),
+        };
+        match result {
+            Ok(()) => {
+                log::info!("Session deleted: {}", chat_id);
+                let _resp = req.into_response(204, Some("No Content"), CORS_HEADERS)?;
+                Ok(())
+            }
+            Err(e) => {
+                let mut resp = req.into_response(500, Some("Internal Server Error"), CORS_HEADERS)?;
+                resp.write_all(serde_json::json!({"error": e.to_string()}).to_string().as_bytes())?;
+                Ok(())
+            }
+        }
+    }).unwrap();
+
     // --- WS /ws/stats (live stats stream) ---
     //
     // Pushes the same payload as `/api/status` every 10 seconds. The
@@ -1695,14 +1836,12 @@ a{{color:#60a5fa;text-decoration:none}}
         use embedded_svc::ws::FrameType;
         let gw_for_ws = gateway.clone();
         let nic_for_ws = nic.clone();
-        let nvs_for_ws = nvs.clone();
         let th = temp_handle;
         server.ws_handler::<_, anyhow::Error>("/ws/stats", None, move |ws: &mut esp_idf_svc::http::server::ws::EspHttpWsConnection| {
             if ws.is_new() {
                 let sender = ws.create_detached_sender()?;
                 let gw_clone = gw_for_ws.clone();
                 let nic_clone = nic_for_ws.clone();
-                let nvs_clone = nvs_for_ws.clone();
                 std::thread::Builder::new()
                     .name("ws-stats".into())
                     .stack_size(8192)
@@ -1710,7 +1849,7 @@ a{{color:#60a5fa;text-decoration:none}}
                         let mut sender = sender;
                         loop {
                             if sender.is_closed() { break; }
-                            let payload = build_status_payload(&gw_clone, &nic_clone, &nvs_clone, th);
+                            let payload = build_status_payload(&gw_clone, &nic_clone, th);
                             if sender.send(FrameType::Text(false), payload.to_string().as_bytes()).is_err() {
                                 break;
                             }

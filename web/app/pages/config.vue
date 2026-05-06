@@ -437,7 +437,7 @@ watch(() => state.networkConnected, (connected) => {
 </script>
 
 <template>
-  <div class="max-w-3xl space-y-6">
+  <div class="max-w-3xl mx-auto space-y-6">
     <h1 class="text-2xl font-bold">Configuration</h1>
 
     <template v-if="state.networkConnected">

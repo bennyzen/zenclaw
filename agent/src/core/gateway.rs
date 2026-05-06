@@ -99,6 +99,7 @@ impl Gateway {
                     session_mgr = session_mgr.with_cloud(
                         h.cache.clone(),
                         h.replicator.clone(),
+                        Some(h.store.clone()),
                         h.log_compaction_bytes,
                     );
                     (
@@ -368,6 +369,26 @@ impl Gateway {
         self.active_chats.lock().unwrap().remove(chat_id);
 
         try_send(events, ChatEvent::Done);
+
+        // Sidebar maintenance: update lastActivityMs and lastMessagePreview
+        // so the conversations list reflects this turn on the next refresh.
+        // Best-effort — bump_activity logs but doesn't propagate failures;
+        // the user's reply has already gone out.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.sessions.bump_activity(chat_id, &result, now_ms);
+
+        // Title generation: rare path (only first turn of a new chat,
+        // only when title_source is Default or FirstMessage). Adds the
+        // LLM round-trip to the function-return on the first turn; WS
+        // users already received the reply via ChatEvent::Done above.
+        crate::core::title_gen::maybe_generate_title(
+            chat_id,
+            self.sessions.as_ref(),
+            self.runner.as_ref(),
+        ).await;
 
         Ok(result)
     }

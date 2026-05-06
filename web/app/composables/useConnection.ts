@@ -3,6 +3,7 @@ import type {
   ConnectionState,
   DeviceStatus,
   FileEntry,
+  SessionMeta,
 } from '~/types/connection'
 
 const state = reactive<ConnectionState>({
@@ -500,6 +501,35 @@ export function useConnection() {
     return apiFetch(`/api/chat/history?chat_id=${encodeURIComponent(chatId)}&limit=${limit}`)
   }
 
+  // Session operations (multi-conversation sidebar)
+  async function listSessions(): Promise<SessionMeta[]> {
+    return apiFetch('/api/sessions')
+  }
+
+  async function createSession(): Promise<{ chatId: string; meta: SessionMeta }> {
+    return apiFetch('/api/sessions', { method: 'POST' })
+  }
+
+  async function renameSession(chatId: string, title: string): Promise<SessionMeta> {
+    return apiFetch(`/api/sessions/${encodeURIComponent(chatId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    })
+  }
+
+  async function deleteSession(chatId: string): Promise<void> {
+    // 204 No Content — apiFetch calls res.json() unconditionally which throws
+    // on an empty body. Use raw fetch for this one endpoint.
+    const url = `${baseUrl()}/api/sessions/${encodeURIComponent(chatId)}`
+    const res = await fetch(url, { method: 'DELETE' })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ error: res.statusText }))
+      const err: any = new Error(body.error || `HTTP ${res.status}`)
+      err.status = res.status
+      throw err
+    }
+  }
+
   // Device operations
   async function restartDevice(): Promise<void> {
     await apiFetch('/api/restart', { method: 'POST' })
@@ -527,6 +557,10 @@ export function useConnection() {
     sendChat,
     openChatStream,
     getChatHistory,
+    listSessions,
+    createSession,
+    renameSession,
+    deleteSession,
     restartDevice,
     baseUrl,
     wsUrl,

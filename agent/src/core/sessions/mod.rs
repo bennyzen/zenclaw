@@ -4,8 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::core::cloud::{CloudCache, Replicator};
+use crate::core::cloud::{client::ObjectStore, CloudCache, Replicator};
 use crate::core::types::{Role, ToolCall};
+
+pub mod meta;
 
 // ---------------------------------------------------------------------------
 // Session entry types
@@ -84,6 +86,10 @@ pub struct SessionManager {
     cache: Option<CloudCache>,
     /// Eager-path replicator. Always set together with `cache`.
     replicator: Option<Arc<Replicator>>,
+    /// S3-compatible store. Used as a lazy fallback when the cache is
+    /// empty for a chat (e.g. boot_restore failed, cross-reflash recovery,
+    /// or in the future when we evict cold entries).
+    store: Option<Arc<dyn ObjectStore>>,
     /// Threshold (bytes) at which the active log file gets folded into
     /// `base.jsonl` and a new log file starts. Mirrors
     /// [`crate::config::StorageConfig::log_compaction_bytes`].
@@ -107,21 +113,27 @@ impl SessionManager {
             states,
             cache: None,
             replicator: None,
+            store: None,
             log_compaction_bytes: 0,
         }
     }
 
     /// Enable cloud persistence. After this, `append` writes through the
     /// cache + replicator instead of the local filesystem, and `load`
-    /// reads from `base.jsonl` + unabsorbed `log-NN.jsonl` in the cache.
+    /// reads from `base.jsonl` + unabsorbed `log-NN.jsonl` in the cache
+    /// (with lazy fallback to `store` on cache miss when `store` is
+    /// provided — production always passes Some; tests that exercise
+    /// the cache hot path pass None).
     pub fn with_cloud(
         mut self,
         cache: CloudCache,
         replicator: Arc<Replicator>,
+        store: Option<Arc<dyn ObjectStore>>,
         log_compaction_bytes: usize,
     ) -> Self {
         self.cache = Some(cache);
         self.replicator = Some(replicator);
+        self.store = store;
         self.log_compaction_bytes = log_compaction_bytes;
         self
     }
@@ -175,6 +187,243 @@ impl SessionManager {
 
     fn session_path(&self, chat_id: &str) -> String {
         format!("{}/{}.jsonl", self.sessions_dir, safe_chat_id(chat_id))
+    }
+
+    /// Path to the per-session metadata sidecar (`<chat_id>.meta.json`)
+    /// on local disk. Mirrors `session_path`'s sanitization rules.
+    fn meta_path(&self, chat_id: &str) -> String {
+        format!("{}/{}.meta.json", self.sessions_dir, safe_chat_id(chat_id))
+    }
+
+    /// Read this session's metadata sidecar from local disk. `None` if
+    /// no sidecar exists; the caller may synthesize a default via
+    /// `SessionMeta::synthesize_default`. Cloud lookups happen at boot
+    /// (cloud/boot.rs), not here — this is the hot path for the
+    /// sidebar list.
+    pub fn meta(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<crate::core::sessions::meta::SessionMeta>, Box<dyn std::error::Error>> {
+        let path = self.meta_path(chat_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the metadata sidecar. In cloud mode: PSRAM cache update +
+    /// eager-drainer enqueue (matches `append_via_cloud`). Always
+    /// writes the local sidecar file. Cloud failures don't propagate
+    /// here — the drainer's dead-letter queue surfaces persistent
+    /// problems; this call returns once the cache + local fs are
+    /// updated.
+    ///
+    /// Returns Err on serialization failure or local fs.write failure
+    /// when cloud is NOT enabled (in cloud mode, local-fs failure logs
+    /// a warning and returns Ok — the cache is the source of truth and
+    /// boot-restore re-syncs from S3).
+    pub fn set_meta(
+        &self,
+        chat_id: &str,
+        meta: &crate::core::sessions::meta::SessionMeta,
+    ) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if let (Some(cache), Some(replicator)) = (&self.cache, &self.replicator) {
+            let key = Self::cloud_sidecar_key(chat_id);
+            cache.put(&key, bytes.clone());
+            replicator.enqueue(key, bytes.clone());
+        }
+
+        let path = self.meta_path(chat_id);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(e) if self.cache.is_some() => {
+                tracing::warn!(
+                    "set_meta local write failed for {}: {} (cloud is canonical)",
+                    chat_id,
+                    e
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Update last-activity-ms and last-message-preview after a
+    /// successful chat turn. Best-effort — failures are logged but
+    /// do not propagate (the user already received their reply;
+    /// sidebar staleness is non-critical). Synthesizes a fresh meta
+    /// if none exists, so newly-active legacy or Telegram chats get
+    /// a sidecar on first sight.
+    pub fn bump_activity(&self, chat_id: &str, preview: &str, now_ms: u64) {
+        let mut meta = match self.meta(chat_id) {
+            Ok(Some(m)) => m,
+            _ => crate::core::sessions::meta::SessionMeta::synthesize_default(chat_id, now_ms, None),
+        };
+        meta.last_activity_ms = now_ms;
+        meta.last_message_preview = preview.chars().take(120).collect();
+        if let Err(e) = self.set_meta(chat_id, &meta) {
+            tracing::warn!("bump_activity for {}: {}", chat_id, e);
+        }
+    }
+
+    /// User-driven rename. Validates `1..=80` characters after trim,
+    /// sets `TitleSource::User`, persists. Returns the updated meta.
+    pub fn rename(
+        &self,
+        chat_id: &str,
+        title: &str,
+    ) -> std::io::Result<crate::core::sessions::meta::SessionMeta> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 80 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "title length must be 1..=80 characters after trim",
+            ));
+        }
+        self.rename_internal(
+            chat_id,
+            trimmed,
+            crate::core::sessions::meta::TitleSource::User,
+        )
+    }
+
+    /// Bypass-validation rename for internal callers (e.g., the LLM
+    /// title-generation background task in T12). Caller is responsible
+    /// for checking `title_source != User` before invoking, otherwise
+    /// a User-renamed title will be clobbered.
+    pub fn rename_internal(
+        &self,
+        chat_id: &str,
+        title: &str,
+        source: crate::core::sessions::meta::TitleSource,
+    ) -> std::io::Result<crate::core::sessions::meta::SessionMeta> {
+        let mut meta = self
+            .meta(chat_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("chat not found: {}", chat_id),
+                )
+            })?;
+        meta.title = title.to_string();
+        meta.title_source = source;
+        self.set_meta(chat_id, &meta)?;
+        Ok(meta)
+    }
+
+    /// Walk the sessions directory and return one `SessionMeta` per
+    /// `<id>.jsonl`. When the matching `.meta.json` is missing or
+    /// corrupt, synthesize a default (peeking at the first user-turn
+    /// in the JSONL for a `FirstMessage`-source title when content
+    /// exists) and persist it back to disk so subsequent calls skip
+    /// the synthesis path. Sessions are discovered from BOTH `.jsonl`
+    /// and `.meta.json` files — a chat created via `POST /api/sessions`
+    /// has only a meta sidecar until the first message lands, and we
+    /// still want it to show up in the sidebar. Per-session errors are
+    /// logged + skipped; never aborts the whole list.
+    pub fn list_with_meta(&self) -> Vec<crate::core::sessions::meta::SessionMeta> {
+        let mut out = Vec::new();
+        let dir = match fs::read_dir(&self.sessions_dir) {
+            Ok(d) => d,
+            Err(_) => return out,
+        };
+
+        // First pass: collect unique chat_ids and remember a representative
+        // DirEntry per id (the JSONL entry preferred over the meta entry,
+        // since its mtime tracks message activity).
+        let mut entries: std::collections::HashMap<String, std::fs::DirEntry> =
+            std::collections::HashMap::new();
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let (chat_id, is_jsonl) = if let Some(s) = name.strip_suffix(".jsonl") {
+                (s.to_string(), true)
+            } else if let Some(s) = name.strip_suffix(".meta.json") {
+                (s.to_string(), false)
+            } else {
+                continue;
+            };
+            // Replace meta-only entry with jsonl entry when both exist.
+            match entries.entry(chat_id) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(entry);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) if is_jsonl => {
+                    o.insert(entry);
+                }
+                _ => {}
+            }
+        }
+
+        for (chat_id, entry) in entries {
+            let meta = match self.meta(&chat_id) {
+                Ok(Some(m)) => m,
+                _ => {
+                    // Synthesize: peek at the first user-turn from the
+                    // JSONL when the file has content, so legacy chats
+                    // get a meaningful title rather than a placeholder.
+                    // Meta-only entries (no JSONL) just get the default.
+                    let first_msg = self.peek_first_user_message(&chat_id);
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let synth = crate::core::sessions::meta::SessionMeta::synthesize_default(
+                        &chat_id,
+                        mtime,
+                        first_msg.as_deref(),
+                    );
+                    // Persist so future calls skip synthesis. Best-effort:
+                    // logged but does not abort.
+                    if let Err(e) = self.set_meta(&chat_id, &synth) {
+                        tracing::warn!(
+                            "list_with_meta: persist synthesized meta failed for {}: {}",
+                            chat_id,
+                            e
+                        );
+                    }
+                    synth
+                }
+            };
+            out.push(meta);
+        }
+        out
+    }
+
+    /// Peek at the first user-role entry in a session's JSONL file
+    /// and return its `content` text, or `None` if the file is empty,
+    /// unreadable, or contains no user messages. Best-effort; failures
+    /// are silent (callers fall back to the `New chat` placeholder).
+    fn peek_first_user_message(&self, chat_id: &str) -> Option<String> {
+        let path = self.session_path(chat_id);
+        let content = std::fs::read_to_string(&path).ok()?;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Use the typed deserializer rather than a JSON-path scan —
+            // matches the actual SessionEntry serde shape (#[serde(tag = "type")]
+            // with content as a flat field on the Message variant).
+            if let Ok(SessionEntry::Message {
+                role: Role::User,
+                content,
+                ..
+            }) = serde_json::from_str::<SessionEntry>(line)
+            {
+                return Some(content);
+            }
+        }
+        None
     }
 
     /// On-disk byte size of the session JSONL, or None if it doesn't exist.
@@ -235,6 +484,13 @@ impl SessionManager {
         format!("{}base.meta.json", Self::cloud_prefix(chat_id))
     }
 
+    /// Per-session metadata sidecar key (`sys/sessions/<id>/meta.json`).
+    /// Distinct from `cloud_meta_key` which targets the JSONL-base
+    /// compaction marker (`base.meta.json`).
+    fn cloud_sidecar_key(chat_id: &str) -> String {
+        format!("{}meta.json", Self::cloud_prefix(chat_id))
+    }
+
     fn cloud_log_key(chat_id: &str, idx: u32) -> String {
         format!("{}log-{:02}.jsonl", Self::cloud_prefix(chat_id), idx)
     }
@@ -262,6 +518,43 @@ impl SessionManager {
 
     /// Concat base.jsonl + all unabsorbed log-NN.jsonl in numeric order.
     fn cloud_load_text(&self, chat_id: &str, cache: &CloudCache) -> String {
+        // Try cache first (the hot path).
+        let out = self.read_chat_from_cache(chat_id, cache);
+        if !out.is_empty() {
+            return out;
+        }
+        // Cache miss: lazy hydrate from S3 if a store is wired up. This
+        // covers boot_restore failures, cross-reflash recovery (LittleFS
+        // persists the meta sidecar but PSRAM cache is volatile), and any
+        // future cache eviction. After hydration, re-read from cache.
+        if let Some(store) = &self.store {
+            let prefix = Self::cloud_prefix(chat_id);
+            let qprefix = format!("{}.quarantine/", prefix);
+            if let Ok(keys) = store.list_keys(&prefix) {
+                for key in keys {
+                    if key.starts_with(&qprefix) {
+                        continue;
+                    }
+                    // Skip keys already in cache (a concurrent writer may
+                    // have populated some — don't clobber freshness).
+                    if cache.get(&key).is_some() {
+                        continue;
+                    }
+                    if let Ok(bytes) = store.get(&key) {
+                        cache.put(&key, bytes);
+                    }
+                }
+                return self.read_chat_from_cache(chat_id, cache);
+            }
+        }
+        out
+    }
+
+    /// Read base.jsonl + unabsorbed log-NN.jsonl for `chat_id` from the
+    /// cache only. Returns empty string when the cache has no keys for
+    /// this chat. Split out from `cloud_load_text` so the lazy-hydrate
+    /// path can re-read after populating.
+    fn read_chat_from_cache(&self, chat_id: &str, cache: &CloudCache) -> String {
         let mut out = String::new();
         if let Some(base) = cache.get(&Self::cloud_base_key(chat_id)) {
             out.push_str(&String::from_utf8_lossy(&base));
@@ -566,6 +859,63 @@ impl SessionManager {
             }
         }
         self.clear(chat_id)
+    }
+
+    /// Hard-delete this chat: remove the JSONL and the meta sidecar
+    /// locally; wipe matching keys from the in-memory cache. Does NOT
+    /// touch S3 — callers with store access should use
+    /// `delete_with_store` for full cleanup.
+    ///
+    /// Idempotent: missing files are not an error.
+    pub fn delete(&self, chat_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Cache wipe (in-memory tier-1) — same pattern as clear().
+        if let Some(cache) = &self.cache {
+            let prefix = Self::cloud_prefix(chat_id);
+            for key in cache.keys_with_prefix(&prefix) {
+                cache.delete(&key);
+            }
+        }
+
+        // Local file removals.
+        let jsonl = self.session_path(chat_id);
+        match std::fs::remove_file(&jsonl) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let meta = self.meta_path(chat_id);
+        match std::fs::remove_file(&meta) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    /// As `delete`, but also walks the cloud `sys/sessions/<id>/` prefix
+    /// and deletes each key. Errors from individual cloud deletes log a
+    /// warning but do not abort — the local cleanup must complete so the
+    /// chat disappears from the UI; cloud orphans surface in dead-letter
+    /// telemetry and can be GC'd later.
+    pub fn delete_with_store(
+        &self,
+        chat_id: &str,
+        store: &dyn crate::core::cloud::client::ObjectStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prefix = Self::cloud_prefix(chat_id);
+        match store.list_keys(&prefix) {
+            Ok(keys) => {
+                for k in keys {
+                    if let Err(e) = store.delete(&k) {
+                        tracing::warn!(error = %e, key = %k, "delete: S3 delete failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, prefix = %prefix, "delete: S3 list_keys failed");
+            }
+        }
+        self.delete(chat_id)
     }
 
     /// List all session chat_ids (derived from .jsonl filenames).
@@ -953,6 +1303,7 @@ mod tests {
         let mgr = SessionManager::new(&dir).with_cloud(
             cache.clone(),
             replicator.clone(),
+            None,
             log_compaction_bytes,
         );
         (mgr, cache, replicator, dir)
@@ -1085,7 +1436,7 @@ mod tests {
         let replicator = Arc::new(Replicator::new_for_test());
 
         let mgr = SessionManager::new(dir.path().to_str().unwrap())
-            .with_cloud(cache.clone(), replicator, 0);
+            .with_cloud(cache.clone(), replicator, None, 0);
 
         mgr.clear("abc").unwrap();
 
@@ -1110,6 +1461,250 @@ mod tests {
     }
 
     #[test]
+    fn meta_returns_none_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        assert!(mgr.meta("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn meta_reads_existing_sidecar() {
+        use crate::core::sessions::meta::{SessionKind, SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let m = SessionMeta {
+            chat_id: "chat-1".into(),
+            kind: SessionKind::Web,
+            title: "Persisted".into(),
+            title_source: TitleSource::User,
+            created_at_ms: 1,
+            last_activity_ms: 2,
+            last_message_preview: "p".into(),
+            version: 1,
+        };
+        let path = dir.path().join("chat-1.meta.json");
+        std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let loaded = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(loaded, m);
+    }
+
+    #[test]
+    fn set_meta_writes_local_when_no_cloud() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let m = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &m).unwrap();
+        assert_eq!(mgr.meta("chat-1").unwrap().unwrap(), m);
+    }
+
+    #[test]
+    fn set_meta_overwrites_existing_sidecar() {
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let mut m = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &m).unwrap();
+        m.title = "Renamed".into();
+        m.title_source = TitleSource::User;
+        mgr.set_meta("chat-1", &m).unwrap();
+        assert_eq!(mgr.meta("chat-1").unwrap().unwrap().title, "Renamed");
+    }
+
+    #[test]
+    fn list_with_meta_returns_sidecar_when_present() {
+        use crate::core::sessions::meta::{SessionMeta, SessionKind, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        // Seed a JSONL + a sidecar.
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"").unwrap();
+        let m = SessionMeta {
+            chat_id: "chat-1".into(),
+            kind: SessionKind::Web,
+            title: "Tomatoes".into(),
+            title_source: TitleSource::User,
+            created_at_ms: 100,
+            last_activity_ms: 200,
+            last_message_preview: "p".into(),
+            version: 1,
+        };
+        std::fs::write(
+            dir.path().join("chat-1.meta.json"),
+            serde_json::to_vec(&m).unwrap(),
+        ).unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], m);
+    }
+
+    #[test]
+    fn list_with_meta_synthesizes_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat_id, "chat-1");
+        assert_eq!(listed[0].title, "New chat");
+        // Synthesized meta is persisted so subsequent calls don't re-synthesize.
+        assert!(dir.path().join("chat-1.meta.json").exists());
+    }
+
+    #[test]
+    fn list_with_meta_includes_meta_only_sessions() {
+        // A session created via POST /api/sessions has a meta sidecar but no
+        // JSONL until the first message is appended. The sidebar must still
+        // show it.
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let m = SessionMeta::synthesize_default("just-created", 1, None);
+        std::fs::write(
+            dir.path().join("just-created.meta.json"),
+            serde_json::to_vec(&m).unwrap(),
+        ).unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat_id, "just-created");
+    }
+
+    #[test]
+    fn list_with_meta_falls_back_to_default_on_corrupt_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"").unwrap();
+        std::fs::write(dir.path().join("chat-1.meta.json"), b"not-valid-json").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let listed = mgr.list_with_meta();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "New chat");
+    }
+
+    #[test]
+    fn bump_activity_updates_last_activity_and_preview() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let initial = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &initial).unwrap();
+
+        mgr.bump_activity("chat-1", "tomato sounds tasty", 200);
+
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.last_activity_ms, 200);
+        assert_eq!(m.last_message_preview, "tomato sounds tasty");
+    }
+
+    #[test]
+    fn bump_activity_truncates_preview_to_120_chars() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        let initial = SessionMeta::synthesize_default("chat-1", 100, None);
+        mgr.set_meta("chat-1", &initial).unwrap();
+
+        let long = "a".repeat(200);
+        mgr.bump_activity("chat-1", &long, 200);
+
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.last_message_preview.chars().count(), 120);
+    }
+
+    #[test]
+    fn bump_activity_synthesizes_meta_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+
+        mgr.bump_activity("chat-1", "first contact", 500);
+
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.last_activity_ms, 500);
+        assert_eq!(m.last_message_preview, "first contact");
+    }
+
+    #[test]
+    fn bump_activity_does_not_panic_on_unwriteable_path() {
+        // Best-effort: a write failure logs but doesn't propagate.
+        let mgr = SessionManager::new("/nonexistent/path");
+        // Should not panic.
+        mgr.bump_activity("chat-1", "anything", 100);
+    }
+
+    #[test]
+    fn rename_sets_title_and_user_source() {
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        let updated = mgr.rename("chat-1", "Custom title").unwrap();
+        assert_eq!(updated.title, "Custom title");
+        assert_eq!(updated.title_source, TitleSource::User);
+    }
+
+    #[test]
+    fn rename_validates_empty_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta(
+            "chat-1",
+            &crate::core::sessions::meta::SessionMeta::synthesize_default("chat-1", 100, None),
+        ).unwrap();
+
+        assert!(mgr.rename("chat-1", "").is_err());
+        assert!(mgr.rename("chat-1", "   ").is_err());
+    }
+
+    #[test]
+    fn rename_validates_oversize_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta(
+            "chat-1",
+            &crate::core::sessions::meta::SessionMeta::synthesize_default("chat-1", 100, None),
+        ).unwrap();
+
+        let too_long = "a".repeat(81);
+        assert!(mgr.rename("chat-1", &too_long).is_err());
+    }
+
+    #[test]
+    fn rename_returns_not_found_for_missing_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        // No meta + no jsonl
+        let err = mgr.rename("missing", "x").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn rename_internal_accepts_llm_source() {
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        mgr.rename_internal("chat-1", "Tomato propagation", TitleSource::Llm).unwrap();
+        let m = mgr.meta("chat-1").unwrap().unwrap();
+        assert_eq!(m.title_source, TitleSource::Llm);
+        assert_eq!(m.title, "Tomato propagation");
+    }
+
+    #[test]
+    fn rename_internal_does_not_validate_length() {
+        // The bypass-validation variant accepts long titles. Caller is
+        // responsible for sanity-checking.
+        use crate::core::sessions::meta::{SessionMeta, TitleSource};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        let long = "a".repeat(150);
+        // Should succeed even though >80 chars
+        mgr.rename_internal("chat-1", &long, TitleSource::Llm).unwrap();
+    }
+
+    #[test]
     fn cloud_session_size_bytes_sums_base_and_unabsorbed_logs() {
         let (mgr, cache, _replicator, dir) = cloud_mgr(16_384);
 
@@ -1123,5 +1718,162 @@ mod tests {
         assert_eq!(mgr.session_size_bytes("web"), Some(log_len));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_jsonl_and_meta_locally() {
+        use crate::core::sessions::meta::SessionMeta;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"x").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        mgr.delete("chat-1").unwrap();
+
+        assert!(!dir.path().join("chat-1.jsonl").exists());
+        assert!(!dir.path().join("chat-1.meta.json").exists());
+        assert_eq!(mgr.list_with_meta().len(), 0);
+    }
+
+    #[test]
+    fn delete_is_idempotent_when_files_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        // Should not error
+        mgr.delete("never-existed").unwrap();
+    }
+
+    #[test]
+    fn cloud_load_lazy_hydrates_from_store_when_cache_empty() {
+        // Simulates the cross-reflash recovery case: PSRAM cache is volatile,
+        // so after reboot it's empty. boot_restore may have failed (S3 LIST
+        // hiccup) or simply not yet run for this chat. The store has the
+        // data, and load() must surface it without waiting for boot_restore
+        // to retry. Without lazy-hydrate, get_branch returns empty and the
+        // UI shows a blank conversation even though S3 is healthy.
+        use crate::core::cloud::client::ObjectStore;
+
+        struct FakeStore {
+            keys: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        }
+        impl ObjectStore for FakeStore {
+            fn put(&self, key: &str, bytes: &[u8]) -> crate::core::cloud::client::Result<()> {
+                self.keys.lock().unwrap().insert(key.to_string(), bytes.to_vec());
+                Ok(())
+            }
+            fn get(&self, key: &str) -> crate::core::cloud::client::Result<Vec<u8>> {
+                self.keys.lock().unwrap().get(key).cloned()
+                    .ok_or_else(|| crate::core::cloud::client::S3Error(format!("not found: {}", key)))
+            }
+            fn head(&self, key: &str) -> crate::core::cloud::client::Result<Option<u64>> {
+                Ok(self.keys.lock().unwrap().get(key).map(|v| v.len() as u64))
+            }
+            fn delete(&self, _: &str) -> crate::core::cloud::client::Result<()> { Ok(()) }
+            fn list_keys(&self, prefix: &str) -> crate::core::cloud::client::Result<Vec<String>> {
+                Ok(self.keys.lock().unwrap().keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned().collect())
+            }
+        }
+
+        // Seed S3 with one user message + one session_info; cache empty.
+        let chat_id = "chat-restore-me";
+        let log_payload = format!(
+            "{{\"type\":\"message\",\"id\":\"u1\",\"parent\":null,\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {{\"type\":\"session_info\",\"leaf_id\":\"u1\"}}\n"
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(FakeStore {
+            keys: std::sync::Mutex::new(std::collections::HashMap::from([
+                (format!("sys/sessions/{}/log-00.jsonl", chat_id), log_payload.into_bytes()),
+            ])),
+        });
+
+        let dir = temp_dir();
+        let cache = CloudCache::new();
+        use crate::core::cloud::ReplicatorConfig;
+        let replicator = Arc::new(Replicator::new(ReplicatorConfig {
+            queue_max: 1, retry_max: 1, backoff_cap_secs: 1,
+        }));
+        let mgr = SessionManager::new(&dir).with_cloud(
+            cache.clone(), replicator, Some(store), 0,
+        );
+
+        let entries = mgr.load(chat_id).unwrap();
+        assert_eq!(entries.len(), 2, "lazy hydrate should pull both lines from S3");
+        // After the first read, the cache should hold the key — second read
+        // exercises the cache hot path.
+        assert!(cache.get(&format!("sys/sessions/{}/log-00.jsonl", chat_id)).is_some());
+
+        let branch = mgr.get_branch(chat_id).unwrap();
+        assert_eq!(branch.len(), 1, "single user-message turn");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_with_store_removes_local_and_cloud_keys() {
+        // Reuses the existing FakeStore pattern from clear_with_store tests.
+        // Build a fake store with seeded keys, run delete_with_store, verify
+        // both local files removed AND store.delete called for each prefix key.
+        use crate::core::cloud::client::ObjectStore;
+        use crate::core::sessions::meta::SessionMeta;
+
+        // Inline minimal FakeStore that records delete calls.
+        struct FakeStore {
+            keys: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+            deleted: std::sync::Mutex<Vec<String>>,
+        }
+        impl ObjectStore for FakeStore {
+            fn put(&self, key: &str, bytes: &[u8]) -> crate::core::cloud::client::Result<()> {
+                self.keys.lock().unwrap().insert(key.to_string(), bytes.to_vec());
+                Ok(())
+            }
+            fn get(&self, key: &str) -> crate::core::cloud::client::Result<Vec<u8>> {
+                self.keys.lock().unwrap().get(key).cloned()
+                    .ok_or_else(|| crate::core::cloud::client::S3Error(format!("not found: {}", key)))
+            }
+            fn head(&self, key: &str) -> crate::core::cloud::client::Result<Option<u64>> {
+                Ok(self.keys.lock().unwrap().get(key).map(|v| v.len() as u64))
+            }
+            fn delete(&self, key: &str) -> crate::core::cloud::client::Result<()> {
+                self.deleted.lock().unwrap().push(key.to_string());
+                self.keys.lock().unwrap().remove(key);
+                Ok(())
+            }
+            fn list_keys(&self, prefix: &str) -> crate::core::cloud::client::Result<Vec<String>> {
+                Ok(self.keys.lock().unwrap().keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned().collect())
+            }
+        }
+
+        let store = FakeStore {
+            keys: std::sync::Mutex::new(std::collections::HashMap::from([
+                ("sys/sessions/chat-1/base.jsonl".to_string(), b"x".to_vec()),
+                ("sys/sessions/chat-1/meta.json".to_string(), b"y".to_vec()),
+                ("sys/sessions/chat-1/log-00.jsonl".to_string(), b"z".to_vec()),
+                ("sys/sessions/other/base.jsonl".to_string(), b"keep".to_vec()),
+            ])),
+            deleted: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chat-1.jsonl"), b"x").unwrap();
+        let mgr = SessionManager::new(dir.path().to_str().unwrap());
+        mgr.set_meta("chat-1", &SessionMeta::synthesize_default("chat-1", 100, None)).unwrap();
+
+        mgr.delete_with_store("chat-1", &store).unwrap();
+
+        // Local removed.
+        assert!(!dir.path().join("chat-1.jsonl").exists());
+        assert!(!dir.path().join("chat-1.meta.json").exists());
+
+        // Cloud: chat-1's three keys deleted; "other" untouched.
+        let deleted = store.deleted.lock().unwrap();
+        assert_eq!(deleted.len(), 3, "expected 3 cloud deletes, got {:?}", *deleted);
+        for d in deleted.iter() {
+            assert!(d.starts_with("sys/sessions/chat-1/"), "unexpected delete: {}", d);
+        }
+        assert!(store.keys.lock().unwrap().contains_key("sys/sessions/other/base.jsonl"));
     }
 }

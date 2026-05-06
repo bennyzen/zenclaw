@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import type { ChatEvent } from '~/types/connection'
 
+definePageMeta({ layout: 'chat' })
+
+const route = useRoute()
+const chatId = computed(() => {
+  const id = route.params.id
+  return Array.isArray(id) ? (id[0] || 'web') : (id || 'web')
+})
+
+const { bumpLocal } = useSessions()
+
 const { state, openChatStream, getChatHistory } = useConnection()
 
 type TimelineItem =
@@ -45,6 +55,7 @@ function applyEvent(evt: ChatEvent) {
     case 'assistant_text':
       items.value.push({ kind: 'assistant', id: newId(), text: evt.text })
       thinking.value = false
+      bumpLocal(chatId.value, evt.text)
       break
     case 'tool_call_started':
       thinking.value = false
@@ -140,7 +151,7 @@ async function loadHistory() {
   loading.value = true
   stickToBottom.value = true
   try {
-    const result = await getChatHistory('web', 200)
+    const result = await getChatHistory(chatId.value, 200)
     items.value = []
     for (const evt of result.events) {
       // Reuse the live-event reducer so history and live render identically.
@@ -156,7 +167,7 @@ async function loadHistory() {
 
 function ensureStream() {
   if (stream && stream.isOpen()) return
-  stream = openChatStream(applyEvent, 'web')
+  stream = openChatStream(applyEvent, chatId.value)
 }
 
 function send() {
@@ -172,6 +183,7 @@ function send() {
   // User just engaged — re-anchor to the bottom even if they had scrolled up.
   // The ResizeObserver handles the actual scroll once layout settles.
   stickToBottom.value = true
+  bumpLocal(chatId.value, text)
   ensureStream()
   stream!.send(text)
 }
@@ -203,6 +215,16 @@ function clamp(text: string | undefined, lines: number): string {
   return all.slice(0, lines).join('\n') + `\n… (${all.length - lines} more lines)`
 }
 
+watch(chatId, async () => {
+  // Tear down the existing stream, reset state, fetch new history.
+  if (stream) {
+    stream.close()
+    stream = null
+  }
+  await loadHistory()
+  ensureStream()
+})
+
 onMounted(() => {
   if (state.networkConnected) loadHistory()
 })
@@ -225,7 +247,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="flex flex-col h-[calc(100vh-8rem)]">
+  <div class="flex flex-col h-full p-4">
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-2xl font-bold">Chat</h1>
       <UButton
