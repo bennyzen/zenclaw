@@ -10,11 +10,11 @@ let focusHandlerAttached = false
 
 async function refresh() {
   const conn = useConnection()
-  // Bail if not connected — there's no device to query.
-  if (!conn.state.networkConnected) {
-    sessions.value = []
-    return
-  }
+  // Bail if not connected — keep whatever's locally optimistic so newly
+  // created chats don't blink during the disconnected → connected window.
+  // (Page reloads reset reactive state anyway; this only matters for the
+  // brief race between auto-connect and the first refresh.)
+  if (!conn.state.networkConnected) return
   loading.value = true
   error.value = null
   try {
@@ -89,10 +89,19 @@ function bumpLocal(id: string, preview: string) {
 
 export function useSessions() {
   // Auto-refresh hooks: attach lazily on first composable call.
+  // - Window focus: fetch when the user comes back to the tab.
+  // - Connection state watcher: fetch once when the device comes online
+  //   (covers the auto-connect-after-mount race).
+  // No periodic polling — sessions only change in response to user actions
+  // (create/rename/delete in this UI) or external channels (Telegram), and
+  // the latter shouldn't make the ESP32 serve a request every 30s.
   if (!focusHandlerAttached && typeof window !== 'undefined') {
     focusHandlerAttached = true
     window.addEventListener('focus', refresh)
-    setInterval(refresh, 30_000)
+    const conn = useConnection()
+    watch(() => conn.state.networkConnected, (connected) => {
+      if (connected) refresh()
+    })
   }
   return { sessions, loading, error, refresh, create, rename, remove, bumpLocal }
 }
