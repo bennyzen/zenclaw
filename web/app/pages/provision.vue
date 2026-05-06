@@ -284,7 +284,7 @@ async function pollForDevice() {
 </script>
 
 <template>
-  <div class="space-y-6 max-w-3xl">
+  <div class="space-y-6 max-w-3xl mx-auto">
     <h2 class="text-2xl font-bold text-white">Provision Device</h2>
     <p class="text-sm text-muted">
       Flash a ZenClaw device over USB. Pick <strong>Fresh install</strong> for a brand-new

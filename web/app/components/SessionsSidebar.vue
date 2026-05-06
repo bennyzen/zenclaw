@@ -115,8 +115,27 @@ async function confirmDelete() {
 </script>
 
 <template>
-  <aside class="flex flex-col h-full w-[300px] border-r border-default bg-elevated">
-    <div class="p-3 space-y-2 border-b border-default">
+  <!-- ui overrides:
+       - root: UDashboardSidebar's theme sets `min-h-svh` which would inflate
+         the sidebar to 100vh and push the page footer below the fold. We're
+         nested inside an absolute-positioned UDashboardGroup, so fill the
+         parent instead.
+       - header: the default is fixed-height (`h-(--ui-header-height)`) with
+         `flex items-center` — designed for a single logo / search button.
+         Our header stacks a button + search input, so use auto height with
+         vertical padding. -->
+  <UDashboardSidebar
+    collapsible
+    resizable
+    :default-size="20"
+    :min-size="14"
+    :max-size="30"
+    :ui="{
+      root: 'h-full min-h-0',
+      header: 'h-auto py-3 flex flex-col items-stretch gap-2 px-4',
+    }"
+  >
+    <template #header>
       <UButton block color="primary" icon="i-lucide-plus" @click="onNewChat">
         New chat
       </UButton>
@@ -126,14 +145,17 @@ async function confirmDelete() {
         icon="i-lucide-search"
         size="sm"
       />
-    </div>
+    </template>
 
-    <div v-if="error" class="m-3 p-2 text-sm text-error border border-error rounded">
-      <p>{{ error }}</p>
-      <UButton size="xs" variant="ghost" @click="refresh">Retry</UButton>
-    </div>
+    <template #default>
+      <UAlert
+        v-if="error"
+        :description="error"
+        color="error"
+        variant="subtle"
+        :actions="[{ label: 'Retry', color: 'neutral', variant: 'outline', onClick: refresh }]"
+      />
 
-    <div class="flex-1 overflow-y-auto">
       <div v-if="filtered.length === 0 && !loading" class="p-4 text-sm text-muted">
         <template v-if="query">No conversations match "{{ query }}".</template>
         <template v-else>No conversations yet — click "New chat" to start.</template>
@@ -148,11 +170,14 @@ async function confirmDelete() {
       >
         <div class="flex items-center gap-2">
           <UIcon :name="kindIcon(session.kind)" class="text-muted shrink-0" />
-          <input
+          <UInput
             v-if="renamingId === session.chatId"
-            :ref="(el) => { if (renamingId === session.chatId) renameInputEl = el as HTMLInputElement | null }"
             v-model="renameDraft"
-            class="flex-1 bg-transparent border-b border-primary outline-none text-sm"
+            :ref="(el: any) => { if (renamingId === session.chatId) renameInputEl = (el?.inputRef ?? el) as HTMLInputElement | null }"
+            size="xs"
+            variant="none"
+            :ui="{ base: 'flex-1 px-0' }"
+            @click.prevent
             @blur="commitRename(session.chatId)"
             @keyup.enter="commitRename(session.chatId)"
             @keyup.escape="renamingId = null"
@@ -173,19 +198,13 @@ async function confirmDelete() {
           {{ session.lastMessagePreview }}
         </p>
       </NuxtLink>
-    </div>
+    </template>
+  </UDashboardSidebar>
 
-    <UModal v-model:open="confirmOpen">
-      <template #content>
-        <div class="p-4 space-y-3">
-          <h3 class="font-semibold">Delete this conversation?</h3>
-          <p class="text-sm text-muted">This cannot be undone.</p>
-          <div class="flex justify-end gap-2">
-            <UButton variant="ghost" @click="confirmOpen = false">Cancel</UButton>
-            <UButton color="error" @click="confirmDelete">Delete</UButton>
-          </div>
-        </div>
-      </template>
-    </UModal>
-  </aside>
+  <UModal v-model:open="confirmOpen" title="Delete this conversation?" description="This cannot be undone.">
+    <template #footer>
+      <UButton variant="ghost" @click="confirmOpen = false">Cancel</UButton>
+      <UButton color="error" @click="confirmDelete">Delete</UButton>
+    </template>
+  </UModal>
 </template>

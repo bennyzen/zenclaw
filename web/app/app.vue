@@ -5,8 +5,8 @@ const navItems = [
   { label: 'Provision', to: '/provision', icon: 'i-lucide-cpu' },
   { label: 'Files', to: '/files', icon: 'i-lucide-folder' },
   { label: 'Memory', to: '/memory', icon: 'i-lucide-brain' },
-  { label: 'Config', to: '/config', icon: 'i-lucide-settings' },
   { label: 'Logs', to: '/logs', icon: 'i-lucide-scroll-text' },
+  { label: 'Config', to: '/config', icon: 'i-lucide-settings' },
 ]
 </script>
 
@@ -41,8 +41,10 @@ const navItems = [
     <ConnectionBanner />
 
     <!-- Main content -->
-    <main class="flex-1 p-4">
-      <NuxtPage />
+    <main class="relative flex-1 p-4">
+      <NuxtLayout>
+        <NuxtPage />
+      </NuxtLayout>
     </main>
 
     <!-- Footer -->
