@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest an idea or enhancement for ZenClaw
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do? What's missing or frustrating today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Firmware / agent core
+        - Web UI
+        - Provisioning
+        - Cloud persistence
+        - Channels (Telegram, etc.)
+        - Other
