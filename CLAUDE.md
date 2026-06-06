@@ -1,6 +1,6 @@
 # ZenClaw
 
-AI agent framework. Single Rust implementation (`agent/`) targeting ESP32-S3 and ESP32-P4 hardware, plus a desktop build for development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC). The original MicroPython implementation has been retired and is preserved at the `legacy/micropython-final` git tag.
+AI agent framework. Single Rust implementation (`agent/`) targeting ESP32-S3 and ESP32-P4 hardware, plus a desktop build for development. Multiple devices coexist on a single network — each gets a unique mDNS hostname (web UI provisioning sets it; CLI-flashed devices fall back to `zenclaw-XXYYZZ` derived from the lower 3 bytes of the MAC). The original MicroPython implementation has been retired and removed.
 
 ## Rust Agent (`agent/`)
 
@@ -305,7 +305,7 @@ Each `chat_id` gets a JSONL file at `data/sessions/{chat_id}.jsonl` (or `/data/s
 
 ### Memory Considerations
 
-All supported boards ship PSRAM: DevKitC has 8MB, Guition P4 has 32MB. The internal SRAM is reserved for hot/IRQ-safe data; tool results, large strings, and the message queue land in PSRAM heap. TLS alone needs ~40-50KB; per-tool result budgets sit comfortably in the MB range. Session compaction keeps JSONL files bounded on flash. (Boards without PSRAM are not supported — see `legacy/micropython-final` git history for the prior T-Dongle-S3 era.)
+All supported boards ship PSRAM: DevKitC has 8MB, Guition P4 has 32MB. The internal SRAM is reserved for hot/IRQ-safe data; tool results, large strings, and the message queue land in PSRAM heap. TLS alone needs ~40-50KB; per-tool result budgets sit comfortably in the MB range. Session compaction keeps JSONL files bounded on flash. (Boards without PSRAM are not supported.)
 
 ## Project Structure
 
