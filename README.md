@@ -2,11 +2,30 @@
   <img src="zenclaw.webp" alt="ZenClaw running on an ESP32 board">
 </p>
 
+<!-- Promo TODO: replace the static hero above with a ~30–60s demo GIF —
+     browser-flash a board → chat over Telegram → watch it call a tool.
+     See docs/PROMOTION.md. The demo is the single best marketing asset. -->
+
 # ZenClaw
+
+<p align="center">
+  <a href="https://bennyzen.github.io/zenclaw/"><img src="https://img.shields.io/badge/▶_Live_demo-flash_from_your_browser-2ea44f" alt="Live demo — flash from your browser"></a>
+  <img src="https://img.shields.io/badge/Rust-esp--idf--svc-orange?logo=rust&logoColor=white" alt="Rust / esp-idf-svc">
+  <img src="https://img.shields.io/badge/ESP32--S3_%7C_ESP32--P4-supported-e7352c?logo=espressif&logoColor=white" alt="ESP32-S3 and ESP32-P4">
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
+</p>
 
 > **Runs on 0.5 watts. Always on. Always yours.**
 
 A fully autonomous AI agent that runs on a low-cost ESP32-S3 board (8 MB PSRAM) — tool use, persistent memory, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) protects your data from flash wear and reflashes via transparent write-through replication. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
+
+## What makes it different
+
+- **A real agent, on a microcontroller** — not a thin client to a cloud agent. The full tool-use loop, persistent memory, and multi-turn sessions run *on the ESP32 itself*, in ~0.5 W.
+- **Flash it from your browser** — Web Serial provisioning: pick a board, paste an API key, click Flash. No CLI, no SDK, no toolchain. ~60 seconds from plug-in to talking to it.
+- **Bring any LLM** — every provider over one OpenAI-compatible wire (OpenAI, Gemini, DeepSeek, Groq, zAI, Anthropic, local Ollama…). Swap providers without touching firmware.
+- **Yours and durable** — local-first storage with optional write-through backup to any S3-compatible bucket. No account, no telemetry, no third-party servers.
+- **Rust, two chips, many devices** — built on `esp-idf-svc`; ESP32-S3 (WiFi) and ESP32-P4 (Ethernet); multiple devices coexist on one network via mDNS.
 
 ## Features
 
