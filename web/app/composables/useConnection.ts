@@ -162,8 +162,6 @@ function scheduleReconnect() {
 // agent/src/desktop/server.rs), so a single setStatus does a full
 // replace regardless of which channel delivered it. No per-field merge,
 // no flicker, no asymmetry.
-//
-// Spec: docs/superpowers/specs/2026-05-03-stats-transport-model.md.
 
 function setStatus(raw: Record<string, any>) {
   state.lastStatus = mapStatus(raw)

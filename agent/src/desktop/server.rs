@@ -99,8 +99,6 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// no real wifi metrics, no on-flash storage info, no USB) — those fields are returned
 /// as `null` so the JSON shape matches and the consumer doesn't need
 /// per-platform branches.
-///
-/// See `docs/superpowers/specs/2026-05-03-stats-transport-model.md`.
 fn build_status_payload(state: &AppState) -> serde_json::Value {
     let uptime = state.start_time.elapsed().as_secs();
     let providers = &state.gateway.config.providers;
