@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a problem with ZenClaw firmware, the web UI, or the desktop build
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please fill in the details below so it can be reproduced.
+        For security vulnerabilities, do **not** open an issue — see [SECURITY.md](https://github.com/bennyzen/zenclaw/blob/main/SECURITY.md).
+  - type: dropdown
+    id: board
+    attributes:
+      label: Board / target
+      options:
+        - ESP32-S3 DevKitC
+        - Guition ESP32-P4
+        - Desktop build
+        - Other (specify below)
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version / commit
+      description: The `version` from `/api/status`, or the git commit you built from
+  - type: input
+    id: provider
+    attributes:
+      label: LLM provider
+      placeholder: e.g. Google Gemini, OpenAI, Ollama
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / serial output
+      description: Relevant serial monitor or `/ws/logs` output
+      render: shell

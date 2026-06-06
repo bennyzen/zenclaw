@@ -179,14 +179,14 @@ agent/src/
     prompt.rs                 System prompt builder
     types.rs                  Shared types (Message, ToolCall, etc.)
     tool_loop.rs              Circuit breaker
+    compaction.rs             Session compaction
     workspace.rs              Bootstrap file loading
-    telegram.rs               Telegram bot (long-poll + send)
-    subagents.rs              Background agent spawning
     cron.rs                   Scheduled tasks
     tools/                    Tool implementations
     sessions/                 JSONL conversation persistence
     channels/                 Channel abstraction
-    background/               Background task management
+      telegram.rs             Telegram bot (long-poll + send)
+    cloud/                    S3-compatible client + SigV4 signer
 
   net/                        NIC abstraction (trait + per-driver modules)
     mod.rs                    Nic trait, IpInfo, bring_up_primary dispatch
@@ -199,7 +199,11 @@ agent/src/
     runner.rs                 EspRunner — HTTP calls via esp-idf-svc
 
   platform/                   Platform abstraction (HTTP client/server, runtime)
-  desktop/                    Desktop-only (axum server, reqwest client)
+  desktop/                    Desktop-only target (axum server, reqwest client)
+    server.rs                 axum HTTP server
+    run.rs                    Desktop entry point
+    subagents.rs              Background agent spawning (desktop-only)
+    background/               Background task management (cron/heartbeat, desktop-only)
 ```
 
 ### HTTP API Endpoints
