@@ -2,6 +2,7 @@
 name = "zenclaw-smoke-p4"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # 0.52+ required for ESP32-P4 support (esp-idf-hal 0.46+ has Core::Core1, hys_ctrl_mode GPIO field, etc.)

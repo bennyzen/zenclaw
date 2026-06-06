@@ -6,19 +6,19 @@
 
 > **Runs on 0.5 watts. Always on. Always yours.**
 
-A fully autonomous AI agent that runs on a $3 ESP32 microcontroller — tool use, persistent memory, cron scheduling, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) protects your data from flash wear and reflashes via transparent write-through replication. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
+A fully autonomous AI agent that runs on a low-cost ESP32-S3 board (8 MB PSRAM) — tool use, persistent memory, multi-channel messaging, all on-device. Cloud-backed persistence (S3-compatible) protects your data from flash wear and reflashes via transparent write-through replication. Works with any LLM provider: Gemini, OpenAI, DeepSeek, Groq, local models via Ollama, or anything OpenAI-compatible. Written in Rust on `esp-idf-svc`, deployable straight from the browser via Web Serial. Supports ESP32-S3 (WiFi) and ESP32-P4 (Ethernet).
 
 ## Features
 
 - **Multi-provider LLM support**: any OpenAI-compatible provider (OpenAI, Google Gemini via its OpenAI-compat endpoint, DeepSeek, Groq, zAI, Anthropic, local models via Ollama, etc.) — all spoken over `POST /chat/completions` with `Bearer` auth
 - **Tool-use agent loop**: Call LLM, execute tools, persist context, repeat
-- **Consolidated tool system**: 13 action-param tools on device (file I/O, memory, sessions, gateway, cron, web fetch/search, cloud storage). Each tool dispatches multiple actions, so the LLM sees many more operations than schemas. Sub-agents exist in the codebase but are not yet wired on ESP32; an MCP client is on the [Roadmap](#roadmap).
+- **Consolidated tool system**: 7 action-param tools on device (file I/O, memory, sessions, gateway, cron, web fetch/search, cloud storage). Each tool dispatches multiple actions, so the LLM sees many more operations than schemas. Sub-agents exist in the codebase but are not yet wired on ESP32; an MCP client is on the [Roadmap](#roadmap).
 - **Circuit breaker**: Detects stuck loops, no-progress polling, ping-pong patterns
 - **Persistent memory**: Markdown-backed memory store with keyword search (vector embeddings deferred — see [`CLAUDE.md`](CLAUDE.md))
 - **Session management**: JSONL-persisted branching conversation trees
-- **Sub-agents**: Spawn isolated background agent sessions with depth limits
-- **Heartbeat**: Autonomous loop with cron scheduling and reflection turns
-- **Multi-channel**: Web UI, Telegram (voice, photos, typing indicator), HTTP API
+- **Sub-agents** *(desktop today; ESP32 on the [Roadmap](#roadmap))*: Spawn isolated background agent sessions with depth limits
+- **Heartbeat & cron** *(planned — see [Roadmap](#roadmap))*: Autonomous reflection loop and scheduled tasks; config and scheduler scaffolding exist, execution is not yet wired
+- **Multi-channel**: Web UI, Telegram (text + typing indicator), HTTP API
 - **Cloud persistence**: Write-through S3-compatible sync — sessions, memory, cron jobs, and user files automatically backed up to cloud storage (Cloudflare R2 free tier, Backblaze B2, AWS S3) and restored on boot
 - **Three-tier storage**: 8 MB on-device LittleFS for sessions/memory/configs, microSD card via FATFS for datasets and large blobs (Guition P4 today; gated by board), and S3-compatible cloud — all surfaced through one file manager UI
 - **Web UI**: Nuxt PWA — dashboard, config editor, file manager, browser-based device provisioning via Web Serial
@@ -36,7 +36,28 @@ Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome
 
 Done. The device is running at `http://<devicename>.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
 
-For developers building from source, see [`agent/`](agent/) and [`CLAUDE.md`](CLAUDE.md) for board manifests, build commands, and Rust architecture.
+For developers building from source, see [`CONTRIBUTING.md`](CONTRIBUTING.md) for toolchain setup and the build/flash workflow, and [`CLAUDE.md`](CLAUDE.md) for board manifests and Rust architecture.
+
+## Run locally (desktop)
+
+No hardware required for development. The agent has a native desktop build that
+runs the same agent core, tools, sessions, and HTTP API as the firmware,
+talking to LLM providers via the `genai` crate:
+
+```bash
+cd agent
+cargo +stable run --no-default-features --features desktop
+```
+
+(`agent/` pins the Espressif `esp` toolchain for firmware builds, so `+stable`
+runs the desktop build on your default stable Rust — no `espup` needed.)
+
+It reads `config.json` from the working directory (`agent/config.json`,
+gitignored) — create one with at least `agent_name`, `providers.default`, and a
+provider entry with `api_key` + `model` (see [Configuration](#configuration)).
+The API listens on `0.0.0.0:8080` (override with `ZENCLAW_PORT`), so the web UI
+connects to it exactly like a physical device. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for tests and the full toolchain.
 
 ## Architecture
 
@@ -142,6 +163,21 @@ Agent system data is stored under a `sys/` prefix in the bucket (stripped transp
 
 The agent's personality and instructions live in `SOUL.md` on the device's filesystem. Edit it via the web UI's File Manager to customize how ZenClaw behaves.
 
+## Security & Trust Model
+
+ZenClaw is a **local-network appliance**. The on-device HTTP/WebSocket API is
+**unauthenticated by design** in the current release: any host on the same
+network (and, because responses send `Access-Control-Allow-Origin: *`, any
+website you visit in a browser on that network) can read your stored secrets in
+cleartext via `GET /api/config` (LLM API keys, Telegram bot token, S3/R2
+`secret_access_key`), read/write the device filesystem, reboot the device, and
+mint presigned URLs for your cloud bucket.
+
+**Only run ZenClaw on a trusted network you control. Never port-forward it or
+place it on an untrusted/guest network.** Optional authentication and secret
+redaction are planned. See [`SECURITY.md`](SECURITY.md) for the full trust model
+and how to report vulnerabilities.
+
 ## Roadmap
 
 The following features are described in this README as part of the agent's design but are **not yet shipping in the on-device build**. They were either dropped during the no-PSRAM era and are being re-added now that the DevKitC (8MB PSRAM) is the floor, or are partially built and waiting on integration. Each item lists what exists today and what "shipped" means, so progress is measurable.
@@ -166,7 +202,7 @@ The following features are described in this README as part of the agent's desig
 
 ### 4. Telegram voice messages
 
-- **Today**: photos (`getFile` receive, vision path), typing indicator (`sendChatAction`), and text are shipping in `agent/src/core/channels/telegram.rs`.
+- **Today**: typing indicator (`sendChatAction`) and text are shipping in `agent/src/core/channels/telegram.rs`. Inbound photos/vision are not yet wired (photo-only messages are currently dropped).
 - **Shipped when**: inbound voice messages are downloaded via `getFile`, transcribed (likely via the configured provider's STT endpoint or a dedicated provider), and dispatched to the agent loop as text. Outbound `sendVoice` for assistant replies is a stretch goal — text replies to voice messages are the v1 deliverable.
 - **Estimated effort**: medium. The transcription dependency is the open design question (which provider, what wire format) — `genai`'s STT support is the natural starting point.
 
@@ -180,4 +216,4 @@ If you depend on any of these for your use case, please open an issue so we can 
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
