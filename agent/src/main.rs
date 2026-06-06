@@ -760,8 +760,6 @@ fn cloud_status_block(
 ///
 /// Cloud-storage stats are 60s-cached server-side (see
 /// `cloud_status_block`), so the cost of the 5s push remains bounded.
-///
-/// See `docs/superpowers/specs/2026-05-03-stats-transport-model.md`.
 #[cfg(feature = "esp32")]
 fn build_status_payload(
     gw: &std::sync::Arc<zenclaw_agent::core::gateway::Gateway>,
@@ -1054,7 +1052,7 @@ a{{color:#60a5fa;text-decoration:none}}
     //
     // Both this handler and the `/ws/stats` push thread call
     // `build_status_payload` so the JSON shape served on either transport
-    // is identical. See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
+    // is identical.
     let gw = gateway.clone();
     let nic_for_status = nic.clone();
     let th = temp_handle;
@@ -1831,7 +1829,6 @@ a{{color:#60a5fa;text-decoration:none}}
     // shared `build_status_payload` ensures GET and WS never diverge —
     // the web client uses a single `setStatus` (full replace) handler
     // regardless of transport. Desktop builds use the same cadence.
-    // See docs/superpowers/specs/2026-05-03-stats-transport-model.md.
     {
         use embedded_svc::ws::FrameType;
         let gw_for_ws = gateway.clone();

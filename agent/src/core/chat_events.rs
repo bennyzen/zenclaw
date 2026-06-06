@@ -4,8 +4,6 @@
 //! `execute_tool_calls` as `events: Option<&Sender<ChatEvent>>`. REST callers
 //! pass `None` (no-op); WS handlers pass `Some` and forward each event to
 //! the browser as a JSON text frame.
-//!
-//! See `docs/superpowers/specs/2026-05-01-streaming-chat-events-design.md`.
 use serde::{Deserialize, Serialize};
 
 /// Sender alias used across the codebase. `std::sync::mpsc` works on both
