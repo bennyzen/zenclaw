@@ -53,6 +53,8 @@ Open [bennyzen.github.io/zenclaw](https://bennyzen.github.io/zenclaw/) in Chrome
 
 > **Privacy**: Everything you type in the wizard stays between your browser and your ESP32. The wizard is a static page on GitHub Pages — no analytics, no telemetry, no third-party servers. WiFi credentials are flashed directly over the USB cable into the device's NVS partition; the API key is POSTed only to the device on your local network. The single outbound request the wizard makes is to `openrouter.ai/api/v1/models` to populate the model-name dropdown, and it carries no user data. Safe to paste your real API key.
 
+> **Don't want to trust a hosted page?** You don't have to — the wizard is open source and self-contained. Clone the repo and run the exact same UI on your own machine: `cd web && npm install && npm run dev`, then open `http://localhost:3000` and use the Provision page (Web Serial works over `localhost`). Audit the code first if you like. To verify the firmware itself, rebuild it from source with `./scripts/build-rust-firmware.sh` and inspect the binaries under `web/public/firmware/` before flashing — nothing has to leave your machine.
+
 Done. The device is running at `http://<devicename>.local`. The dashboard connects to it from the same hosted web UI — your browser bridges to the device on your local network.
 
 For developers building from source, see [`CONTRIBUTING.md`](CONTRIBUTING.md) for toolchain setup and the build/flash workflow, and [`CLAUDE.md`](CLAUDE.md) for board manifests and Rust architecture.
