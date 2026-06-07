@@ -39,6 +39,135 @@ impl RunnerError {
     }
 }
 
+/// Pull a human-readable error message out of an OpenAI-compatible error
+/// response body. Handles the common shapes:
+/// `{"error": {"message": "..."}}`, `{"error": "..."}`, `{"message": "..."}`.
+/// Returns `None` if nothing usable is found (caller should fall back to the
+/// raw body).
+pub fn extract_provider_error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let candidate = v
+        .get("error")
+        .and_then(|e| e.get("message").or(Some(e)))
+        .or_else(|| v.get("message"))
+        .or_else(|| v.get("error"));
+    match candidate {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Classify a *completed* HTTP response (status + body) from an
+/// OpenAI-compatible provider into a `RunnerError`, surfacing the status code
+/// and the provider's error message verbatim so the user sees the real cause
+/// instead of a generic "network error".
+///
+/// Retryability follows `is_retryable()`:
+/// - `401/403` → `Auth` (fatal — wrong/expired key)
+/// - `429` → `RateLimit` (transient, retried) — UNLESS the body indicates an
+///   insufficient-balance condition, which z.ai returns as 429 but is fatal
+/// - `5xx` → `Network` (transient, retried with backoff)
+/// - any other `4xx` → `Api` (fatal — bad request, wrong model/endpoint, etc.)
+pub fn classify_http_error(status: u16, body: &str) -> RunnerError {
+    let msg = extract_provider_error_message(body).unwrap_or_else(|| {
+        let trimmed = body.trim();
+        trimmed[..trimmed.len().min(300)].to_string()
+    });
+    let with_code = format!("HTTP {}: {}", status, msg);
+    match status {
+        401 | 403 => RunnerError::Auth(with_code),
+        429 if msg.to_lowercase().contains("balance")
+            || msg.to_lowercase().contains("insufficient")
+            || msg.to_lowercase().contains("quota") =>
+        {
+            // z.ai (and others) return 429 for a depleted balance/quota — that
+            // never recovers on retry, so surface it as a fatal API error.
+            RunnerError::Api(with_code)
+        }
+        429 => RunnerError::RateLimit,
+        500 | 502 | 503 | 504 => RunnerError::Network(with_code),
+        _ => RunnerError::Api(with_code),
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_nested_error_message() {
+        let body = r#"{"error":{"message":"Invalid API key","type":"auth"}}"#;
+        assert_eq!(
+            extract_provider_error_message(body).as_deref(),
+            Some("Invalid API key")
+        );
+    }
+
+    #[test]
+    fn extracts_string_error_and_top_level_message() {
+        assert_eq!(
+            extract_provider_error_message(r#"{"error":"boom"}"#).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            extract_provider_error_message(r#"{"message":"nope"}"#).as_deref(),
+            Some("nope")
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_on_junk() {
+        assert_eq!(extract_provider_error_message("not json"), None);
+        assert_eq!(extract_provider_error_message("{}"), None);
+    }
+
+    #[test]
+    fn auth_codes_are_fatal_and_carry_code() {
+        for status in [401u16, 403] {
+            let e = classify_http_error(status, r#"{"error":{"message":"bad key"}}"#);
+            assert!(matches!(e, RunnerError::Auth(_)), "{status} should be Auth");
+            assert!(!e.is_retryable());
+            let s = e.to_string();
+            assert!(s.contains(&format!("HTTP {status}")) && s.contains("bad key"));
+        }
+    }
+
+    #[test]
+    fn plain_rate_limit_is_retryable() {
+        let e = classify_http_error(429, r#"{"error":{"message":"too many requests"}}"#);
+        assert!(matches!(e, RunnerError::RateLimit));
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn insufficient_balance_429_is_fatal() {
+        let e = classify_http_error(429, r#"{"error":{"message":"Insufficient balance"}}"#);
+        assert!(matches!(e, RunnerError::Api(_)));
+        assert!(!e.is_retryable());
+        assert!(e.to_string().contains("HTTP 429") && e.to_string().contains("balance"));
+    }
+
+    #[test]
+    fn server_errors_are_transient_with_code() {
+        for status in [500u16, 502, 503, 504] {
+            let e = classify_http_error(status, "upstream boom");
+            assert!(matches!(e, RunnerError::Network(_)), "{status} should be Network");
+            assert!(e.is_retryable());
+            assert!(e.to_string().contains(&format!("HTTP {status}")));
+        }
+    }
+
+    #[test]
+    fn other_4xx_is_fatal_api_with_code() {
+        for status in [400u16, 404, 422] {
+            let e = classify_http_error(status, r#"{"error":{"message":"nope"}}"#);
+            assert!(matches!(e, RunnerError::Api(_)), "{status} should be Api");
+            assert!(!e.is_retryable());
+            assert!(e.to_string().contains(&format!("HTTP {status}")));
+        }
+    }
+}
+
 // --- LLM Runner trait (shared between desktop and ESP32) ---
 
 #[async_trait]

@@ -77,10 +77,32 @@ pub async fn run_loop(
                 r
             }
             Err(e) => {
+                // Fatal errors (bad/expired key, bad request, depleted balance,
+                // unparseable response) never recover on retry — surface the
+                // provider's status code + message immediately instead of
+                // burying it under the consecutive-error breaker.
+                if !e.is_retryable() {
+                    error!("LLM call failed (fatal): {}", e);
+                    return Err(AgentLoopError::Runner(e));
+                }
                 consecutive_errors += 1;
-                error!("LLM call failed (attempt {}): {}", consecutive_errors, e);
+                error!(
+                    "LLM call failed (attempt {}/{}): {}",
+                    consecutive_errors, MAX_CONSECUTIVE_ERRORS, e
+                );
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     return Err(AgentLoopError::TooManyErrors(e.to_string()));
+                }
+                // Transient (connection reset, rate limit, 5xx): back off before
+                // retrying so a momentary blip in the provider edge doesn't trip
+                // the breaker. The ESP32 HTTP layer already retries handshake
+                // resets internally; this is the second line of defense.
+                // Gated off desktop, where the runner does its own async backoff
+                // and a blocking sleep would stall the tokio worker.
+                #[cfg(not(feature = "desktop"))]
+                {
+                    let backoff_ms = 300u64 * (1u64 << (consecutive_errors - 1));
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
                 }
                 continue;
             }
