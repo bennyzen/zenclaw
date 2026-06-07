@@ -7,7 +7,7 @@ Browser-based companion app for [ZenClaw](../) devices — a PWA for provisionin
 - **Provision** a new ESP32-S3 or ESP32-P4 over Web Serial (Chrome / Edge desktop only — no driver install needed)
 - **Connect** to any device on the LAN by mDNS hostname (`zenclaw-<name>.local`); switch between devices freely
 - **Chat** with the agent in real time over WebSocket, with streaming tool-call widgets
-- **Browse files** on the device's SPIFFS partition and on its bound R2 bucket
+- **Browse files** on the device's LittleFS flash partition (and the microSD card on P4) and on its bound S3-compatible bucket (e.g. Cloudflare R2)
 - **Edit config** (providers, API keys, channels, cloud storage) with a CodeMirror editor
 - **Inspect memory**, watch live logs, restart the device
 
@@ -60,21 +60,27 @@ app/
   pages/
     index.vue                Landing — provision card + connect/disconnect card
     dashboard.vue            Connected device overview (memory, storage, cloud, embedded device page)
-    chat.vue                 Streaming chat with tool-call widgets
+    chat/                    Streaming chat with tool-call widgets — index.vue (list) + [id].vue (per-conversation)
     provision.vue            Web Serial flashing wizard
     config.vue               JSON config editor (CodeMirror)
-    files.vue                Device SPIFFS + cloud R2 file browser
+    files.vue                Device (LittleFS) + microSD + cloud (S3) file browser
     memory.vue               Agent memory viewer
     logs.vue                 Live log stream
   components/
     ConnectionBanner.vue     Top-bar connect prompt (hidden when connected)
     WelcomeLanding.vue       Landing page hero + cards
     AppFooter.vue            Status footer (live device stats)
+    SessionsSidebar.vue      Conversation list for multi-chat
+    MemoryCard.vue,          Memory viewing + inline editing
+    MemoryEditor.vue
     HelpDrawer.vue + help/   Per-page contextual help
   composables/
     useConnection.ts         Module-scoped reactive state — single source of truth for the active device
     useSerial.ts             Web Serial wrapper used by the provisioning wizard
-  types/connection.ts        Shared types for events, device status, file entries
+    useSessions.ts           Multi-conversation session list + persistence
+  types/
+    connection.ts            Shared types for events, device status, file entries
+    firmware.ts              Board manifest types for the provisioning wizard
 ```
 
 `useConnection` exposes one shared `state` object plus action functions (`connectNetwork`, `disconnectNetwork`, file ops, chat ops, etc.). Pages read `state` reactively — there's no Pinia / Vuex.
