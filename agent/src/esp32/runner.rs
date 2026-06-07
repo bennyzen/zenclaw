@@ -70,14 +70,22 @@ impl EspRunner {
 
         info!("LLM call: model={} body={}B", model, body.len());
 
-        let response_body = esp_http_post(&url, &body, Some(&auth_header))
-            .map_err(|e| RunnerError::Network(e))?;
+        let (status, response_body) = esp_http_post(&url, &body, Some(&auth_header))
+            .map_err(RunnerError::Network)?;
         drop(body); // Free request body before parsing response
+
+        // A non-2xx status carries a real provider error — surface its code and
+        // message (issue #14) instead of burying it as a generic failure. This
+        // also classifies it as fatal vs. transient so the agent loop retries
+        // only the transient ones.
+        if status >= 400 {
+            return Err(crate::core::runner::classify_http_error(status, &response_body));
+        }
 
         let response: serde_json::Value = serde_json::from_str(&response_body)
             .map_err(|e| RunnerError::Parse(format!("JSON parse: {}", e)))?;
 
-        // Check for API errors
+        // Some providers return 200 with an error envelope in the body.
         if let Some(error) = response.get("error") {
             let msg = error
                 .get("message")
@@ -128,19 +136,57 @@ impl LlmRunner for EspRunner {
 // HTTP POST via esp-idf-svc (blocking, uses mbedtls for TLS)
 // ---------------------------------------------------------------------------
 
-fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<String, String> {
-    use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
-    use esp_idf_svc::http::Method;
+/// Max attempts for one logical POST. z.ai's edge resets a large fraction of
+/// *new* TLS handshakes (issue #14); a fresh handshake per call rolls the dice
+/// every time. We (a) keep a warm connection so most calls skip the handshake
+/// entirely, and (b) retry the handshake/write resets that do happen, with
+/// exponential backoff, before they ever reach the agent-loop circuit breaker.
+const MAX_HTTP_ATTEMPTS: usize = 4;
+const INITIAL_BACKOFF_MS: u64 = 200;
 
+thread_local! {
+    /// Warm HTTP/TLS connection to the LLM provider, reused across calls on
+    /// this thread — including the multiple round-trips within a single
+    /// tool-using turn (issue #10's dominant failure mode). A kept-alive
+    /// connection only handshakes once; subsequent requests reuse the socket
+    /// (`esp_http_client_open` reuses it when keep-alive is on). Reset or dead
+    /// connections are dropped and rebuilt by `esp_http_post`'s retry loop.
+    ///
+    /// Thread-local (not a global) so we never move the `!Send` connection
+    /// handle across threads and never need `unsafe`. mbedTLS buffers live in
+    /// PSRAM (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`) and the idle footprint is
+    /// freed (`CONFIG_MBEDTLS_DYNAMIC_BUFFER`), so a few warm connections (one
+    /// per calling thread) are cheap.
+    static PROVIDER_CONN: std::cell::RefCell<Option<esp_idf_svc::http::client::EspHttpConnection>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn build_provider_conn() -> Result<esp_idf_svc::http::client::EspHttpConnection, String> {
+    use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     let config = HttpConfig {
         buffer_size: Some(1024),
         buffer_size_tx: Some(1024),
         timeout: Some(std::time::Duration::from_secs(60)),
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        // Reuse the socket across requests — the whole point of the fix.
+        keep_alive_enable: true,
         ..Default::default()
     };
+    EspHttpConnection::new(&config).map_err(|e| format!("HTTP init: {}", e))
+}
 
-    let mut conn = EspHttpConnection::new(&config).map_err(|e| format!("HTTP init: {}", e))?;
+/// Perform one request over the given (possibly warm) connection. Any error
+/// here is treated as a transient transport failure: the caller drops the
+/// connection and reconnects on the next attempt. Returns `(status, body)` for
+/// *any* HTTP status — non-2xx is a real provider response, not a transport
+/// failure, so the caller (not this function) decides how to classify it.
+fn http_post_once(
+    conn: &mut esp_idf_svc::http::client::EspHttpConnection,
+    url: &str,
+    body: &str,
+    auth_header: Option<&str>,
+) -> Result<(u16, String), String> {
+    use esp_idf_svc::http::Method;
 
     let content_len = body.len().to_string();
     let mut headers: Vec<(&str, &str)> = vec![
@@ -171,20 +217,65 @@ fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<Str
         }
         resp_body.extend_from_slice(&buf[..n]);
     }
-    drop(conn); // Release TLS resources before processing response
 
-    let body_str = String::from_utf8(resp_body)
-        .map_err(|e| format!("Invalid UTF-8: {}", e))?;
+    let body_str = String::from_utf8(resp_body).map_err(|e| format!("Invalid UTF-8: {}", e))?;
+    Ok((status, body_str))
+}
 
-    if status >= 400 {
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            &body_str[..body_str.len().min(500)]
-        ));
+/// POST to the provider, returning `(status, body)` for any completed HTTP
+/// response. Reuses a warm thread-local connection and retries transient
+/// TLS/connection failures with exponential backoff. Only `Err` when every
+/// attempt fails at the transport level (no HTTP response at all) — those are
+/// the resets z.ai sheds, surfaced as a retryable `Network` error upstream.
+fn esp_http_post(url: &str, body: &str, auth_header: Option<&str>) -> Result<(u16, String), String> {
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_HTTP_ATTEMPTS {
+        // Take the warm connection if we have one, else build a fresh one. A
+        // failure to even allocate the client is not transient — bail.
+        let conn = PROVIDER_CONN.with(|c| c.borrow_mut().take());
+        let mut conn = match conn {
+            Some(c) => c,
+            None => build_provider_conn()?,
+        };
+
+        // Serialize the actual TLS I/O device-wide: mbedTLS shares global state
+        // during operations, so the LLM call must be mutually exclusive with
+        // the web tool's TLS calls (which also take this lock). Released during
+        // the backoff sleep below so other TLS work isn't blocked while we wait.
+        let result = {
+            let _tls_guard = crate::TLS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            http_post_once(&mut conn, url, body, auth_header)
+        };
+
+        match result {
+            Ok(resp) => {
+                // Healthy — keep the connection warm for the next call.
+                PROVIDER_CONN.with(|c| *c.borrow_mut() = Some(conn));
+                return Ok(resp);
+            }
+            Err(e) => {
+                // Transient: drop the (poisoned) connection so the next attempt
+                // reconnects from scratch.
+                drop(conn);
+                last_err = e;
+                if attempt < MAX_HTTP_ATTEMPTS {
+                    log::warn!(
+                        "LLM HTTP attempt {}/{} failed ({}); retrying in {}ms",
+                        attempt,
+                        MAX_HTTP_ATTEMPTS,
+                        last_err,
+                        backoff_ms
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms *= 2;
+                }
+            }
+        }
     }
 
-    Ok(body_str)
+    Err(format!("{} (after {} attempts)", last_err, MAX_HTTP_ATTEMPTS))
 }
 
 // ---------------------------------------------------------------------------
