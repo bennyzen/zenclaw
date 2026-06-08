@@ -10,6 +10,8 @@
 /// Telegram's maximum message length, in characters.
 const TELEGRAM_LIMIT: usize = 4096;
 
+const MAX_INLINE_DEPTH: usize = 32;
+
 /// Escape the three HTML-significant characters in text content.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -50,6 +52,27 @@ fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
     (from..chars.len()).find(|&j| chars[j] == target)
 }
 
+/// Find the `)` that closes a link URL opened at `from`, allowing balanced
+/// nested parens inside the URL (e.g. Wikipedia `..._(programming)` links).
+fn find_url_close(chars: &[char], from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut j = from;
+    while j < chars.len() {
+        match chars[j] {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(j);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Index of the first char of the next `delim delim` pair at or after `from`.
 fn find_double(chars: &[char], from: usize, delim: char) -> Option<usize> {
     let mut j = from;
@@ -69,7 +92,7 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     if close_text + 1 >= chars.len() || chars[close_text + 1] != '(' {
         return None;
     }
-    let close_url = find_char(chars, close_text + 2, ')')?;
+    let close_url = find_url_close(chars, close_text + 2)?;
     let text: String = chars[start + 1..close_text].iter().collect();
     let url: String = chars[close_text + 2..close_url].iter().collect();
     Some((text, url, close_url + 1))
@@ -77,6 +100,13 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
 
 /// Render an inline string (one logical line) to Telegram HTML.
 fn render_inline(input: &str) -> String {
+    render_inline_depth(input, 0)
+}
+
+fn render_inline_depth(input: &str, depth: usize) -> String {
+    if depth >= MAX_INLINE_DEPTH {
+        return escape(input);
+    }
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
@@ -101,7 +131,7 @@ fn render_inline(input: &str) -> String {
                 out.push_str("<a href=\"");
                 out.push_str(&escape_attr(&url));
                 out.push_str("\">");
-                out.push_str(&render_inline(&text));
+                out.push_str(&render_inline_depth(&text, depth + 1));
                 out.push_str("</a>");
                 i = next;
                 continue;
@@ -116,7 +146,7 @@ fn render_inline(input: &str) -> String {
                     if close > i + 2 {
                         let content: String = chars[i + 2..close].iter().collect();
                         out.push_str("<b>");
-                        out.push_str(&render_inline(&content));
+                        out.push_str(&render_inline_depth(&content, depth + 1));
                         out.push_str("</b>");
                         i = close + 2;
                         continue;
@@ -131,7 +161,7 @@ fn render_inline(input: &str) -> String {
                 if close > i + 2 {
                     let content: String = chars[i + 2..close].iter().collect();
                     out.push_str("<s>");
-                    out.push_str(&render_inline(&content));
+                    out.push_str(&render_inline_depth(&content, depth + 1));
                     out.push_str("</s>");
                     i = close + 2;
                     continue;
@@ -147,7 +177,7 @@ fn render_inline(input: &str) -> String {
                     if close > i + 1 {
                         let content: String = chars[i + 1..close].iter().collect();
                         out.push_str("<i>");
-                        out.push_str(&render_inline(&content));
+                        out.push_str(&render_inline_depth(&content, depth + 1));
                         out.push_str("</i>");
                         i = close + 1;
                         continue;
@@ -398,53 +428,123 @@ fn render_blocks(md: &str) -> Vec<String> {
     blocks
 }
 
-/// Split one oversize block into pieces ≤ `limit`. A `<pre>…</pre>` block is
-/// split at line boundaries with the `<pre>` tags re-opened on each piece so
-/// every piece is independently valid HTML. Any other oversize block is
-/// hard-split by character count.
-fn split_block(block: &str, limit: usize) -> Vec<String> {
-    const OPEN: &str = "<pre>";
-    const CLOSE: &str = "</pre>";
-    if block.starts_with(OPEN) && block.ends_with(CLOSE) {
-        let inner = &block[OPEN.len()..block.len() - CLOSE.len()];
-        let wrap = OPEN.chars().count() + CLOSE.chars().count();
-        let mut out: Vec<String> = Vec::new();
-        let mut cur = String::new();
-        for piece in inner.split_inclusive('\n') {
-            // A single line longer than the budget must itself be hard-split,
-            // re-wrapping each fragment so every chunk stays within the limit.
-            if piece.chars().count() + wrap > limit {
-                if !cur.is_empty() {
-                    out.push(format!("{}{}{}", OPEN, cur, CLOSE));
-                    cur = String::new();
+/// One HTML token: an opening tag, a closing tag, or an atomic unit of text
+/// (a single char, or a whole `&entity;` which must never be split).
+enum HtmlTok {
+    Open(String),
+    Close(String),
+    Atom(String),
+}
+
+/// Tokenize rendered HTML into tags and atomic text units. `&...;` entities
+/// are kept whole so a split never lands inside an entity.
+fn tokenize_html(s: &str) -> Vec<HtmlTok> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '<' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != '>' {
+                    j += 1;
                 }
-                let budget = limit - wrap;
-                let line_chars: Vec<char> = piece.chars().collect();
-                for sub in line_chars.chunks(budget) {
-                    let fragment: String = sub.iter().collect();
-                    out.push(format!("{}{}{}", OPEN, fragment, CLOSE));
+                let end = (j + 1).min(chars.len());
+                let tag: String = chars[i..end].iter().collect();
+                if tag.starts_with("</") {
+                    toks.push(HtmlTok::Close(tag));
+                } else {
+                    toks.push(HtmlTok::Open(tag));
                 }
-                continue;
+                i = end;
             }
-            if !cur.is_empty()
-                && cur.chars().count() + piece.chars().count() + wrap > limit
-            {
-                out.push(format!("{}{}{}", OPEN, cur, CLOSE));
-                cur = String::new();
+            '&' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != ';' && j - i <= 10 {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ';' {
+                    toks.push(HtmlTok::Atom(chars[i..=j].iter().collect()));
+                    i = j + 1;
+                } else {
+                    toks.push(HtmlTok::Atom(chars[i].to_string()));
+                    i += 1;
+                }
             }
-            cur.push_str(piece);
+            _ => {
+                toks.push(HtmlTok::Atom(chars[i].to_string()));
+                i += 1;
+            }
         }
-        if !cur.is_empty() {
-            out.push(format!("{}{}{}", OPEN, cur, CLOSE));
-        }
-        out
-    } else {
-        let chars: Vec<char> = block.chars().collect();
-        chars
-            .chunks(limit)
-            .map(|c| c.iter().collect::<String>())
-            .collect()
     }
+    toks
+}
+
+/// The closing tag for an opening tag string (`<a href=..>` -> `</a>`).
+fn close_for(open_tag: &str) -> String {
+    let name: String = open_tag
+        .trim_start_matches('<')
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    format!("</{}>", name)
+}
+
+/// Split an oversize HTML block into pieces each <= `limit` chars AND each
+/// independently well-formed: tags open at a split boundary are closed at the
+/// end of the chunk and reopened at the start of the next. Keeps `<b>`/`<i>`/
+/// `<a>` spans and `<pre><code class=..>` blocks valid within every chunk.
+fn split_block(block: &str, limit: usize) -> Vec<String> {
+    if block.chars().count() <= limit {
+        return vec![block.to_string()];
+    }
+    let toks = tokenize_html(block);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    let mut open: Vec<String> = Vec::new();
+    let mut progressed = false;
+
+    for tok in toks {
+        let tok_str = match &tok {
+            HtmlTok::Open(s) | HtmlTok::Close(s) | HtmlTok::Atom(s) => s.clone(),
+        };
+        let tok_len = tok_str.chars().count();
+        let close_reserve: usize =
+            open.iter().map(|t| close_for(t).chars().count()).sum();
+        let extra = if let HtmlTok::Open(s) = &tok {
+            close_for(s).chars().count()
+        } else {
+            0
+        };
+        if progressed && cur_len + tok_len + close_reserve + extra > limit {
+            let mut chunk = cur.clone();
+            for t in open.iter().rev() {
+                chunk.push_str(&close_for(t));
+            }
+            out.push(chunk);
+            cur = open.concat();
+            cur_len = cur.chars().count();
+            progressed = false;
+        }
+        cur.push_str(&tok_str);
+        cur_len += tok_len;
+        progressed = true;
+        match &tok {
+            HtmlTok::Open(s) => open.push(s.clone()),
+            HtmlTok::Close(_) => {
+                open.pop();
+            }
+            HtmlTok::Atom(_) => {}
+        }
+    }
+    if !cur.is_empty() {
+        for t in open.iter().rev() {
+            cur.push_str(&close_for(t));
+        }
+        out.push(cur);
+    }
+    out
 }
 
 /// Pack blocks (joined by single newlines) into chunks ≤ `limit`.
@@ -684,5 +784,55 @@ mod tests {
             assert!(c.chars().count() <= 4096, "chunk too long: {}", c.chars().count());
             assert!(c.starts_with("<pre>") && c.ends_with("</pre>"), "chunk must be a valid pre block");
         }
+    }
+
+    #[test]
+    fn oversize_bold_paragraph_splits_into_balanced_chunks() {
+        let md = format!("**{}**", "a".repeat(5000));
+        let chunks = render_telegram(&md);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.chars().count() <= 4096, "chunk len {}", c.chars().count());
+            assert_eq!(
+                c.matches("<b>").count(),
+                c.matches("</b>").count(),
+                "unbalanced bold tags in chunk"
+            );
+            assert!(c.starts_with("<b>") && c.ends_with("</b>"));
+        }
+    }
+
+    #[test]
+    fn oversize_language_code_fence_keeps_code_tag_per_chunk() {
+        let body = "x".repeat(10_000);
+        let md = format!("```json\n{}\n```", body);
+        let chunks = render_telegram(&md);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.chars().count() <= 4096);
+            assert!(
+                c.starts_with("<pre><code class=\"language-json\">"),
+                "chunk must reopen the code tag"
+            );
+            assert!(c.ends_with("</code></pre>"), "chunk must close code+pre");
+        }
+    }
+
+    #[test]
+    fn inline_link_with_parens_in_url() {
+        assert_eq!(
+            render_inline("[w](https://e.org/wiki/Rust_(programming))"),
+            "<a href=\"https://e.org/wiki/Rust_(programming)\">w</a>"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_emphasis_does_not_overflow() {
+        let mut s = "x".to_string();
+        for _ in 0..500 {
+            s = format!("**{}**", s);
+        }
+        let out = render_inline(&s);
+        assert!(!out.is_empty());
     }
 }

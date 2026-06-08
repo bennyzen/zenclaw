@@ -152,7 +152,6 @@ impl Poller {
 pub struct TelegramChannel {
     bot_token: String,
     http: Arc<dyn HttpClient>,
-    parse_mode: Option<String>,
 }
 
 impl TelegramChannel {
@@ -160,13 +159,7 @@ impl TelegramChannel {
         Self {
             bot_token,
             http,
-            parse_mode: None,
         }
-    }
-
-    pub fn with_parse_mode(mut self, mode: Option<String>) -> Self {
-        self.parse_mode = mode;
-        self
     }
 
     /// Telegram-specific (not on Channel trait — Cli has no notion of typing).
