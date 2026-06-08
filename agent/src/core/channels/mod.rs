@@ -26,6 +26,7 @@ pub trait Channel: Send + Sync {
 }
 
 pub mod telegram;
+pub(crate) mod markdown_html;
 
 #[cfg(all(test, feature = "desktop"))]
 mod tests {
