@@ -100,7 +100,7 @@ impl EspRunner {
             return Err(RunnerError::Api(msg.to_string()));
         }
 
-        parse_openai_response(&response)
+        parse_openai_response(&response, tools)
     }
 }
 
@@ -350,7 +350,10 @@ fn build_openai_payload(
     payload
 }
 
-fn parse_openai_response(data: &serde_json::Value) -> Result<LlmResponse, RunnerError> {
+fn parse_openai_response(
+    data: &serde_json::Value,
+    tools: &[ToolDefinition],
+) -> Result<LlmResponse, RunnerError> {
     let message = data
         .get("choices")
         .and_then(|c| c.get(0))
@@ -389,6 +392,19 @@ fn parse_openai_response(data: &serde_json::Value) -> Result<LlmResponse, Runner
         .unwrap_or_default();
 
     if tool_calls.is_empty() {
+        // Some models leak their tool calls into `content` as `<calls>…</calls>`
+        // XML instead of emitting a structured tool_calls array. Recover them so
+        // they execute instead of dumping into the reply text.
+        if let Some(recovered) = crate::core::tool_recovery::recover_xml_tool_calls(&text, tools) {
+            info!(
+                "recovered {} leaked <calls> tool call(s) from content",
+                recovered.len()
+            );
+            return Ok(LlmResponse::ToolCalls {
+                tool_calls: recovered,
+                provider_data: None,
+            });
+        }
         Ok(LlmResponse::Text(text))
     } else if text.is_empty() {
         Ok(LlmResponse::ToolCalls {

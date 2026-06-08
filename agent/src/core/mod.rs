@@ -9,6 +9,7 @@ pub mod gateway;
 pub mod prompt;
 pub mod sessions;
 pub mod tool_loop;
+pub mod tool_recovery;
 pub mod tools;
 pub mod types;
 pub mod workspace;
