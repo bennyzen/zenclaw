@@ -12,6 +12,10 @@ const TELEGRAM_LIMIT: usize = 4096;
 
 const MAX_INLINE_DEPTH: usize = 32;
 
+/// Max rendered grid width (chars) that still fits a phone's monospace <pre>
+/// before Telegram wraps it. Wider tables switch to vertical records.
+const MOBILE_GRID_MAX_WIDTH: usize = 34;
+
 /// Escape the three HTML-significant characters in text content.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -291,7 +295,9 @@ fn format_row(cells: &[String], widths: &[usize]) -> String {
 }
 
 /// Render a table starting at `lines[0]` (header) + `lines[1]` (separator).
-/// Returns (html_block, lines_consumed).
+/// Narrow tables become an aligned monospace `<pre>` grid; tables too wide for
+/// a phone become vertical records (first column as a bold title, the rest as
+/// indented `Label: value` lines). Returns (html_block, lines_consumed).
 fn render_table(lines: &[&str]) -> (String, usize) {
     let header = split_row(lines[0]);
     let ncols = header.len();
@@ -312,18 +318,35 @@ fn render_table(lines: &[&str]) -> (String, usize) {
             widths[c] = widths[c].max(cell.chars().count());
         }
     }
+    let grid_width: usize = widths.iter().sum::<usize>() + 3 * ncols.saturating_sub(1);
 
-    let mut grid = String::new();
-    grid.push_str(&format_row(&rows[0], &widths));
-    grid.push('\n');
-    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-    grid.push_str(&sep.join("-+-"));
-    for row in &rows[1..] {
-        grid.push('\n');
-        grid.push_str(&format_row(row, &widths));
+    if rows.len() <= 1 || grid_width <= MOBILE_GRID_MAX_WIDTH {
+        // Aligned monospace grid (fits a phone). Trailing padding is trimmed.
+        let mut grid = String::new();
+        for (ri, row) in rows.iter().enumerate() {
+            if ri > 0 {
+                grid.push('\n');
+            }
+            grid.push_str(format_row(row, &widths).trim_end());
+        }
+        (format!("<pre>{}</pre>", escape(&grid)), consumed)
+    } else {
+        // Too wide for a phone: vertical records.
+        let header = &rows[0];
+        let mut records: Vec<String> = Vec::new();
+        for row in &rows[1..] {
+            let mut out_lines: Vec<String> = Vec::new();
+            let title = row.first().map(|s| s.as_str()).unwrap_or("");
+            out_lines.push(format!("<b>{}</b>", escape(title)));
+            for c in 1..ncols {
+                let label = header.get(c).map(|s| s.as_str()).unwrap_or("");
+                let value = row.get(c).map(|s| s.as_str()).unwrap_or("");
+                out_lines.push(format!("  {}: {}", escape(label), escape(value)));
+            }
+            records.push(out_lines.join("\n"));
+        }
+        (records.join("\n\n"), consumed)
     }
-
-    (format!("<pre>{}</pre>", escape(&grid)), consumed)
 }
 
 /// Convert markdown into a sequence of Telegram-HTML blocks (no trailing
@@ -707,7 +730,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0],
-            "<pre>Name  | Age\n------+----\nAlice | 30 \nBob   | 7  </pre>"
+            "<pre>Name  | Age\nAlice | 30\nBob   | 7</pre>"
         );
     }
 
@@ -715,7 +738,7 @@ mod tests {
     fn table_escapes_cell_html() {
         let md = "| A |\n| --- |\n| x<y |";
         let out = render_blocks(md);
-        assert_eq!(out, vec!["<pre>A  \n---\nx&lt;y</pre>"]);
+        assert_eq!(out, vec!["<pre>A\nx&lt;y</pre>"]);
     }
 
     #[test]
@@ -834,5 +857,26 @@ mod tests {
         }
         let out = render_inline(&s);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn narrow_table_stays_compact_grid_without_separator() {
+        let md = "| Qty | Item |\n| --- | --- |\n| 3 | Bolts |\n| 12 | Nuts |";
+        let out = render_blocks(md);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], "<pre>Qty | Item\n3   | Bolts\n12  | Nuts</pre>");
+    }
+
+    #[test]
+    fn wide_table_renders_as_vertical_records() {
+        let md = "| Name | Role | Status |\n| --- | --- | --- |\n| Alice | Engineering Lead | On vacation |\n| Bob | Designer | Away |";
+        let out = render_blocks(md);
+        assert_eq!(out.len(), 1, "vertical table is one block");
+        let block = &out[0];
+        assert!(block.contains("<b>Alice</b>"), "missing Alice title: {block}");
+        assert!(block.contains("  Role: Engineering Lead"), "missing role line: {block}");
+        assert!(block.contains("  Status: On vacation"), "missing status line: {block}");
+        assert!(block.contains("<b>Bob</b>"));
+        assert!(!block.contains("<pre>"), "wide table must not use <pre>: {block}");
     }
 }
