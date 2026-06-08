@@ -411,6 +411,21 @@ fn split_block(block: &str, limit: usize) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut cur = String::new();
         for piece in inner.split_inclusive('\n') {
+            // A single line longer than the budget must itself be hard-split,
+            // re-wrapping each fragment so every chunk stays within the limit.
+            if piece.chars().count() + wrap > limit {
+                if !cur.is_empty() {
+                    out.push(format!("{}{}{}", OPEN, cur, CLOSE));
+                    cur = String::new();
+                }
+                let budget = limit - wrap;
+                let line_chars: Vec<char> = piece.chars().collect();
+                for sub in line_chars.chunks(budget) {
+                    let fragment: String = sub.iter().collect();
+                    out.push(format!("{}{}{}", OPEN, fragment, CLOSE));
+                }
+                continue;
+            }
             if !cur.is_empty()
                 && cur.chars().count() + piece.chars().count() + wrap > limit
             {
@@ -656,6 +671,18 @@ mod tests {
             assert!(c.chars().count() <= 4096);
             assert!(c.starts_with("<pre>"), "chunk must reopen <pre>: {:?}", &c[..20.min(c.len())]);
             assert!(c.ends_with("</pre>"), "chunk must close </pre>");
+        }
+    }
+
+    #[test]
+    fn oversize_single_line_pre_is_hard_split() {
+        let line = "x".repeat(10_000);
+        let md = format!("```\n{}\n```", line);
+        let chunks = render_telegram(&md);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        for c in &chunks {
+            assert!(c.chars().count() <= 4096, "chunk too long: {}", c.chars().count());
+            assert!(c.starts_with("<pre>") && c.ends_with("</pre>"), "chunk must be a valid pre block");
         }
     }
 }
