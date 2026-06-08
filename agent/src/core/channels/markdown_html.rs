@@ -226,6 +226,76 @@ fn list_item(line: &str) -> Option<(usize, Marker, &str)> {
     None
 }
 
+/// A non-empty line containing at least one pipe is a candidate table row.
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.contains('|')
+}
+
+/// A separator row is made only of `| - : space` and contains a dash.
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Split a pipe row into trimmed cells, ignoring leading/trailing pipes.
+fn split_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Right-pad each cell to its column width and join with " | ".
+fn format_row(cells: &[String], widths: &[usize]) -> String {
+    let padded: Vec<String> = widths
+        .iter()
+        .enumerate()
+        .map(|(c, w)| {
+            let cell = cells.get(c).map(|s| s.as_str()).unwrap_or("");
+            let pad = w.saturating_sub(cell.chars().count());
+            format!("{}{}", cell, " ".repeat(pad))
+        })
+        .collect();
+    padded.join(" | ")
+}
+
+/// Render a table starting at `lines[0]` (header) + `lines[1]` (separator).
+/// Returns (html_block, lines_consumed).
+fn render_table(lines: &[&str]) -> (String, usize) {
+    let header = split_row(lines[0]);
+    let ncols = header.len();
+    let mut rows: Vec<Vec<String>> = vec![header];
+    let mut consumed = 2; // header + separator
+    let mut idx = 2;
+    while idx < lines.len() && is_table_row(lines[idx]) && !is_table_separator(lines[idx]) {
+        let mut cells = split_row(lines[idx]);
+        cells.resize(ncols, String::new());
+        rows.push(cells);
+        consumed += 1;
+        idx += 1;
+    }
+
+    let mut widths = vec![0usize; ncols];
+    for row in &rows {
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+
+    let mut grid = String::new();
+    grid.push_str(&format_row(&rows[0], &widths));
+    grid.push('\n');
+    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    grid.push_str(&sep.join("-+-"));
+    for row in &rows[1..] {
+        grid.push('\n');
+        grid.push_str(&format_row(row, &widths));
+    }
+
+    (format!("<pre>{}</pre>", escape(&grid)), consumed)
+}
+
 /// Convert markdown into a sequence of Telegram-HTML blocks (no trailing
 /// newlines; one block per heading / paragraph line / list item / blockquote /
 /// code fence / table).
@@ -260,8 +330,16 @@ fn render_blocks(md: &str) -> Vec<String> {
             continue;
         }
 
-        // Table detection is added in Task 4 (here, a pipe row falls through
-        // to a paragraph).
+        // GFM pipe table: a row followed by a separator row.
+        if is_table_row(line)
+            && i + 1 < lines.len()
+            && is_table_separator(lines[i + 1])
+        {
+            let (html, consumed) = render_table(&lines[i..]);
+            blocks.push(html);
+            i += consumed;
+            continue;
+        }
 
         // Heading.
         if let Some((level, text)) = heading(line) {
@@ -436,5 +514,30 @@ mod tests {
             render_blocks("a\n\nb"),
             vec!["a", "b"]
         );
+    }
+
+    #[test]
+    fn table_renders_as_padded_pre() {
+        let md = "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 7 |";
+        let out = render_blocks(md);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            "<pre>Name  | Age\n------+----\nAlice | 30 \nBob   | 7  </pre>"
+        );
+    }
+
+    #[test]
+    fn table_escapes_cell_html() {
+        let md = "| A |\n| --- |\n| x<y |";
+        let out = render_blocks(md);
+        assert_eq!(out, vec!["<pre>A  \n---\nx&lt;y</pre>"]);
+    }
+
+    #[test]
+    fn table_requires_separator_row() {
+        // A lone pipe line with no separator is just a paragraph.
+        let out = render_blocks("a | b | c");
+        assert_eq!(out, vec!["a | b | c"]);
     }
 }
