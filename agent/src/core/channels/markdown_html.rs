@@ -398,6 +398,75 @@ fn render_blocks(md: &str) -> Vec<String> {
     blocks
 }
 
+/// Split one oversize block into pieces ≤ `limit`. A `<pre>…</pre>` block is
+/// split at line boundaries with the `<pre>` tags re-opened on each piece so
+/// every piece is independently valid HTML. Any other oversize block is
+/// hard-split by character count.
+fn split_block(block: &str, limit: usize) -> Vec<String> {
+    const OPEN: &str = "<pre>";
+    const CLOSE: &str = "</pre>";
+    if block.starts_with(OPEN) && block.ends_with(CLOSE) {
+        let inner = &block[OPEN.len()..block.len() - CLOSE.len()];
+        let wrap = OPEN.chars().count() + CLOSE.chars().count();
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for piece in inner.split_inclusive('\n') {
+            if !cur.is_empty()
+                && cur.chars().count() + piece.chars().count() + wrap > limit
+            {
+                out.push(format!("{}{}{}", OPEN, cur, CLOSE));
+                cur = String::new();
+            }
+            cur.push_str(piece);
+        }
+        if !cur.is_empty() {
+            out.push(format!("{}{}{}", OPEN, cur, CLOSE));
+        }
+        out
+    } else {
+        let chars: Vec<char> = block.chars().collect();
+        chars
+            .chunks(limit)
+            .map(|c| c.iter().collect::<String>())
+            .collect()
+    }
+}
+
+/// Pack blocks (joined by single newlines) into chunks ≤ `limit`.
+fn chunk_blocks(blocks: Vec<String>, limit: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for block in blocks {
+        if block.chars().count() > limit {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            chunks.extend(split_block(&block, limit));
+            continue;
+        }
+        let sep = if current.is_empty() { 0 } else { 1 };
+        if !current.is_empty()
+            && current.chars().count() + sep + block.chars().count() > limit
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(&block);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Convert LLM markdown into Telegram-HTML chunks, each ≤ `TELEGRAM_LIMIT`
+/// characters. Returns an empty vec for empty/whitespace-only input.
+pub fn render_telegram(md: &str) -> Vec<String> {
+    chunk_blocks(render_blocks(md), TELEGRAM_LIMIT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +608,54 @@ mod tests {
         // A lone pipe line with no separator is just a paragraph.
         let out = render_blocks("a | b | c");
         assert_eq!(out, vec!["a | b | c"]);
+    }
+
+    #[test]
+    fn render_telegram_empty_input_yields_no_chunks() {
+        assert!(render_telegram("").is_empty());
+        assert!(render_telegram("   \n  ").is_empty());
+    }
+
+    #[test]
+    fn render_telegram_single_chunk_joined_with_newlines() {
+        assert_eq!(
+            render_telegram("# Title\n\nbody **x**"),
+            vec!["<u><b>Title</b></u>\nbody <b>x</b>"]
+        );
+    }
+
+    #[test]
+    fn render_telegram_splits_at_block_boundaries() {
+        // 500 short paragraph blocks (~7 KB) force multiple chunks past 4096.
+        let md: String = (0..500)
+            .map(|n| format!("line number {}", n))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let chunks = render_telegram(&md);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        for c in &chunks {
+            assert!(c.chars().count() <= 4096, "chunk too long: {}", c.chars().count());
+        }
+        // No block is split mid-line: every chunk starts with "line number".
+        for c in &chunks {
+            assert!(c.starts_with("line number"), "unexpected chunk start: {:?}", c);
+        }
+    }
+
+    #[test]
+    fn oversize_pre_block_is_split_with_reopened_tags() {
+        // One code fence whose body alone exceeds the limit.
+        let big_body: String = (0..1000)
+            .map(|n| format!("row {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let md = format!("```\n{}\n```", big_body);
+        let chunks = render_telegram(&md);
+        assert!(chunks.len() > 1, "expected the pre block to be split");
+        for c in &chunks {
+            assert!(c.chars().count() <= 4096);
+            assert!(c.starts_with("<pre>"), "chunk must reopen <pre>: {:?}", &c[..20.min(c.len())]);
+            assert!(c.ends_with("</pre>"), "chunk must close </pre>");
+        }
     }
 }
