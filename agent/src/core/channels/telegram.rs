@@ -4,10 +4,12 @@
 //!
 //! Defaults:
 //! - Long-poll timeout: caller-supplied; recommended 10s.
-//! - parse_mode: None. LLM replies aren't sanitized for Markdown special
-//!   chars (`_`, `*`, `[`, `` ` ``); a stray underscore returns 400 from
-//!   Telegram. Opt in via `with_parse_mode(Some("Markdown"))` if you
-//!   know your replies are safe.
+//! - Formatting: `deliver` renders LLM markdown to Telegram HTML via
+//!   `markdown_html::render_telegram` (bold/italic/code/lists/quote/links +
+//!   monospace `<pre>` tables), chunks output to Telegram's 4096-char limit,
+//!   and sends each chunk with `parse_mode=HTML`. On a Telegram 400 (malformed
+//!   entities) the chunk is re-sent as stripped plain text, so a formatting
+//!   defect can never lose a message.
 //! - allowed_chat_ids: not enforced inside Poller — caller filters
 //!   returned `IncomingMessage`s, since Poller doesn't see config.
 
@@ -150,7 +152,6 @@ impl Poller {
 pub struct TelegramChannel {
     bot_token: String,
     http: Arc<dyn HttpClient>,
-    parse_mode: Option<String>,
 }
 
 impl TelegramChannel {
@@ -158,13 +159,7 @@ impl TelegramChannel {
         Self {
             bot_token,
             http,
-            parse_mode: None,
         }
-    }
-
-    pub fn with_parse_mode(mut self, mode: Option<String>) -> Self {
-        self.parse_mode = mode;
-        self
     }
 
     /// Telegram-specific (not on Channel trait — Cli has no notion of typing).
@@ -204,11 +199,53 @@ impl Channel for TelegramChannel {
         chat_id: &str,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for chunk in crate::core::channels::markdown_html::render_telegram(text) {
+            self.send_one(chat_id, &chunk).await?;
+        }
+        Ok(())
+    }
+}
+
+impl TelegramChannel {
+    /// Send one already-rendered HTML chunk. Tries `parse_mode=HTML`; on a
+    /// Telegram 400 (malformed entities) retries the same chunk as stripped
+    /// plain text so a formatting defect can never lose a message.
+    async fn send_one(
+        &self,
+        chat_id: &str,
+        html: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let status = self.post_send(chat_id, html, Some("HTML")).await?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        if status == 400 {
+            let plain = strip_tags(html);
+            let retry = self.post_send(chat_id, &plain, None).await?;
+            if (200..300).contains(&retry) {
+                return Ok(());
+            }
+            return Err(format!(
+                "Telegram sendMessage HTTP {} (after plain-text fallback)",
+                retry
+            )
+            .into());
+        }
+        Err(format!("Telegram sendMessage HTTP {}", status).into())
+    }
+
+    /// POST one sendMessage. Returns the HTTP status (transport errors are
+    /// surfaced as `Err`).
+    async fn post_send(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<&str>,
+    ) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://api.telegram.org/bot{}/sendMessage",
             self.bot_token
         );
-
         let mut payload = serde_json::Map::new();
         payload.insert(
             "chat_id".to_string(),
@@ -218,10 +255,10 @@ impl Channel for TelegramChannel {
             "text".to_string(),
             serde_json::Value::String(text.to_string()),
         );
-        if let Some(mode) = &self.parse_mode {
+        if let Some(mode) = parse_mode {
             payload.insert(
                 "parse_mode".to_string(),
-                serde_json::Value::String(mode.clone()),
+                serde_json::Value::String(mode.to_string()),
             );
         }
         let body = serde_json::Value::Object(payload).to_string();
@@ -230,16 +267,26 @@ impl Channel for TelegramChannel {
         headers.insert("Content-Type".to_string(), "application/json".to_string());
 
         let resp = self.http.post(&url, &headers, body.as_bytes()).await?;
-        if resp.status < 200 || resp.status >= 300 {
-            return Err(format!(
-                "Telegram sendMessage HTTP {}: {}",
-                resp.status,
-                String::from_utf8_lossy(&resp.body)
-            )
-            .into());
-        }
-        Ok(())
+        Ok(resp.status)
     }
+}
+
+/// Remove HTML tags and unescape entities for the plain-text fallback path.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
 }
 
 #[cfg(all(test, feature = "desktop"))]
@@ -493,34 +540,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_deliver_includes_parse_mode_when_set() {
-        let http = Arc::new(MockHttpClient::new());
-        http.push_response(200, r#"{"ok":true}"#);
-
-        let ch = TelegramChannel::new("TOKEN".to_string(), http.clone())
-            .with_parse_mode(Some("Markdown".to_string()));
-        ch.deliver("1", "msg").await.unwrap();
-
-        let reqs = http.requests();
-        let body = parse_body_json(&reqs[0]);
-        assert_eq!(body["parse_mode"], "Markdown");
-    }
-
-    #[tokio::test]
-    async fn channel_deliver_omits_parse_mode_by_default() {
+    async fn channel_deliver_uses_html_parse_mode_and_renders_markdown() {
         let http = Arc::new(MockHttpClient::new());
         http.push_response(200, r#"{"ok":true}"#);
 
         let ch = TelegramChannel::new("TOKEN".to_string(), http.clone());
-        ch.deliver("1", "msg").await.unwrap();
+        ch.deliver("1", "be **bold**").await.unwrap();
 
         let reqs = http.requests();
+        assert_eq!(reqs.len(), 1);
         let body = parse_body_json(&reqs[0]);
-        assert!(
-            body.get("parse_mode").is_none(),
-            "parse_mode should be absent: {:?}",
-            body
-        );
+        assert_eq!(body["parse_mode"], "HTML");
+        assert_eq!(body["text"], "be <b>bold</b>");
+    }
+
+    #[tokio::test]
+    async fn channel_deliver_falls_back_to_plain_text_on_400() {
+        let http = Arc::new(MockHttpClient::new());
+        http.push_response(400, r#"{"ok":false,"description":"can't parse entities"}"#);
+        http.push_response(200, r#"{"ok":true}"#);
+
+        let ch = TelegramChannel::new("TOKEN".to_string(), http.clone());
+        ch.deliver("1", "be **bold**").await.unwrap();
+
+        let reqs = http.requests();
+        assert_eq!(reqs.len(), 2, "expected an HTML attempt then a plain retry");
+        // First attempt: HTML.
+        assert_eq!(parse_body_json(&reqs[0])["parse_mode"], "HTML");
+        // Retry: no parse_mode, tags stripped.
+        let retry = parse_body_json(&reqs[1]);
+        assert!(retry.get("parse_mode").is_none(), "retry must be plain: {:?}", retry);
+        assert_eq!(retry["text"], "be bold");
+    }
+
+    #[tokio::test]
+    async fn channel_deliver_403_propagates_without_fallback() {
+        let http = Arc::new(MockHttpClient::new());
+        http.push_response(403, r#"{"ok":false,"description":"forbidden"}"#);
+
+        let ch = TelegramChannel::new("TOKEN".to_string(), http.clone());
+        let result = ch.deliver("1", "hi").await;
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("403"));
+        assert_eq!(http.requests().len(), 1, "403 must not trigger a retry");
+    }
+
+    #[tokio::test]
+    async fn channel_deliver_long_message_is_chunked() {
+        let http = Arc::new(MockHttpClient::new());
+        // Enough 200s for however many chunks; extra canned responses are fine.
+        for _ in 0..10 {
+            http.push_response(200, r#"{"ok":true}"#);
+        }
+        let big: String = (0..500)
+            .map(|n| format!("paragraph number {}", n))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let ch = TelegramChannel::new("TOKEN".to_string(), http.clone());
+        ch.deliver("1", &big).await.unwrap();
+
+        let reqs = http.requests();
+        assert!(reqs.len() > 1, "long message should be split into multiple sends");
+        for r in &reqs {
+            let body = parse_body_json(r);
+            let text = body["text"].as_str().unwrap();
+            assert!(text.chars().count() <= 4096);
+        }
     }
 
     #[tokio::test]
